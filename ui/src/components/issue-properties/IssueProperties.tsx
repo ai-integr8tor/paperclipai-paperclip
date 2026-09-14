@@ -2336,7 +2336,7 @@ export function IssueProperties({
           <StatusIcon
             status={issue.status}
             externalConversationState={issue.externalConversationState}
-            className="size-6"
+            glyphContainerClassName="inline-flex size-6 shrink-0 items-center justify-center"
             blockerAttention={issue.blockerAttention}
             onChange={(status) => onUpdate({ status })}
             showLabel
