@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, like, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   agents,
@@ -27,7 +27,10 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 
-const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const externalTestDatabaseUrl = process.env.PAPERCLIP_TEST_DATABASE_URL;
+const embeddedPostgresSupport = externalTestDatabaseUrl
+  ? { supported: true }
+  : await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported
   ? describe
   : describe.skip;
@@ -43,10 +46,14 @@ describeEmbeddedPostgres(
 
     beforeAll(async () => {
       process.env.PAPERCLIP_PUBLIC_URL = "https://paperclip.example";
-      tempDb = await startEmbeddedPostgresTestDatabase(
-        "paperclip-terminal-chat-interaction-",
-      );
-      db = createDb(tempDb.connectionString);
+      if (externalTestDatabaseUrl) {
+        db = createDb(externalTestDatabaseUrl);
+      } else {
+        tempDb = await startEmbeddedPostgresTestDatabase(
+          "paperclip-terminal-chat-interaction-",
+        );
+        db = createDb(tempDb.connectionString);
+      }
     }, 20_000);
 
     afterAll(async () => {
@@ -405,7 +412,9 @@ describeEmbeddedPostgres(
       expect(publications).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
-            idempotencyKey: `interaction-resolution:${interaction.id}:${fixture.endpointIds.slack}`,
+            idempotencyKey: expect.stringContaining(
+              `interaction-resolution:${interaction.id}:${fixture.endpointIds.slack}:`,
+            ),
             state: "pending",
             payload: expect.objectContaining({ text: "Answered: High." }),
           }),
@@ -456,14 +465,16 @@ describeEmbeddedPostgres(
           })
           .from(chatPublications)
           .where(
-            eq(
+            like(
               chatPublications.idempotencyKey,
-              `interaction-resolution:${interaction.id}:${fixture.endpointIds.github}`,
+              `interaction-resolution:${interaction.id}:${fixture.endpointIds.github}:%`,
             ),
           ),
       ).resolves.toEqual([
         {
-          idempotencyKey: `interaction-resolution:${interaction.id}:${fixture.endpointIds.github}`,
+          idempotencyKey: expect.stringContaining(
+            `interaction-resolution:${interaction.id}:${fixture.endpointIds.github}:`,
+          ),
           payload: expect.objectContaining({
             interactionId: interaction.id,
             text: "Accepted.",
@@ -597,7 +608,9 @@ describeEmbeddedPostgres(
           Object.values(fixture.endpointIds).map((endpointId) =>
             expect.objectContaining({
               endpointId,
-              idempotencyKey: `interaction-resolution:${answeredQuestion.id}:${endpointId}`,
+              idempotencyKey: expect.stringContaining(
+                `interaction-resolution:${answeredQuestion.id}:${endpointId}:`,
+              ),
               payload: expect.objectContaining({
                 text: "Answered: High.",
                 card: expect.objectContaining({
@@ -767,7 +780,9 @@ describeEmbeddedPostgres(
             Object.values(fixture.endpointIds).map((endpointId) =>
               expect.objectContaining({
                 endpointId,
-                idempotencyKey: `interaction-resolution:${interaction.id}:${endpointId}`,
+                idempotencyKey: expect.stringContaining(
+                  `interaction-resolution:${interaction.id}:${endpointId}:`,
+                ),
                 payload: expect.objectContaining({
                   text: outcome === "accept" ? "Accepted." : "Rejected.",
                   card: expect.objectContaining({
@@ -818,6 +833,95 @@ describeEmbeddedPostgres(
           },
         ]);
       }
+    });
+
+    it("acknowledges every conversation that carries the card on one endpoint", async () => {
+      // Two `#general` threads can be bound to the same task through the same
+      // endpoint. Keying the terminal acknowledgement by endpoint alone made the
+      // second thread's ack a silent no-op under the idempotency unique index,
+      // so the board could answer in thread B and never hear back.
+      const fixture = await seedBoundIssue(["slack"]);
+      const service = issueThreadInteractionService(db);
+      const interaction = await service.create(
+        { id: fixture.issueId, companyId: fixture.companyId },
+        {
+          kind: "request_confirmation",
+          continuationPolicy: "wake_assignee",
+          payload: { version: 1, prompt: "Ship the second thread?" },
+        },
+        { agentId: fixture.agentId },
+      );
+      const endpointId = fixture.endpointIds.slack!;
+      const [firstConversation] = await db
+        .select({ id: chatConversations.id })
+        .from(chatConversations)
+        .where(
+          and(
+            eq(chatConversations.companyId, fixture.companyId),
+            eq(chatConversations.endpointId, endpointId),
+            eq(chatConversations.issueId, fixture.issueId),
+          ),
+        );
+      if (!firstConversation) throw new Error("Expected a bound conversation");
+      const secondConversationId = randomUUID();
+      await db.insert(chatConversations).values({
+        id: secondConversationId,
+        companyId: fixture.companyId,
+        endpointId,
+        issueId: fixture.issueId,
+        externalConversationId: "slack-second-thread",
+        externalThreadId: `slack:second:${fixture.issueId}`,
+        externalLabel: "slack second thread",
+        state: "active",
+      });
+      // The courier path delivered the card into both threads by hand, so the
+      // card was created before either conversation existed and left no
+      // `interaction:` mirror row behind. Settlement must still acknowledge
+      // both, keyed apart by conversation rather than collapsed by endpoint.
+      await db
+        .delete(chatPublications)
+        .where(
+          and(
+            eq(chatPublications.companyId, fixture.companyId),
+            eq(
+              sql<string>`${chatPublications.payload}->>'interactionId'`,
+              interaction.id,
+            ),
+          ),
+        );
+
+      await service.acceptInteraction(
+        {
+          id: fixture.issueId,
+          companyId: fixture.companyId,
+          projectId: null,
+          goalId: null,
+        },
+        interaction.id,
+        {},
+        { userId: "board-user" },
+      );
+
+      const settlements = await db
+        .select()
+        .from(chatPublications)
+        .where(
+          like(
+            chatPublications.idempotencyKey,
+            `interaction-resolution:${interaction.id}:%`,
+          ),
+        );
+      expect(settlements).toHaveLength(2);
+      expect(settlements.map((row) => row.conversationId).sort()).toEqual(
+        [firstConversation.id, secondConversationId].sort(),
+      );
+      expect(
+        settlements.every(
+          (row) =>
+            row.payload.text === "Accepted." &&
+            row.payload.interactionId === interaction.id,
+        ),
+      ).toBe(true);
     });
 
     it("expires both modal action tokens when a form-backed question is answered", async () => {
@@ -1030,9 +1134,9 @@ describeEmbeddedPostgres(
         .select()
         .from(chatPublications)
         .where(
-          eq(
+          like(
             chatPublications.idempotencyKey,
-            `interaction-resolution:${confirmation.id}:${fixture.endpointIds.telegram}`,
+            `interaction-resolution:${confirmation.id}:${fixture.endpointIds.telegram}:%`,
           ),
         );
       expect(liveSettlements).toEqual([

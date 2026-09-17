@@ -32,7 +32,7 @@ import { HEIF_CONTENT_TYPES, photonHeifPreview, validatePhotonImage } from "./ph
 import { projectSafeChatPublicationText } from "./chat-publication-projection.js";
 import { PhotonAnswerValidationError, nativePhotonInteraction, publishPhotonPrompt, photonResponseCommand, parsePhotonQuestionAnswer, type PhotonPromptReceipt, type PhotonInteractionBinding, type PhotonDraft } from "./photon/interactions.js";
 import { validateNativeQuestionResponseInput } from "./native-runtime/native-question-bridge.js";
-import type { AskUserQuestionsAnswer, AskUserQuestionsInteraction, IssueThreadInteraction } from "@paperclipai/shared";
+import type { AskUserQuestionsAnswer, AskUserQuestionsInteraction, IssueThreadInteraction, RequestConfirmationInteraction } from "@paperclipai/shared";
 import { PhotonCloudClient, PhotonError, photonFailure, photonSharedIdentity, photonSharedScope } from "./photon/cloud.js";
 import { PhotonChatAdapter, photonThreadId, photonReplyReference } from "./photon/adapter.js";
 import { photonChannelConfigurationSchema, type PhotonChannelConfiguration } from "@paperclipai/shared";
@@ -254,6 +254,7 @@ import {
   queueIssueAssignmentWakeup,
   type IssueAssignmentWakeupDeps,
 } from "./issue-assignment-wakeup.js";
+import { agentIsManagerOf } from "./authorization.js";
 import { issueService } from "./issues.js";
 import {
   authorizeNativeChatReviewPresentation,
@@ -326,6 +327,8 @@ import {
 } from "./chat-provider-lifecycle.js";
 import {
   enqueueTerminalIssueInteractionChatPublications,
+  interactionResolutionPublicationKey,
+  isInteractionResolutionPublicationKey,
   nativeChatQuestion,
   nativeTelegramConfirmation,
   TELEGRAM_CALLBACK_DATA_LIMIT_BYTES,
@@ -1728,6 +1731,41 @@ function nonDirectDestinationAllowed(
     return endpoint.allowGroupChats;
   }
   return resource.enabled;
+}
+
+const AGENT_CHAT_MAX_ATTACHMENTS = 20;
+
+/**
+ * Builds the provider thread id that a channel/thread resource posts into. It
+ * is the inverse of `providerEffectThreadResourceId` and stays provider-prefixed
+ * so `runtimeFor(endpoint).thread(threadId)` resolves the right adapter surface.
+ *
+ * A resource's `providerResourceId` is the canonical provider resource
+ * coordinate (Discord channel id, Slack channel id, Telegram chat id, Teams
+ * conversation id). Threads created by Paperclip append their own segment to
+ * the encoded thread id, never to the resource coordinate.
+ */
+function agentThreadIdForResource(
+  provider: ChatProvider,
+  endpoint: Pick<EndpointRow, "providerAccountId" | "botExternalId">,
+  resource: Pick<ResourceRow, "type" | "providerResourceId">,
+): string | null {
+  const resourceId = resource.providerResourceId.trim();
+  if (!resourceId) return null;
+  if (provider === "discord") {
+    const guildId =
+      endpoint.providerAccountId?.trim() ||
+      endpoint.botExternalId?.trim() ||
+      "@me";
+    return `discord:${guildId}:${resourceId}`;
+  }
+  if (provider === "slack") return `slack:${resourceId}:`;
+  if (provider === "telegram") return `telegram:${resourceId}`;
+  if (provider === "github") return `github:${resourceId.toLowerCase()}`;
+  if (provider === "microsoft-teams") {
+    return canonicalTeamsThreadId(`teams:${resourceId}`) ?? null;
+  }
+  return null;
 }
 
 function linearControlCommand(text: string): "new" | "close" | "status" | null {
@@ -11594,6 +11632,130 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     );
   }
 
+  /**
+   * Maps a bare numbered thread reply to a pending binary confirmation on the
+   * bound task. Discord has no Approve/Reject buttons, so a linked user answers
+   * the `#general` menu with `1` (accept) or `2` (reject, optional reason).
+   *
+   * This deliberately runs before `issuesSvc.addComment`, because a linked
+   * user's comment would otherwise expire the confirmation as
+   * `superseded_by_comment`. The governed accept/reject path still enforces
+   * resolver policy (`human_only`, `not_creator`, ...), so a reply that is not
+   * an authorized resolution simply returns null and remains an ordinary
+   * comment. Only exactly pending `request_confirmation` rows are targets;
+   * checkbox confirmations, questions, and multi-digit text are untouched.
+   */
+  async function resolveNumberedConfirmationReply(input: {
+    tx: DbOrTransaction;
+    endpoint: EndpointRow;
+    conversation: typeof chatConversations.$inferSelect;
+    messageText: string;
+    userId: string | null;
+    principalId: string;
+    runtimeContext?: LifecycleRuntimeFence;
+  }): Promise<
+    | {
+        decision: "accept" | "reject";
+        reason: string;
+        interaction: IssueThreadInteraction;
+      }
+    | null
+  > {
+    if (!input.userId) return null;
+    const match = /^([12])(?:[\s.]+([\s\S]*))?$/.exec(input.messageText.trim());
+    if (!match) return null;
+    const decision = match[1] === "1" ? "accept" : "reject";
+    const reason = (match[2] ?? "").trim();
+
+    const [issue] = await input.tx
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, input.endpoint.companyId),
+          eq(issues.id, input.conversation.issueId),
+        ),
+      )
+      .limit(1);
+    if (!issue) return null;
+    const interactions = await issueThreadInteractionService(
+      input.tx as unknown as Db,
+    ).listForIssue(input.conversation.issueId);
+    const pending = interactions.filter(
+      (candidate): candidate is RequestConfirmationInteraction =>
+        candidate.kind === "request_confirmation" &&
+        candidate.status === "pending",
+    );
+    // Only a single unambiguous gate is resolvable by number. Competing gates
+    // must be answered in Paperclip, where each card is distinct.
+    if (pending.length !== 1) return null;
+    const interaction = pending[0]!;
+    if (
+      decision === "reject" &&
+      interaction.payload.rejectRequiresReason &&
+      !reason
+    ) {
+      return null;
+    }
+
+    const mutation = {
+      beforeResolveInTransaction: async (tx: DbTransaction) => {
+        if (!input.runtimeContext) return;
+        await requireCurrentExternalActionAuthorization(tx, {
+          conversationId: input.conversation.id,
+          endpointId: input.endpoint.id,
+          expectedUserId: input.userId!,
+          principalId: input.principalId,
+          runtimeContext: input.runtimeContext,
+        });
+      },
+      afterResolveInTransaction: async (
+        tx: DbTransaction,
+        resolved: IssueThreadInteraction,
+      ) => {
+        await logActivity(tx as unknown as Db, {
+          companyId: input.endpoint.companyId,
+          actorType: "user",
+          actorId: input.userId!,
+          action:
+            decision === "accept"
+              ? "issue.thread_interaction_accepted"
+              : "issue.thread_interaction_rejected",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            source: "external_chat",
+            provider: input.endpoint.provider,
+            endpointId: input.endpoint.id,
+            conversationId: input.conversation.id,
+            interactionId: resolved.id,
+            decisionSource: "numbered_reply",
+          },
+        });
+      },
+    };
+    if (decision === "accept") {
+      await issueThreadInteractionService(input.tx as unknown as Db)
+        .acceptInteraction(
+          issue,
+          interaction.id,
+          {},
+          { userId: input.userId },
+          mutation,
+        );
+    } else {
+      await issueThreadInteractionService(input.tx as unknown as Db)
+        .rejectInteraction(
+          issue,
+          interaction.id,
+          { reason },
+          { userId: input.userId },
+          mutation,
+        );
+    }
+    return { decision, reason, interaction };
+  }
+
   async function stageInboundWakeup(
     tx: DbOrTransaction,
     input: {
@@ -16014,6 +16176,27 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       }
 
       const inboundActivityPublications: ActivityPublication[] = [];
+      // Discord has no Approve/Reject buttons. A linked user's bare `1`/`2`
+      // reply in the bound thread resolves this task's single pending binary
+      // confirmation through the governed path, in its own committed
+      // transaction before the comment is stored. This ordering matters: a
+      // linked user's comment would otherwise expire the confirmation as
+      // superseded. A reply that is not an authorized resolution returns null
+      // and continues as ordinary thread input.
+      const numberedResolution =
+        endpoint.provider === "discord" &&
+        existingConversation &&
+        principalResolution.userId
+          ? await resolveNumberedConfirmationReply({
+              tx: db,
+              endpoint,
+              conversation: existingConversation,
+              messageText: message.text,
+              userId: principalResolution.userId,
+              principalId: principalResolution.principal.id,
+              runtimeContext,
+            })
+          : null;
       const persistTaskMutation = async (
         taskTx: DbOrTransaction,
         taskEndpoint: EndpointRow,
@@ -16189,7 +16372,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           .where(eq(chatEndpoints.id, taskEndpoint.id));
         comment = await issuesSvc.addComment(
           conversation!.issueId,
-          body.slice(0, MAX_INBOUND_TEXT),
+          numberedResolution
+            ? `Discord decision: ${numberedResolution.decision === "accept" ? "approve" : "reject"} (numbered reply)${numberedResolution.reason ? ` — ${numberedResolution.reason}` : ""}`
+            : body.slice(0, MAX_INBOUND_TEXT),
           taskUserId ? { userId: taskUserId } : {},
           {
             authorType: taskUserId ? "user" : "system",
@@ -19695,7 +19880,11 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           endpointId: action.endpointId,
           conversationId: conversation.id,
           issueId: issue.id,
-          idempotencyKey: `interaction-resolution:${interaction.id}:${action.endpointId}`,
+          idempotencyKey: interactionResolutionPublicationKey({
+            interactionId: interaction.id,
+            endpointId: action.endpointId,
+            conversationId: conversation.id,
+          }),
           payload: projectSafeChatPublication({
             classification: "external",
             source: "issue_interaction",
@@ -20503,8 +20692,12 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       .payload as SafeChatPublicationPayload;
     const linkStillAuthoritative =
       messageBinding.link.publicationId === originalPublicationId ||
-      (messageBinding.linkedPublication.idempotencyKey ===
-        `interaction-resolution:${actionInteractionId}:${record.endpoint.id}` &&
+      (isInteractionResolutionPublicationKey({
+        idempotencyKey: messageBinding.linkedPublication.idempotencyKey,
+        interactionId: actionInteractionId,
+        endpointId: record.endpoint.id,
+        conversationId: conversation.id,
+      }) &&
         linkedPayload.interactionId === actionInteractionId);
     if (!originalPublication || !linkStillAuthoritative) {
       return deny(safelyKnown);
@@ -21147,7 +21340,11 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                 endpointId: record.endpoint.id,
                 conversationId: conversation.id,
                 issueId: issue.id,
-                idempotencyKey: `interaction-resolution:${resolved.id}:${record.endpoint.id}`,
+                idempotencyKey: interactionResolutionPublicationKey({
+                  interactionId: resolved.id,
+                  endpointId: record.endpoint.id,
+                  conversationId: conversation.id,
+                }),
                 payload: projectSafeChatPublication({
                   classification: "external",
                   source: "issue_interaction",
@@ -21466,8 +21663,13 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       | undefined;
     const linkStillAuthoritative =
       currentMessageBinding?.link.publicationId === originalPublication.id ||
-      (currentMessageBinding?.publication.idempotencyKey ===
-        `interaction-resolution:${loaded.interactionId}:${record.endpoint.id}` &&
+      (Boolean(currentMessageBinding) &&
+        isInteractionResolutionPublicationKey({
+          idempotencyKey: currentMessageBinding!.publication.idempotencyKey,
+          interactionId: loaded.interactionId,
+          endpointId: record.endpoint.id,
+          conversationId: conversation.id,
+        }) &&
         linkedPayload?.interactionId === loaded.interactionId);
     if (!currentMessageBinding || !linkStillAuthoritative) {
       return deny(
@@ -30826,6 +31028,789 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     );
   }
 
+  type AgentChatActor = {
+    agentId: string;
+    runId: string;
+    companyId: string;
+  };
+
+  type ResolvedAgentChatDestination = {
+    conversation: ConversationRow | null;
+    threadId: string;
+    externalConversationId: string;
+    externalLabel: string;
+    resourceId: string | null;
+    isDirectMessage: boolean;
+  };
+
+  /**
+   * Resolve the exact provider destination an agent send targets. Provider I/O
+   * for a DM happens here, before the publication transaction, so no network
+   * call runs under a database lock.
+   */
+  async function resolveAgentChatDestination(
+    endpointId: string,
+    endpoint: EndpointRow,
+    input: {
+      conversationId?: string;
+      resourceId?: string;
+      principalId?: string;
+    },
+  ): Promise<ResolvedAgentChatDestination> {
+    if (input.conversationId) {
+      const conversation = await db
+        .select()
+        .from(chatConversations)
+        .where(
+          and(
+            eq(chatConversations.id, input.conversationId),
+            eq(chatConversations.endpointId, endpointId),
+            eq(chatConversations.companyId, endpoint.companyId),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+      if (!conversation) throw notFound("Chat conversation not found");
+      return {
+        conversation,
+        threadId: conversation.externalThreadId,
+        externalConversationId: conversation.externalConversationId,
+        externalLabel: conversation.externalLabel,
+        resourceId: conversation.resourceId,
+        isDirectMessage: conversation.isDirectMessage,
+      };
+    }
+    if (input.principalId) {
+      const principal = await db
+        .select()
+        .from(chatExternalPrincipals)
+        .where(
+          and(
+            eq(chatExternalPrincipals.id, input.principalId),
+            eq(chatExternalPrincipals.companyId, endpoint.companyId),
+            eq(chatExternalPrincipals.provider, endpoint.provider),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+      if (!principal || principal.isBot)
+        throw notFound("Chat principal not found");
+      if (!endpoint.allowDirectMessages)
+        throw forbidden("Direct messages are disabled in Paperclip");
+      // Opening a DM is a provider mutation. Run it under the same endpoint
+      // credential lease every other provider write uses.
+      const threadId = await withCredentialMutationLease(
+        endpoint,
+        async (credentialLease) => {
+          await credentialLease.assertOwned();
+          return await openAgentDirectMessageThread(endpoint, principal);
+        },
+      );
+      if (!threadId) {
+        throw conflict("Chat endpoint runtime is unavailable");
+      }
+      return {
+        conversation: null,
+        threadId,
+        externalConversationId: threadId,
+        externalLabel: threadId,
+        resourceId: null,
+        isDirectMessage: true,
+      };
+    }
+    if (input.resourceId) {
+      const resource = await db
+        .select()
+        .from(chatEndpointResources)
+        .where(
+          and(
+            eq(chatEndpointResources.id, input.resourceId),
+            eq(chatEndpointResources.endpointId, endpointId),
+            eq(chatEndpointResources.companyId, endpoint.companyId),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+      if (!resource) throw notFound("Chat destination not found");
+      if (
+        resource.type === "direct_message" ||
+        resource.availability !== "available"
+      )
+        throw forbidden("This destination is not available");
+      if (!nonDirectDestinationAllowed(endpoint, resource))
+        throw forbidden("This destination is disabled in Paperclip");
+      const threadId = agentThreadIdForResource(
+        endpoint.provider,
+        endpoint,
+        resource,
+      );
+      if (!threadId)
+        throw unprocessable("This provider does not support channel sends");
+      return {
+        conversation: null,
+        threadId,
+        externalConversationId: threadId,
+        externalLabel: resource.label,
+        resourceId: resource.id,
+        isDirectMessage: false,
+      };
+    }
+    throw badRequest("A conversation, destination, or principal is required");
+  }
+
+  /**
+   * Resolve and authorize the exact endpoint a run-scoped agent may send
+   * through. Only the endpoint's assigned agent holds outbound chat authority;
+   * the run must be the live run for that agent. This mirrors the email
+   * inbox/AgentMail contract and never widens the destination gates below.
+   */
+  async function authorizeAgentChatEndpoint(
+    endpointId: string,
+    actor: AgentChatActor,
+  ) {
+    const record = await endpointRecord(endpointId);
+    if (
+      !record ||
+      record.endpoint.companyId !== actor.companyId ||
+      record.endpoint.assignedAgentId !== actor.agentId
+    ) {
+      throw notFound("Chat endpoint not found");
+    }
+    const [run] = await db
+      .select({
+        id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+        agentId: heartbeatRuns.agentId,
+        companyId: heartbeatRuns.companyId,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.id, actor.runId),
+          eq(heartbeatRuns.companyId, actor.companyId),
+          eq(heartbeatRuns.agentId, actor.agentId),
+          eq(heartbeatRuns.status, "running"),
+        ),
+      )
+      .limit(1);
+    if (!run) throw forbidden("The assigned agent's active run is required");
+    if (
+      !["active", "verifying"].includes(record.endpoint.status) ||
+      record.endpoint.archivedAt
+    ) {
+      throw conflict("This chat endpoint is not available for sending", {
+        code: "chat_endpoint_runtime_unavailable",
+      });
+    }
+    return record;
+  }
+
+  /**
+   * Agent-initiated outbound send. Publishes through the same durable
+   * publication pipeline, projection, destination gate, credential lease, and
+   * audit trail as the board send path; the only difference is the actor.
+   */
+  async function publishAgentMessage(
+    endpointId: string,
+    input: {
+      body: string;
+      idempotencyKey: string;
+      conversationId?: string;
+      resourceId?: string;
+      principalId?: string;
+      attachmentIds?: string[];
+    },
+    actor: AgentChatActor,
+  ) {
+    const record = await authorizeAgentChatEndpoint(endpointId, actor);
+    const endpoint = record.endpoint;
+    if (endpoint.publicationMode === "explicit") {
+      throw badRequest("Use an explicit email send action");
+    }
+    const attachmentIds = input.attachmentIds ?? [];
+    // `explicit:` keeps this send on the operator-send lifecycle: it is never
+    // suppressed by run-progress supersession or conversation completion, and
+    // it is not auto-published from a task comment.
+    const idempotencyKey = `explicit:agent:${endpointId}:${actor.agentId}:${input.idempotencyKey}`;
+    const publicationCreatedAt = new Date();
+
+    // Provider I/O (openDM) must not run inside the database transaction. The
+    // destination and its provider thread id are resolved first, then the
+    // durable publication row is the authorization linearization point.
+    const resolved = await resolveAgentChatDestination(endpointId, endpoint, input);
+    const publication = await db.transaction(async (tx) => {
+      let conversation = resolved.conversation;
+      const threadId = resolved.threadId;
+
+      if (conversation) {
+        // Re-read under lock so a concurrent send shares one FIFO lane.
+        conversation = await tx
+          .select()
+          .from(chatConversations)
+          .where(
+            and(
+              eq(chatConversations.id, conversation.id),
+              eq(chatConversations.endpointId, endpointId),
+              eq(chatConversations.companyId, endpoint.companyId),
+            ),
+          )
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!conversation) throw notFound("Chat conversation not found");
+      }
+
+      // Reuse the endpoint's existing conversation for channel/thread sends so
+      // replies keep their task binding and FIFO order. A DM without a bound
+      // conversation stays task-scoped to the source run's issue.
+      if (!conversation) {
+        conversation = await tx
+          .select()
+          .from(chatConversations)
+          .where(
+            and(
+              eq(chatConversations.endpointId, endpointId),
+              eq(chatConversations.companyId, endpoint.companyId),
+              eq(chatConversations.externalThreadId, threadId),
+              eq(chatConversations.sessionGeneration, 1),
+            ),
+          )
+          .orderBy(desc(chatConversations.lastActivityAt))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+      }
+
+      if (!conversation) {
+        const boundIssueId = await agentChatSourceIssueId(
+          tx as unknown as Db,
+          actor,
+          endpoint.companyId,
+        );
+        const [created] = await tx
+          .insert(chatConversations)
+          .values({
+            companyId: endpoint.companyId,
+            endpointId,
+            resourceId: resolved.resourceId,
+            issueId: boundIssueId,
+            externalConversationId: resolved.externalConversationId,
+            externalThreadId: threadId,
+            externalLabel: resolved.externalLabel,
+            isDirectMessage: resolved.isDirectMessage,
+            state: "active",
+            lastActivityAt: new Date(),
+          })
+          .onConflictDoNothing()
+          .returning();
+        conversation =
+          created ??
+          (await tx
+            .select()
+            .from(chatConversations)
+            .where(
+              and(
+                eq(chatConversations.endpointId, endpointId),
+                eq(chatConversations.externalThreadId, threadId),
+                eq(chatConversations.sessionGeneration, 1),
+              ),
+            )
+            .limit(1)
+            .then((rows) => rows[0] ?? null));
+      }
+      if (!conversation)
+        throw conflict("Could not bind an external conversation");
+
+      if (attachmentIds.length) {
+        const bound = await tx
+          .select({ id: issueAttachments.id })
+          .from(issueAttachments)
+          .innerJoin(assets, eq(issueAttachments.assetId, assets.id))
+          .where(
+            and(
+              eq(issueAttachments.companyId, endpoint.companyId),
+              eq(issueAttachments.issueId, conversation.issueId),
+              inArray(issueAttachments.id, attachmentIds),
+            ),
+          );
+        if (bound.length !== attachmentIds.length)
+          throw forbidden("Attachments must belong to the source task");
+      }
+
+      const [created] = await tx
+        .insert(chatPublications)
+        .values({
+          companyId: endpoint.companyId,
+          endpointId,
+          conversationId: conversation.id,
+          issueId: conversation.issueId,
+          idempotencyKey,
+          payload: projectSafeChatPublication({
+            classification: "external",
+            source: "agent_send",
+            text: input.body,
+            ...(attachmentIds.length ? { attachmentIds } : {}),
+          }),
+          state: "pending",
+          createdAt: publicationCreatedAt,
+          updatedAt: publicationCreatedAt,
+        })
+        .onConflictDoNothing()
+        .returning();
+      const persisted =
+        created ??
+        (await tx
+          .select()
+          .from(chatPublications)
+          .where(
+            and(
+              eq(chatPublications.companyId, endpoint.companyId),
+              eq(chatPublications.idempotencyKey, idempotencyKey),
+            ),
+          )
+          .then((rows) => rows[0] ?? null));
+      if (persisted) {
+        await logActivity(tx as unknown as Db, {
+          companyId: endpoint.companyId,
+          actorType: "agent",
+          actorId: actor.agentId,
+          action: "chat.publication_requested",
+          entityType: "chat_publication",
+          entityId: persisted.id,
+          issueId: conversation.issueId,
+          details: {
+            endpointId,
+            conversationId: conversation.id,
+            source: "agent_send",
+            agentId: actor.agentId,
+            runId: actor.runId,
+          },
+        });
+      }
+      return persisted;
+    });
+
+    if (!publication) throw conflict("Chat publication was not persisted");
+    await processPendingPublications();
+    const batch = await db
+      .select()
+      .from(chatPublications)
+      .where(
+        and(
+          eq(chatPublications.endpointId, endpointId),
+          eq(chatPublications.conversationId, publication.conversationId),
+          eq(chatPublications.idempotencyKey, idempotencyKey),
+        ),
+      )
+      .orderBy(
+        asc(chatPublications.createdAt),
+        asc(publicationTransportOrderKey(chatPublications)),
+      );
+    return (
+      batch.find((candidate) => candidate.state !== "published") ??
+      batch.at(-1) ??
+      publication
+    );
+  }
+
+  /**
+   * Agent-initiated thread creation. The agent's root message is posted as the
+   * first publication, then the provider thread is created from that message and
+   * a conversation is bound so later sends share the thread. Provider support is
+   * gated on the endpoint's `threads` capability.
+   */
+  async function createAgentThread(
+    endpointId: string,
+    input: {
+      resourceId: string;
+      body: string;
+      idempotencyKey: string;
+      title?: string;
+      issueId?: string;
+    },
+    actor: AgentChatActor,
+  ) {
+    const record = await authorizeAgentChatEndpoint(endpointId, actor);
+    const endpoint = record.endpoint;
+    if (!endpoint.capabilities.threads) {
+      throw unprocessable("This provider does not support threads");
+    }
+    if (
+      endpoint.provider === "github" ||
+      endpoint.provider === "imessage-photon" ||
+      endpoint.provider === "agentmail"
+    ) {
+      throw unprocessable("This provider does not support agent-created threads");
+    }
+    const resource = await db
+      .select()
+      .from(chatEndpointResources)
+      .where(
+        and(
+          eq(chatEndpointResources.id, input.resourceId),
+          eq(chatEndpointResources.endpointId, endpointId),
+          eq(chatEndpointResources.companyId, endpoint.companyId),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    if (!resource) throw notFound("Chat destination not found");
+    if (resource.type === "direct_message" || resource.availability !== "available")
+      throw forbidden("This destination is not available");
+    if (!nonDirectDestinationAllowed(endpoint, resource))
+      throw forbidden("This destination is disabled in Paperclip");
+    const channelThreadId = agentThreadIdForResource(
+      endpoint.provider,
+      endpoint,
+      resource,
+    );
+    if (!channelThreadId)
+      throw unprocessable("This provider does not support channel sends");
+
+    const rootKey = `explicit:agent-thread:${endpointId}:${actor.agentId}:${input.idempotencyKey}`;
+    const rootCreatedAt = new Date();
+    const prepared = await db.transaction(async (tx) => {
+      // An explicit issueId lets a manager open the thread for a report's task.
+      // `agentChatSourceIssueId` already owns the run's own-task binding and its
+      // assigned-agent authority gate; an explicit target replaces only the
+      // task, never the actor authority, and is gated to the task's assignee or
+      // a manager in that assignee's chain of command.
+      const sourceIssueId = input.issueId
+        ? await authorizeAgentChatThreadIssue(
+            tx as unknown as Db,
+            actor,
+            endpoint.companyId,
+            input.issueId,
+          )
+        : await agentChatSourceIssueId(
+            tx as unknown as Db,
+            actor,
+            endpoint.companyId,
+          );
+      const [existing] = await tx
+        .select()
+        .from(chatPublications)
+        .where(
+          and(
+            eq(chatPublications.companyId, endpoint.companyId),
+            eq(chatPublications.idempotencyKey, rootKey),
+          ),
+        )
+        .limit(1);
+      if (existing) {
+        const [conversation] = await tx
+          .select()
+          .from(chatConversations)
+          .where(eq(chatConversations.id, existing.conversationId))
+          .limit(1);
+        if (!conversation) {
+          throw conflict("Agent thread conversation is unavailable");
+        }
+        return { publication: existing, conversation };
+      }
+      const [conversation] = await tx
+        .insert(chatConversations)
+        .values({
+          companyId: endpoint.companyId,
+          endpointId,
+          resourceId: resource.id,
+          issueId: sourceIssueId,
+          // Held until the provider thread exists; the unique index keeps a
+          // concurrent retry on the same placeholder rather than a real thread.
+          externalConversationId: channelThreadId,
+          externalThreadId: `pending:${rootKey}`,
+          externalLabel: resource.label,
+          isDirectMessage: false,
+          state: "waiting",
+          lastActivityAt: new Date(),
+        })
+        .onConflictDoNothing()
+        .returning();
+      if (!conversation) {
+        throw conflict("Agent thread conversation could not be reserved");
+      }
+      const [publication] = await tx
+        .insert(chatPublications)
+        .values({
+          companyId: endpoint.companyId,
+          endpointId,
+          conversationId: conversation.id,
+          issueId: sourceIssueId,
+          idempotencyKey: rootKey,
+          payload: projectSafeChatPublication({
+            classification: "external",
+            source: "agent_send",
+            text: input.body,
+          }),
+          // Parked so the automatic publisher never posts to the placeholder
+          // thread id; this function owns the provider send below.
+          state: "awaiting_consent",
+          createdAt: rootCreatedAt,
+          updatedAt: rootCreatedAt,
+        })
+        .onConflictDoNothing()
+        .returning();
+      if (!publication) {
+        throw conflict("Agent thread publication could not be reserved");
+      }
+      await logActivity(tx as unknown as Db, {
+        companyId: endpoint.companyId,
+        actorType: "agent",
+        actorId: actor.agentId,
+        action: "chat.thread_requested",
+        entityType: "chat_publication",
+        entityId: publication.id,
+        issueId: sourceIssueId,
+        details: {
+          endpointId,
+          resourceId: resource.id,
+          source: "agent_send",
+          agentId: actor.agentId,
+          runId: actor.runId,
+        },
+      });
+      return { publication, conversation };
+    });
+
+    if (
+      prepared.publication.state === "published" &&
+      prepared.publication.providerMessageId
+    ) {
+      return {
+        publicationId: prepared.publication.id,
+        conversationId: prepared.publication.conversationId,
+        threadId: prepared.conversation.externalThreadId,
+        providerMessageId: prepared.publication.providerMessageId,
+      };
+    }
+
+    // A prior attempt may already have created the provider thread but not
+    // committed the conversation update. Resume from the durable thread id.
+    if (
+      prepared.conversation.externalThreadId !== `pending:${rootKey}` &&
+      prepared.publication.providerMessageId
+    ) {
+      await db
+        .update(chatPublications)
+        .set({
+          state: "published",
+          providerMessageId: prepared.publication.providerMessageId,
+          publishedAt: prepared.publication.publishedAt ?? new Date(),
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(chatPublications.id, prepared.publication.id),
+            eq(chatPublications.state, "awaiting_consent"),
+          ),
+        );
+      return {
+        publicationId: prepared.publication.id,
+        conversationId: prepared.conversation.id,
+        threadId: prepared.conversation.externalThreadId,
+        providerMessageId: prepared.publication.providerMessageId,
+      };
+    }
+
+    // Provider I/O runs under the same endpoint credential-mutation lease every
+    // other provider write uses, so a concurrent reconnect/pause/rotation cannot
+    // leave this thread bound to a superseded runtime. Each provider id is
+    // persisted immediately so a retry resumes rather than re-posting.
+    const result = await withCredentialMutationLease(
+      endpoint,
+      async (credentialLease) => {
+        await credentialLease.assertOwned();
+        const current = await db
+          .select()
+          .from(chatEndpoints)
+          .where(eq(chatEndpoints.id, endpointId))
+          .then((rows) => rows[0] ?? null);
+        if (
+          !current ||
+          current.companyId !== endpoint.companyId ||
+          !["active", "verifying"].includes(current.status)
+        ) {
+          throw conflict("Chat endpoint changed before thread creation", {
+            code: "chat_endpoint_runtime_superseded",
+          });
+        }
+        const runtime = await runtimeFor(current);
+        let providerMessageId = prepared.publication.providerMessageId;
+        if (!providerMessageId) {
+          const rootSent = await runtime.thread(channelThreadId).post(
+            projectSafeChatPublicationText(input.body),
+          );
+          if (
+            typeof rootSent?.id !== "string" ||
+            !rootSent.id ||
+            rootSent.id.length > 2048
+          ) {
+            throw new Error("Provider did not return a usable message receipt");
+          }
+          providerMessageId = rootSent.id;
+          await credentialLease.assertOwned();
+          await db
+            .update(chatPublications)
+            .set({ providerMessageId, updatedAt: new Date() })
+            .where(eq(chatPublications.id, prepared.publication.id));
+        }
+
+        const threadName =
+          input.title?.trim() ||
+          `Paperclip ${PROVIDER_LABELS[current.provider] ?? "thread"}`;
+        const createdThread = await runtime.ensureThreadFromMessage({
+          // GitHub has no create-thread contract and is rejected above, but the
+          // shared provider union still includes it and AgentMail.
+          provider: current.provider as ChatSdkProvider,
+          channelThreadId,
+          messageId: providerMessageId,
+          name: threadName,
+        });
+
+        await db.transaction(async (tx) => {
+          await credentialLease.assertOwned(tx);
+          await tx
+            .update(chatConversations)
+            .set({
+              externalThreadId: createdThread.threadId,
+              ...(createdThread.providerUrl
+                ? { providerUrl: createdThread.providerUrl }
+                : {}),
+              state: "active",
+              lastActivityAt: new Date(),
+              updatedAt: new Date(),
+            })
+            .where(eq(chatConversations.id, prepared.conversation.id));
+          await tx
+            .update(chatPublications)
+            .set({
+              state: "published",
+              providerMessageId,
+              providerUrl: createdThread.providerUrl ?? null,
+              publishedAt: new Date(),
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(chatPublications.id, prepared.publication.id),
+                eq(chatPublications.state, "awaiting_consent"),
+              ),
+            );
+        });
+        return {
+          publicationId: prepared.publication.id,
+          conversationId: prepared.conversation.id,
+          threadId: createdThread.threadId,
+          providerMessageId,
+        };
+      },
+    );
+    if (!result) {
+      throw conflict("Chat endpoint runtime is unavailable");
+    }
+    return result;
+  }
+
+  async function openAgentDirectMessageThread(
+    endpoint: EndpointRow,
+    principal: typeof chatExternalPrincipals.$inferSelect,
+  ): Promise<string> {
+    const runtime = await runtimeFor(endpoint);
+    const thread = await runtime.openDirectMessage(principal.externalId);
+    return thread.id;
+  }
+
+  async function agentChatSourceIssueId(
+    tx: Db,
+    actor: AgentChatActor,
+    companyId: string,
+  ): Promise<string> {
+    const [run] = await tx
+      .select({
+        nativeIssueId: heartbeatRuns.nativeIssueId,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.id, actor.runId),
+          eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.agentId, actor.agentId),
+        ),
+      )
+      .limit(1);
+    const snapshot =
+      run?.contextSnapshot && typeof run.contextSnapshot === "object"
+        ? (run.contextSnapshot as Record<string, unknown>)
+        : null;
+    const candidate =
+      run?.nativeIssueId ??
+      (typeof snapshot?.issueId === "string" ? snapshot.issueId : null) ??
+      (typeof snapshot?.taskId === "string" ? snapshot.taskId : null);
+    if (!candidate) {
+      throw conflict("The sending run is not bound to a Paperclip task", {
+        code: "agent_chat_task_binding_missing",
+      });
+    }
+    const [issue] = await tx
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.id, candidate),
+          eq(issues.companyId, companyId),
+          eq(issues.assigneeAgentId, actor.agentId),
+        ),
+      )
+      .limit(1);
+    if (!issue) {
+      throw forbidden("The sending run is not assigned to this task");
+    }
+    return issue.id;
+  }
+
+  /**
+   * Authorize binding an agent-created thread to a named task. The agent may
+   * only target a task it is assigned to, one assigned to a report in its own
+   * chain of command, or — for the company CEO, who already holds company-wide
+   * authority and is the board's single chat contact — any task in the company.
+   * This never widens the sending agent's ability to speak through the
+   * endpoint, which `authorizeAgentChatEndpoint` has already pinned to the
+   * assigned agent's live run.
+   */
+  async function authorizeAgentChatThreadIssue(
+    tx: Db,
+    actor: AgentChatActor,
+    companyId: string,
+    issueId: string,
+  ): Promise<string> {
+    const [issue] = await tx
+      .select({
+        id: issues.id,
+        assigneeAgentId: issues.assigneeAgentId,
+        companyId: issues.companyId,
+      })
+      .from(issues)
+      .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
+      .limit(1);
+    if (!issue) throw notFound("Task not found");
+    if (issue.assigneeAgentId === actor.agentId) return issue.id;
+    if (
+      issue.assigneeAgentId &&
+      (await agentIsManagerOf(
+        tx,
+        companyId,
+        actor.agentId,
+        issue.assigneeAgentId,
+      ))
+    ) {
+      return issue.id;
+    }
+    const [actorAgent] = await tx
+      .select({ role: agents.role })
+      .from(agents)
+      .where(
+        and(eq(agents.id, actor.agentId), eq(agents.companyId, companyId)),
+      )
+      .limit(1);
+    if (actorAgent?.role === "ceo") return issue.id;
+    throw forbidden("This agent does not own that task");
+  }
+
   // Native Teams file consent is authority for one personal recipient and one
   // immutable file, not authority inferred from the SDK's latest route cache.
   const teamsBoardFileIntentKind = "teams_board_file_intent";
@@ -38407,6 +39392,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     publishComment,
     getPublicationBatchStatus,
     publishBoardMessage,
+    publishAgentMessage,
+    createAgentThread,
     reconcileProviderRuntimes,
     processPendingPublications,
     enqueueInboundWakeupPublications,

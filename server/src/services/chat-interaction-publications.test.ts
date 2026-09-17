@@ -5,6 +5,7 @@ import { Actions, Button, Card, CardText } from "chat";
 import {
   createChatQuestionOptionActionToken,
   nativeChatQuestion,
+  selectInteractionSettlementTargets,
   TELEGRAM_CALLBACK_DATA_LIMIT_BYTES,
   telegramCallbackDataByteLength,
   telegramChatSdkCallbackData,
@@ -55,6 +56,46 @@ describe("native chat question eligibility", () => {
 
   it("keeps an explicitly open question on the Paperclip-only response path", () => {
     expect(nativeChatQuestion(closedQuestion(true))).toBeNull();
+  });
+});
+
+describe("interaction settlement targets", () => {
+  const mirrored = [{ endpointId: "e1", conversationId: "c1" }];
+  const fallback = [{ endpointId: "e2", conversationId: "c2" }];
+
+  it("acknowledges exactly the conversations a mirrored card reached", () => {
+    expect(
+      selectInteractionSettlementTargets({
+        hasMirroredOriginal: true,
+        providerVisibleTargets: mirrored,
+        fallbackTargets: fallback,
+      }),
+    ).toEqual(mirrored);
+  });
+
+  it("stays silent when a mirrored card was never provider-visible", () => {
+    // originals exist but none were delivered, so the card never appeared in
+    // the thread and there is nothing to settle.
+    expect(
+      selectInteractionSettlementTargets({
+        hasMirroredOriginal: true,
+        providerVisibleTargets: [],
+        fallbackTargets: fallback,
+      }),
+    ).toEqual([]);
+  });
+
+  it("falls back to live task conversations for a courier-delivered card", () => {
+    // The regression: a card created before the thread existed has no mirrored
+    // row, so the board's numbered reply resolved the card but posted nothing
+    // back. Settlement must still acknowledge in the bound thread.
+    expect(
+      selectInteractionSettlementTargets({
+        hasMirroredOriginal: false,
+        providerVisibleTargets: [],
+        fallbackTargets: fallback,
+      }),
+    ).toEqual(fallback);
   });
 });
 

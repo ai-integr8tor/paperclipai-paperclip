@@ -1126,6 +1126,26 @@ function isSpawnLikeFailureMessage(value: unknown) {
   return /failed to start command|spawn\b|\bENOENT\b/i.test(value);
 }
 
+// A provider admission failure means the saved session body itself is the
+// problem (an oversized/poisoned conversation history the provider rejects
+// before reading, an over-limit image count, or an argv/env overflow on the
+// resumed session). Retrying the identical saved session reproduces the same
+// failure and burns the bounded retry budget, so the retry must start on a
+// fresh session. The opencode-local adapter also self-heals this in-place;
+// this server-side classification keeps the automatic retry path consistent
+// for any adapter that surfaces the provider's message verbatim.
+function isProviderAdmissionFailureRun(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "error" | "resultJson">,
+) {
+  const resultJson = parseObject(run.resultJson);
+  const haystack = `${run.error ?? ""}\n${readNonEmptyString(resultJson.stdout) ?? ""}\n${readNonEmptyString(resultJson.stderr) ?? ""}\n${readNonEmptyString(resultJson.errorMessage) ?? ""}`;
+  return (
+    /failed to read request body/i.test(haystack) ||
+    /too many images were provided/i.test(haystack) ||
+    /\bspawn\s+E2BIG\b/i.test(haystack)
+  );
+}
+
 // A sandbox provider plugin's worker can be briefly down during its own
 // restart window (e.g. a rolling deploy of the plugin worker process). Lease
 // acquisition fails immediately in that window, but the condition is
@@ -15468,6 +15488,9 @@ export function heartbeatService(
             }
           : {}),
         ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
+        ...(isProviderAdmissionFailureRun(run)
+          ? { forceFreshSession: true, providerSessionRotated: true }
+          : {}),
       },
       "normal_model",
     );
@@ -15808,6 +15831,9 @@ export function heartbeatService(
                   : {}),
                 ...(codexTransientFallbackMode
                   ? { codexTransientFallbackMode }
+                  : {}),
+                ...(isProviderAdmissionFailureRun(run)
+                  ? { forceFreshSession: true, providerSessionRotated: true }
                   : {}),
               },
               "normal_model",
