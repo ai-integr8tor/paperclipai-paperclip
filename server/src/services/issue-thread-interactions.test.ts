@@ -70,11 +70,13 @@ function createFakeDb(args: {
               issueTouches.push(values);
               return Promise.resolve(undefined);
             }
-            // Other tables are outside this test's assertions. Resolving an
-            // interaction also expires its issued chat action tokens, which
-            // updates chat_actions; that must not be counted as an interaction
-            // update.
-            return Promise.resolve(undefined);
+            // Resolving an interaction also expires its issued chat action
+            // tokens, which updates chat_actions. Accept only that expected
+            // side effect and keep failing on any other unexpected table.
+            if (tableName === "chat_actions") {
+              return Promise.resolve(undefined);
+            }
+            throw new Error(`Unexpected update target: ${String(table)}`);
           },
         };
       },
