@@ -61,14 +61,12 @@ describe("native chat question eligibility", () => {
 
 describe("interaction settlement targets", () => {
   const mirrored = [{ endpointId: "e1", conversationId: "c1" }];
-  const fallback = [{ endpointId: "e2", conversationId: "c2" }];
 
   it("acknowledges exactly the conversations a mirrored card reached", () => {
     expect(
       selectInteractionSettlementTargets({
         hasMirroredOriginal: true,
         providerVisibleTargets: mirrored,
-        fallbackTargets: fallback,
       }),
     ).toEqual(mirrored);
   });
@@ -80,22 +78,19 @@ describe("interaction settlement targets", () => {
       selectInteractionSettlementTargets({
         hasMirroredOriginal: true,
         providerVisibleTargets: [],
-        fallbackTargets: fallback,
       }),
     ).toEqual([]);
   });
 
-  it("falls back to live task conversations for a courier-delivered card", () => {
-    // The regression: a card created before the thread existed has no mirrored
-    // row, so the board's numbered reply resolved the card but posted nothing
-    // back. Settlement must still acknowledge in the bound thread.
+  it("fails closed for a card with no mirrored delivery row", () => {
+    // Without a durable delivery binding, a terminal resolution must not be
+    // broadcast to every live conversation bound to the task.
     expect(
       selectInteractionSettlementTargets({
         hasMirroredOriginal: false,
         providerVisibleTargets: [],
-        fallbackTargets: fallback,
       }),
-    ).toEqual(fallback);
+    ).toEqual([]);
   });
 });
 

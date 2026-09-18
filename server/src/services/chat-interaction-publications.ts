@@ -637,38 +637,30 @@ type InteractionSettlementTarget = {
  * conversations that received it — and stays silent when that row was never
  * provider-visible, because the card was never delivered.
  *
- * A card carried into a thread by hand (the courier path) has no such row at
- * all: its author created the interaction before the conversation existed, so
- * the mirror found no binding. For that case `fallbackTargets` — the live
- * conversations bound to the task — is where the card necessarily lives, and
- * settlement must acknowledge there instead of returning silently.
+ * A card with no mirror row has no durable record of where (or whether) it was
+ * delivered. Settlement must fail closed rather than broadcast a resolution to
+ * every live conversation bound to the task: a task can carry several threads,
+ * and only one of them may have shown the card. The resolution conversation is
+ * acknowledged by its own mirror when the card went through the publication
+ * pipeline.
  */
 export function selectInteractionSettlementTargets<T extends { endpointId: string; conversationId: string }>(input: {
   /** Whether any `interaction:{id}:{endpointId}` publication row exists. */
   hasMirroredOriginal: boolean;
   /** Mirrored rows that were actually delivered to the provider. */
   providerVisibleTargets: T[];
-  /** Live task conversations, used only when nothing mirrored exists. */
-  fallbackTargets: T[];
 }): T[] {
-  return input.hasMirroredOriginal
-    ? input.providerVisibleTargets
-    : input.fallbackTargets;
+  return input.hasMirroredOriginal ? input.providerVisibleTargets : [];
 }
 
 /**
- * Settlement targets for a card that was delivered without a mirrored
- * `interaction:` publication row.
+ * Live task conversations eligible to receive an internal continuation wake for
+ * a card that was delivered without a mirrored `interaction:` publication row.
  *
- * The normal path is `enqueueIssueInteractionChatPublications` mirroring the
- * card into a live conversation, which leaves a publication row whose
- * `payload.interactionId` and `interaction:{id}:{endpointId}` key let
- * settlement find where the card went. A gate carried manually into a thread
- * (the courier path) has no such row, so settlement must resolve the same
- * conversations the enqueue path would have used: active conversations bound
- * to the task, on an automatic endpoint the card's author or a bridged manager
- * (or the CEO) owns. Without this the board answers and the thread never hears
- * back, because settlement returns before posting a follow-up.
+ * Settlement never uses these targets: a terminal external publication must
+ * address only the conversation that actually showed the card, and that binding
+ * lives on the mirrored row. This resolver exists solely so the assignee agent
+ * still wakes when the board answers a card that has no durable delivery row.
  */
 async function resolveInteractionSettlementTargets(
   db: ChatPublicationDb,
@@ -854,10 +846,6 @@ export async function enqueueTerminalIssueInteractionChatPublications(
   const settlementTargets = selectInteractionSettlementTargets({
     hasMirroredOriginal: originals.length > 0,
     providerVisibleTargets: mirroredTargets,
-    fallbackTargets:
-      originals.length === 0
-        ? await resolveInteractionSettlementTargets(db, interaction)
-        : [],
   });
   const planTarget =
     interaction.kind === "request_confirmation" &&
@@ -884,11 +872,14 @@ export async function enqueueTerminalIssueInteractionChatPublications(
       rejectedPlanNeedsRevision);
   // The wake follows the card's original delivery binding when one exists —
   // including a card that was cancelled before it became provider-visible, which
-  // the assignee must still learn about. Only a courier-delivered card, which
-  // has no original row at all, falls back to the live task conversations.
-  const wakeBinding =
-    currentOriginals[0] ??
-    (settlementTargets.length > 0 ? settlementTargets[0]! : null);
+  // the assignee must still learn about. Only a card with no original row at all
+  // resolves the live task conversations, and only for this internal wake: an
+  // external settlement publication must never broadcast to unrelated threads.
+  const courierWakeTargets =
+    continuationWakeRequired && currentOriginals.length === 0
+      ? await resolveInteractionSettlementTargets(db, interaction)
+      : [];
+  const wakeBinding = currentOriginals[0] ?? courierWakeTargets[0] ?? null;
   if (continuationWakeRequired && wakeBinding) {
     const issue = await db
       .select({

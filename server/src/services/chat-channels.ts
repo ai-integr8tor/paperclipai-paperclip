@@ -362,6 +362,7 @@ import {
   telegramMarkdownRequiresAttachment,
 } from "./chat-publication-stream.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
+import { ISSUE_THREAD_INTERACTION_RESOLUTION_DENIAL_CODES } from "./issue-thread-interaction-resolution.js";
 import {
   questionResponseDeliveryService,
   type QuestionResponseDeliveryServiceOptions,
@@ -10566,6 +10567,25 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     );
   }
 
+  /**
+   * True when resolving an interaction failed for an audience/policy reason
+   * rather than an infrastructure one. A chat reply that is not an authorized
+   * resolution is expected: the caller must fall back to storing it as an
+   * ordinary comment instead of retrying the inbound delivery.
+   */
+  function isInteractionResolutionDenial(error: unknown): boolean {
+    if (!error || typeof error !== "object") return false;
+    const details = (error as { details?: unknown }).details;
+    if (!details || typeof details !== "object") return false;
+    const code = (details as { code?: unknown }).code;
+    return (
+      typeof code === "string" &&
+      (ISSUE_THREAD_INTERACTION_RESOLUTION_DENIAL_CODES as readonly string[]).includes(
+        code,
+      )
+    );
+  }
+
   async function ensureResource(
     endpoint: EndpointRow,
     thread: Thread,
@@ -11690,6 +11710,25 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     // must be answered in Paperclip, where each card is distinct.
     if (pending.length !== 1) return null;
     const interaction = pending[0]!;
+    // A bare number only resolves the gate whose card was delivered to *this*
+    // conversation. Otherwise a linked user's unrelated `1`/`2` in any other
+    // thread bound to the task could accept or reject a pending gate by
+    // accident. The durable publication row is the delivery binding.
+    const [deliveredToConversation] = await input.tx
+      .select({ id: chatPublications.id })
+      .from(chatPublications)
+      .where(
+        and(
+          eq(chatPublications.companyId, input.endpoint.companyId),
+          eq(chatPublications.conversationId, input.conversation.id),
+          eq(
+            sql<string>`${chatPublications.payload}->>'interactionId'`,
+            interaction.id,
+          ),
+        ),
+      )
+      .limit(1);
+    if (!deliveredToConversation) return null;
     if (
       decision === "reject" &&
       interaction.payload.rejectRequiresReason &&
@@ -11734,24 +11773,33 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         });
       },
     };
-    if (decision === "accept") {
-      await issueThreadInteractionService(input.tx as unknown as Db)
-        .acceptInteraction(
-          issue,
-          interaction.id,
-          {},
-          { userId: input.userId },
-          mutation,
-        );
-    } else {
-      await issueThreadInteractionService(input.tx as unknown as Db)
-        .rejectInteraction(
-          issue,
-          interaction.id,
-          { reason },
-          { userId: input.userId },
-          mutation,
-        );
+    try {
+      if (decision === "accept") {
+        await issueThreadInteractionService(input.tx as unknown as Db)
+          .acceptInteraction(
+            issue,
+            interaction.id,
+            {},
+            { userId: input.userId },
+            mutation,
+          );
+      } else {
+        await issueThreadInteractionService(input.tx as unknown as Db)
+          .rejectInteraction(
+            issue,
+            interaction.id,
+            { reason },
+            { userId: input.userId },
+            mutation,
+          );
+      }
+    } catch (error) {
+      // A resolver-policy denial is an expected outcome for a reply that is not
+      // an authorized resolution. Return null so the caller falls through to
+      // storing the message as an ordinary comment instead of retrying the
+      // inbound delivery and eventually dropping the user's message.
+      if (isInteractionResolutionDenial(error)) return null;
+      throw error;
     }
     return { decision, reason, interaction };
   }
@@ -31088,6 +31136,15 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             eq(chatExternalPrincipals.id, input.principalId),
             eq(chatExternalPrincipals.companyId, endpoint.companyId),
             eq(chatExternalPrincipals.provider, endpoint.provider),
+            // Scope the principal to the endpoint's own provider account: a
+            // company can hold two accounts for one provider, and a principal
+            // from account A must never be opened through account B's
+            // credentials. `ensurePrincipal` stores "unknown" when an endpoint
+            // has no account, so match that fallback exactly.
+            eq(
+              chatExternalPrincipals.providerAccountId,
+              endpoint.providerAccountId ?? "unknown",
+            ),
           ),
         )
         .then((rows) => rows[0] ?? null);
@@ -31225,6 +31282,16 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       throw badRequest("Use an explicit email send action");
     }
     const attachmentIds = input.attachmentIds ?? [];
+    // Resolve the run's task binding before any provider I/O or conversation
+    // reuse. A supplied conversationId, or a provider thread already bound to
+    // another conversation, must belong to this task; otherwise the send, its
+    // attachments, and its audit trail would silently retarget another task's
+    // thread.
+    const boundIssueId = await agentChatSourceIssueId(
+      db,
+      actor,
+      endpoint.companyId,
+    );
     // `explicit:` keeps this send on the operator-send lifecycle: it is never
     // suppressed by run-progress supersession or conversation completion, and
     // it is not auto-published from a task comment.
@@ -31235,6 +31302,11 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     // destination and its provider thread id are resolved first, then the
     // durable publication row is the authorization linearization point.
     const resolved = await resolveAgentChatDestination(endpointId, endpoint, input);
+    if (resolved.conversation && resolved.conversation.issueId !== boundIssueId) {
+      throw forbidden("This chat conversation is bound to another task", {
+        code: "chat_conversation_task_mismatch",
+      });
+    }
     const publication = await db.transaction(async (tx) => {
       let conversation = resolved.conversation;
       const threadId = resolved.threadId;
@@ -31254,6 +31326,11 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           .for("update")
           .then((rows) => rows[0] ?? null);
         if (!conversation) throw notFound("Chat conversation not found");
+        if (conversation.issueId !== boundIssueId) {
+          throw forbidden("This chat conversation is bound to another task", {
+            code: "chat_conversation_task_mismatch",
+          });
+        }
       }
 
       // Reuse the endpoint's existing conversation for channel/thread sends so
@@ -31277,11 +31354,6 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       }
 
       if (!conversation) {
-        const boundIssueId = await agentChatSourceIssueId(
-          tx as unknown as Db,
-          actor,
-          endpoint.companyId,
-        );
         const [created] = await tx
           .insert(chatConversations)
           .values({
@@ -31315,6 +31387,11 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       }
       if (!conversation)
         throw conflict("Could not bind an external conversation");
+      if (conversation.issueId !== boundIssueId) {
+        throw forbidden("This chat conversation is bound to another task", {
+          code: "chat_conversation_task_mismatch",
+        });
+      }
 
       if (attachmentIds.length) {
         const bound = await tx
@@ -31433,7 +31510,11 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     if (
       endpoint.provider === "github" ||
       endpoint.provider === "imessage-photon" ||
-      endpoint.provider === "agentmail"
+      endpoint.provider === "agentmail" ||
+      // Telegram advertises thread support but `ensureThreadFromMessage` has no
+      // Telegram create-thread contract. Reject it before any provider I/O so a
+      // posted root message cannot be orphaned by a later throw.
+      endpoint.provider === "telegram"
     ) {
       throw unprocessable("This provider does not support agent-created threads");
     }
@@ -31502,7 +31583,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         }
         return { publication: existing, conversation };
       }
-      const [conversation] = await tx
+      const [reservedConversation] = await tx
         .insert(chatConversations)
         .values({
           companyId: endpoint.companyId,
@@ -31520,10 +31601,27 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         })
         .onConflictDoNothing()
         .returning();
+      // A concurrent request with the same idempotency key can win this insert
+      // between the initial lookup and here. Load the winner's reservation
+      // instead of failing an otherwise idempotent retry.
+      const conversation =
+        reservedConversation ??
+        (await tx
+          .select()
+          .from(chatConversations)
+          .where(
+            and(
+              eq(chatConversations.companyId, endpoint.companyId),
+              eq(chatConversations.endpointId, endpointId),
+              eq(chatConversations.externalThreadId, `pending:${rootKey}`),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null));
       if (!conversation) {
         throw conflict("Agent thread conversation could not be reserved");
       }
-      const [publication] = await tx
+      const [reservedPublication] = await tx
         .insert(chatPublications)
         .values({
           companyId: endpoint.companyId,
@@ -31544,6 +31642,19 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         })
         .onConflictDoNothing()
         .returning();
+      const publication =
+        reservedPublication ??
+        (await tx
+          .select()
+          .from(chatPublications)
+          .where(
+            and(
+              eq(chatPublications.companyId, endpoint.companyId),
+              eq(chatPublications.idempotencyKey, rootKey),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null));
       if (!publication) {
         throw conflict("Agent thread publication could not be reserved");
       }
@@ -31595,7 +31706,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         .where(
           and(
             eq(chatPublications.id, prepared.publication.id),
-            eq(chatPublications.state, "awaiting_consent"),
+            inArray(chatPublications.state, [
+              "awaiting_consent",
+              "delivery_unknown",
+            ]),
           ),
         );
       return {
@@ -31630,7 +31744,36 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         }
         const runtime = await runtimeFor(current);
         let providerMessageId = prepared.publication.providerMessageId;
+        if (
+          !providerMessageId &&
+          prepared.publication.state === "delivery_unknown"
+        ) {
+          // A previous attempt reached the provider but never persisted a
+          // receipt. Re-posting would duplicate the root message, so fail closed
+          // and require an operator to resolve the ambiguous send.
+          throw conflict("Agent thread root message delivery is ambiguous", {
+            code: "chat_publication_delivery_unknown",
+          });
+        }
         if (!providerMessageId) {
+          // Persist an ambiguous-send marker before the provider call so a
+          // restart in the gap resumes as ambiguous instead of re-posting the
+          // root message. The winner of this CAS owns the single send.
+          const marked = await db
+            .update(chatPublications)
+            .set({ state: "delivery_unknown", updatedAt: new Date() })
+            .where(
+              and(
+                eq(chatPublications.id, prepared.publication.id),
+                eq(chatPublications.state, "awaiting_consent"),
+              ),
+            )
+            .returning({ id: chatPublications.id });
+          if (marked.length === 0) {
+            throw conflict("Agent thread root message is already in flight", {
+              code: "chat_publication_delivery_unknown",
+            });
+          }
           const rootSent = await runtime.thread(channelThreadId).post(
             projectSafeChatPublicationText(input.body),
           );
@@ -31687,7 +31830,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             .where(
               and(
                 eq(chatPublications.id, prepared.publication.id),
-                eq(chatPublications.state, "awaiting_consent"),
+                inArray(chatPublications.state, [
+                  "awaiting_consent",
+                  "delivery_unknown",
+                ]),
               ),
             );
         });

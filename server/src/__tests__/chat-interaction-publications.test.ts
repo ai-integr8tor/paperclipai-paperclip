@@ -27,8 +27,16 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 
-const externalTestDatabaseUrl = process.env.PAPERCLIP_TEST_DATABASE_URL;
-const embeddedPostgresSupport = externalTestDatabaseUrl
+// External databases are opt-in. This suite performs destructive mutations, so
+// it only targets an operator-supplied PAPERCLIP_TEST_DATABASE_URL when they
+// explicitly acknowledge it is a dedicated test database; otherwise it uses a
+// disposable embedded Postgres.
+const externalTestDatabaseUrl =
+  process.env.PAPERCLIP_TEST_DATABASE_URL?.trim() || null;
+const useExternalTestDatabase =
+  process.env.PAPERCLIP_ALLOW_EXTERNAL_TEST_DATABASE === "1" &&
+  externalTestDatabaseUrl !== null;
+const embeddedPostgresSupport = useExternalTestDatabase
   ? { supported: true }
   : await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported
@@ -46,8 +54,8 @@ describeEmbeddedPostgres(
 
     beforeAll(async () => {
       process.env.PAPERCLIP_PUBLIC_URL = "https://paperclip.example";
-      if (externalTestDatabaseUrl) {
-        db = createDb(externalTestDatabaseUrl);
+      if (useExternalTestDatabase) {
+        db = createDb(externalTestDatabaseUrl!);
       } else {
         tempDb = await startEmbeddedPostgresTestDatabase(
           "paperclip-terminal-chat-interaction-",
@@ -835,11 +843,11 @@ describeEmbeddedPostgres(
       }
     });
 
-    it("acknowledges every conversation that carries the card on one endpoint", async () => {
-      // Two `#general` threads can be bound to the same task through the same
-      // endpoint. Keying the terminal acknowledgement by endpoint alone made the
-      // second thread's ack a silent no-op under the idempotency unique index,
-      // so the board could answer in thread B and never hear back.
+    it("does not broadcast a settlement when the card has no mirrored delivery row", async () => {
+      // A task can carry several threads. Without a durable delivery binding
+      // there is no way to know which one showed the card, so a terminal
+      // resolution must fail closed rather than be posted into every live
+      // conversation bound to the task.
       const fixture = await seedBoundIssue(["slack"]);
       const service = issueThreadInteractionService(db);
       const interaction = await service.create(
@@ -874,10 +882,8 @@ describeEmbeddedPostgres(
         externalLabel: "slack second thread",
         state: "active",
       });
-      // The courier path delivered the card into both threads by hand, so the
-      // card was created before either conversation existed and left no
-      // `interaction:` mirror row behind. Settlement must still acknowledge
-      // both, keyed apart by conversation rather than collapsed by endpoint.
+      // Simulate a card delivered without any `interaction:` mirror row: there
+      // is no record of which conversation actually showed it.
       await db
         .delete(chatPublications)
         .where(
@@ -911,17 +917,7 @@ describeEmbeddedPostgres(
             `interaction-resolution:${interaction.id}:%`,
           ),
         );
-      expect(settlements).toHaveLength(2);
-      expect(settlements.map((row) => row.conversationId).sort()).toEqual(
-        [firstConversation.id, secondConversationId].sort(),
-      );
-      expect(
-        settlements.every(
-          (row) =>
-            row.payload.text === "Accepted." &&
-            row.payload.interactionId === interaction.id,
-        ),
-      ).toBe(true);
+      expect(settlements).toHaveLength(0);
     });
 
     it("expires both modal action tokens when a form-backed question is answered", async () => {
