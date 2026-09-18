@@ -29070,7 +29070,11 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                   : undefined,
               )
             : row.state === "delivery_unknown"
-              ? (["mark_delivered", "retry_anyway", "cancel"] as const)
+              ? row.idempotencyKey.startsWith("explicit:agent-thread:")
+                ? // A receipt-less root cannot be marked delivered; retry
+                  // resumes thread creation, or the operator cancels it.
+                  (["retry_anyway", "cancel"] as const)
+                : (["mark_delivered", "retry_anyway", "cancel"] as const)
               : [],
         };
       }),
@@ -29653,11 +29657,34 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               })
               .onConflictDoNothing();
           }
+          const isAgentThreadRoot = publication.idempotencyKey.startsWith(
+            "explicit:agent-thread:",
+          );
+          if (isAgentThreadRoot && action === "mark_delivered") {
+            // The root post's receipt is what the thread id derives from, so a
+            // root message that never recorded a receipt cannot be completed by
+            // marking it delivered. Only a retry can resume thread creation.
+            throw conflict(
+              "A root message with no receipt cannot be marked delivered; retry it to resume thread creation or cancel it",
+              { code: "chat_thread_root_resolution_unsupported" },
+            );
+          }
           const now = new Date();
           await tx
             .update(chatPublications)
             .set(
-              action === "mark_delivered"
+              isAgentThreadRoot && action === "retry_anyway"
+                ? {
+                    // Hand the ambiguous root back to createAgentThread, which
+                    // owns the root post and the provider thread creation. The
+                    // generic publisher would otherwise post to the placeholder
+                    // thread id and never create the thread.
+                    state: "awaiting_consent",
+                    nextAttemptAt: null,
+                    redactedError: null,
+                    updatedAt: now,
+                  }
+                : action === "mark_delivered"
                 ? {
                     state: "published",
                     publishedAt: now,
@@ -31581,6 +31608,19 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         if (!conversation) {
           throw conflict("Agent thread conversation is unavailable");
         }
+        if (
+          conversation.issueId !== sourceIssueId ||
+          conversation.resourceId !== resource.id
+        ) {
+          // The same agent idempotency key must not be reused for a different
+          // task or destination; return the reservation only when it belongs to
+          // this request rather than silently binding the caller's task/body to
+          // the winner's thread.
+          throw conflict(
+            "This thread idempotency key is already bound to a different task or destination",
+            { code: "chat_thread_reservation_mismatch" },
+          );
+        }
         return { publication: existing, conversation };
       }
       const [reservedConversation] = await tx
@@ -31620,6 +31660,18 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           .then((rows) => rows[0] ?? null));
       if (!conversation) {
         throw conflict("Agent thread conversation could not be reserved");
+      }
+      if (
+        conversation.issueId !== sourceIssueId ||
+        conversation.resourceId !== resource.id
+      ) {
+        // The concurrent winner reserved this key for a different task or
+        // destination. Fail closed instead of associating this request's task
+        // and body with the winner's thread.
+        throw conflict(
+          "This thread idempotency key is already bound to a different task or destination",
+          { code: "chat_thread_reservation_mismatch" },
+        );
       }
       const [reservedPublication] = await tx
         .insert(chatPublications)

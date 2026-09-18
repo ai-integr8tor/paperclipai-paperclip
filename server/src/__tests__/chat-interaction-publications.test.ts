@@ -26,16 +26,13 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
 
-// External databases are opt-in. This suite performs destructive mutations, so
-// it only targets an operator-supplied PAPERCLIP_TEST_DATABASE_URL when they
-// explicitly acknowledge it is a dedicated test database; otherwise it uses a
-// disposable embedded Postgres.
-const externalTestDatabaseUrl =
-  process.env.PAPERCLIP_TEST_DATABASE_URL?.trim() || null;
-const useExternalTestDatabase =
-  process.env.PAPERCLIP_ALLOW_EXTERNAL_TEST_DATABASE === "1" &&
-  externalTestDatabaseUrl !== null;
+// External databases are opt-in and must name a dedicated test database. This
+// suite performs destructive mutations, so `resolveExternalTestDatabaseUrl`
+// refuses a non-test target and otherwise falls back to embedded Postgres.
+const externalTestDatabaseUrl = resolveExternalTestDatabaseUrl();
+const useExternalTestDatabase = externalTestDatabaseUrl !== null;
 const embeddedPostgresSupport = useExternalTestDatabase
   ? { supported: true }
   : await getEmbeddedPostgresTestSupport();
