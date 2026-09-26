@@ -47,6 +47,7 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import { DEFAULT_MUSE_LOCAL_MODEL } from "../index.js";
 import { isMuseAuthError, parseMuseJsonl } from "./parse.js";
+import { readCompanyMuseApiKey } from "./muse-home.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -230,6 +231,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // Do not set TBH_CREDENTIAL_BACKEND here: forcing the file backend hides a
     // macOS keychain `muse login`. META_API_KEY needs no backend at all.
     env.MUSE_NO_AUTO_UPDATE = "1";
+    // Credential precedence: a bound META_API_KEY (agent env or managed AI
+    // connection) > the company key from a sandbox device login > the host's
+    // own `muse login`.
+    let usedCompanyKey = false;
+    if (!config.managedAiConnection && !hasNonEmptyEnvValue({ ...process.env, ...env }, "META_API_KEY")) {
+      const companyKey = await readCompanyMuseApiKey(process.env, agent.companyId);
+      if (companyKey) {
+        env.META_API_KEY = companyKey;
+        usedCompanyKey = true;
+      }
+    }
 
     const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(executionTarget, asNumber(config.timeoutSec, 0));
     const graceSec = asNumber(config.graceSec, 20);
@@ -292,7 +304,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const managedMethod = asString(parseObject(config.managedAiConnection).method, "");
     const billingType: "api" | "subscription" = managedMethod
       ? (managedMethod === "api_key" ? "api" : "subscription")
-      : hasNonEmptyEnvValue(effectiveEnv, "META_API_KEY") ? "api" : "subscription";
+      : usedCompanyKey ? "subscription"
+        : hasNonEmptyEnvValue(effectiveEnv, "META_API_KEY") ? "api" : "subscription";
 
     const runtimeSessionParams = parseObject(runtime.sessionParams);
     const storedSessionId = asString(runtimeSessionParams.sessionId, runtime.sessionId ?? "");

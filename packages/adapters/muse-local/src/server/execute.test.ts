@@ -32,6 +32,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", () => ({
 }));
 
 import { execute, resolveMuseDataHome } from "./execute.js";
+import { promoteMuseDeviceLoginCredential } from "./muse-home.js";
 
 const fixture = (name: string) =>
   fs.readFile(path.join(path.dirname(fileURLToPath(import.meta.url)), "__fixtures__", name), "utf8");
@@ -184,6 +185,40 @@ describe("muse_local execute", () => {
       },
     }));
     expect(result.billingType).toBe("subscription");
+  });
+
+  const COMPANY_KEY = "LLM|666666666666666|companydevicelogin0000000";
+  const promoteCompanyKey = () => promoteMuseDeviceLoginCredential({
+    authBytes: Buffer.from(JSON.stringify({ providers: { meta: { api_key: COMPANY_KEY } } })),
+    companyId: "company-1", userInitiated: true, isSoleActiveOwner: () => true, log: () => {},
+  });
+
+  it("uses the company Muse key from a sandbox device login when nothing else is bound", async () => {
+    const root = await makeTempRoot();
+    await promoteCompanyKey();
+    mocks.runProcessMock.mockResolvedValue(await okRun());
+    const result = await execute(makeCtx(root));
+    const env = (mocks.runProcessMock.mock.calls[0]![4] as { env: Record<string, string> }).env;
+    expect(env.META_API_KEY).toBe(COMPANY_KEY);
+    expect(result.billingType).toBe("subscription");
+  });
+
+  it("prefers a bound META_API_KEY over the company key", async () => {
+    const root = await makeTempRoot();
+    await promoteCompanyKey();
+    mocks.runProcessMock.mockResolvedValue(await okRun());
+    await execute(makeCtx(root, { config: { cwd: root, paperclipRuntimeSkills: [], env: { META_API_KEY: "LLM|bound-key-0000000000000000000000000000000" } } }));
+    const env = (mocks.runProcessMock.mock.calls[0]![4] as { env: Record<string, string> }).env;
+    expect(env.META_API_KEY).toBe("LLM|bound-key-0000000000000000000000000000000");
+  });
+
+  it("prefers a managed connection over the company key", async () => {
+    const root = await makeTempRoot();
+    await promoteCompanyKey();
+    mocks.runProcessMock.mockResolvedValue(await okRun());
+    await execute(makeCtx(root, { config: { cwd: root, paperclipRuntimeSkills: [], env: { META_API_KEY: "LLM|managed-key-00000000000000000000000000000" }, managedAiConnection: { method: "subscription" } } }));
+    const env = (mocks.runProcessMock.mock.calls[0]![4] as { env: Record<string, string> }).env;
+    expect(env.META_API_KEY).toBe("LLM|managed-key-00000000000000000000000000000");
   });
 
   it("stages skills into .agents/skills and cleans them up", async () => {

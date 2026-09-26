@@ -72,3 +72,10 @@ export {
   parseMuseDeviceLoginPrompt,
   type DeviceLoginPrompt as MuseDeviceLoginPrompt,
 } from "./device-login-parse.js";
+export {
+  resolveManagedMuseHomeDir,
+  checkStagedMuseCredentialReadiness,
+  promoteMuseDeviceLoginCredential,
+  readCompanyMuseApiKey,
+  type PromoteMuseDeviceLoginCredentialOutcome,
+} from "./muse-home.js";
