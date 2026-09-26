@@ -701,7 +701,6 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
   it.each(["paused", "terminated", "pending_approval"] as const)(
     "skips resolved-dependency backstop candidates whose assignee is %s",
     async (assigneeStatus) => {
-      await enableAutoRecovery();
       const { companyId, agentId, blockedIssueId } =
         await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
       // Flip the assignee into a directly non-invokable state. The backstop
@@ -709,11 +708,11 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
       // wake that always fails with 409 and loops on every heartbeat.
       await db.update(agents).set({ status: assigneeStatus }).where(eq(agents.id, agentId));
 
-      const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+      const result = await heartbeatService(db).reconcileResolvedDependencyWakes();
 
-      expect(result.dependencyWakeBackstopChecked).toBe(0);
-      expect(result.dependencyWakesHealed).toBe(0);
-      expect(result.dependencyWakeIssueIds).not.toContain(blockedIssueId);
+      expect(result.checked).toBe(0);
+      expect(result.healed).toBe(0);
+      expect(result.issueIds).not.toContain(blockedIssueId);
 
       const wakes = await db
         .select({ id: agentWakeupRequests.id })
