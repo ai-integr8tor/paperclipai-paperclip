@@ -1,6 +1,6 @@
 # `muse_local` adapter: Muse Code subscription support
 
-Status: design approved 2026-09-26, spec awaiting review.
+Status: design approved 2026-09-26; rev 2 (phased, AI-connection provider `meta`) 2026-09-26.
 
 ## Goal
 
@@ -80,77 +80,110 @@ Modelled on `grok-local` (smallest adapter with device login) and
   does.
 - **Sessions:** the session codec stores `{sessionId, cwd}`. A heartbeat
   reuses `sessionId` when the stored cwd matches the current cwd; otherwise
-  it mints a fresh UUID. Muse's session store lives in the per-agent
-  `XDG_DATA_HOME`, so resume survives across heartbeats.
+  it lets Muse mint one and records `stream.id` from the output. Muse's session
+  store lives in the per-agent `XDG_DATA_HOME`, so resume survives across heartbeats.
 - **`parse.ts`:** a pure JSONL parser over MSP records, built from
   `muse schema` output and the recorded fixture
   `src/server/__fixtures__/exec-basic.jsonl` (recorded copy: `doc/plans/2026-09-26-muse-exec-basic.jsonl`). Unknown `record_type` values are
   ignored, not fatal.
-- **Skills:** Paperclip skills are linked into the agent's
-  `XDG_DATA_HOME/muse/skills/`, following `grok-local/src/server/skills.ts`.
+- **Skills:** Paperclip skills are copied into `<cwd>/.agents/skills/` for the
+  run (see "Run-time behaviour").
 - **`testEnvironment`:** reports the CLI path and version, and whether a
-  credential source exists (company secret, `META_API_KEY`, or a host login).
+  credential source exists (`META_API_KEY` or a host login) with a
+  `muse exec` hello probe.
   It never prints the key.
 - **UI:** a config form (model, reasoning effort, cwd, command, extraArgs,
   env, timeouts) and the login affordance flag, following `grok-local/src/ui`.
 
-### 2. Device login: profile `muse_local`
+### 2–4. Credentials, login and wiring (revised 2026-09-26, rev 2)
 
-Added next to `codex_local` and `grok_local` in
-`server/src/services/device-login-service.ts` (allow-list and profile map).
+Rev 1 said to put the key in a company secret named `MUSE_API_KEY`. Mapping the codebase showed
+that Paperclip already has a credential system for subscriptions, **AI
+connections** (`packages/shared/src/ai-connections.ts`), with providers
+`anthropic`, `openai`, `openrouter`, `xai`. Grok subscriptions are an `xai`
+AI connection whose secret is staged into each run. Muse joins that
+system as provider **`meta`** instead of inventing a parallel store. The work
+splits into three phases, each shippable on its own:
 
-- **Command:** `muse login`, run in the login sandbox with
-  `XDG_CONFIG_HOME=<login scratch home>/config`,
-  `XDG_DATA_HOME=<login scratch home>/data`, `TBH_CREDENTIAL_BACKEND=file`,
-  `MUSE_NO_AUTO_UPDATE=1`, stdin closed.
-- **Prompt parser** `parseMuseDeviceLoginPrompt` (a pure function, same rules as
-  the Grok parser): strip ANSI CSI; accept only origin `https://auth.meta.com`,
-  path `/oauth/device/`, exactly one query key `code`, no fragment; the code
-  matches `^[A-Z0-9]{4}-[A-Z0-9]{4}$` and equals the code on its own line after
-  `confirm this code matches:`. It never logs or throws input bytes.
-- **Completion:** the profile treats `Logged in.` plus exit 0 as success. It also
-  requires `Model API access verified.`, which is the CLI's own readiness check.
-- **Promotion** (`adapter-auth-promotion.ts`): read
-  `<scratch>/config/muse/auth.json` and assert its shape: a `providers.meta`
-  object, `mechanism === "oauth"`, and an `api_key` matching `^LLM\|` with a
-  length of 40–128 characters. Store only `api_key` as the company secret
-  `MUSE_API_KEY` (upsert; the same decision rules as Grok for user-initiated
-  vs background logins). Discard `access_token` and the user's name and email.
-  Delete the scratch home in a `finally` block.
+**Phase 1: the `muse_local` adapter.** The package (execute, JSONL parser,
+skills, environment test, session codec, UI and CLI parsers, config
+form) plus every adapter registration point (shared adapter types, server,
+UI and CLI registries, conversation and git-sensitive sets, packaging,
+telemetry enum). Credentials in phase 1: `META_API_KEY` from the agent's env
+bindings (an existing Paperclip secret binding), else the host's own `muse
+login`. Useful end to end on a machine where `muse login` has been run.
 
-### 3. Run-time credential and environment
+**Phase 2: AI connection provider `meta`.** Add `meta` to `AI_PROVIDERS` and
+`AI_CONNECTION_CAPABILITIES` with `subscription` and `api_key` methods, both
+for adapter `muse_local` with `envKey: "META_API_KEY"`. The stored secret is
+the bare `LLM|…` key for both methods. Runs inject it as `META_API_KEY`,
+so meta is **not** a `subscriptionFile` provider and needs no auth-file merge
+or rotation (the key has no expiry and no refresh token). Local terminal sign-in
+(`local-ai-login.ts`) prints
+`(export XDG_CONFIG_HOME=<home>/xdg XDG_DATA_HOME=<home>/xdg-data TBH_CREDENTIAL_BACKEND=file MUSE_NO_AUTO_UPDATE=1 && mkdir -p "$XDG_CONFIG_HOME" && muse login)`.
+The verifier reads `<home>/xdg/muse/auth.json`, extracts `providers.meta.api_key`,
+and live-checks it with `GET https://api.meta.ai/v1/models`. It also needs a
+DB migration that widens the two provider CHECK constraints
+(`ai_provider_defaults`, `ai_connection_defaults`), the UI provider lists and
+logo, and `agents.ts` provider and inheritable-key maps.
 
-`execute` builds the child environment as follows:
+**Phase 3: sandbox device login.** Add a closed login-command key `muse` in
+all three lockstep unions (`server/src/services/login-command.ts`,
+`packages/plugins/sandbox-providers/daytona/src/login-pty.ts`,
+`packages/plugins/sdk/src/protocol.ts`), a `muse_local` entry in
+`DISPLAYED_CODE_ADAPTER_TYPES` / `DISPLAYED_CODE_PROFILES`, a registry
+`loginCapability` (displayed_code), and a promotion in `agents.ts`. The
+sandbox credential reader only reads `<sessionHome>/auth.json` with
+`O_NOFOLLOW`, so the Daytona launch line for `muse` is fixed per key:
+`exec env XDG_CONFIG_HOME=<home>/xdg XDG_DATA_HOME=<home>/xdg-data TBH_CREDENTIAL_BACKEND=file MUSE_NO_AUTO_UPDATE=1 sh -c 'muse login && install -m 0600 "$XDG_CONFIG_HOME/muse/auth.json" <home>/auth.json'`.
+The reader stays unchanged. Promotion validates the Muse auth shape,
+then saves the bare key to the AI connection (managed sessions) or to the
+company home `<instance>/companies/<id>/muse-home/api-key` (0600) for
+unmanaged sessions, which `execute` reads into `META_API_KEY`. The runner image
+(`docker/daytona-runner/Dockerfile`) installs Muse with the launcher
+(`MUSE_LAUNCHER_INSTALL=1`). `muse_local` also joins `REMOTE_MANAGED_ADAPTERS`.
 
-- `META_API_KEY` = the company secret `MUSE_API_KEY`, when present.
-- `XDG_CONFIG_HOME` and `XDG_DATA_HOME` = per-agent directories under the
-  Paperclip instance data dir (`…/muse/<companyId>/<agentId>/{config,data}`),
-  created 0700.
-- `TBH_CREDENTIAL_BACKEND=file` and `MUSE_NO_AUTO_UPDATE=1`, always.
+**Prompt parser (phase 3):** `parseMuseDeviceLoginPrompt` is a pure function
+with the same rules as the Grok parser. It strips ANSI CSI and accepts only origin
+`https://auth.meta.com`, path `/oauth/device/`, exactly one query key `code`, and no
+fragment. The code must match `^[A-Z0-9]{4}-[A-Z0-9]{4}$` and equal the code on
+its own line after `confirm this code matches:`.
 
-With the company secret, the run never touches any keychain or the operator's
-`~/.config/muse`. **Host-login fallback:** when no company secret exists and
-`useHostLogin` is true (the default), `XDG_CONFIG_HOME` is left unset so the
-CLI uses the host user's own login (keychain on macOS). `XDG_DATA_HOME` stays
-per-agent either way.
+### Run-time behaviour (all phases)
 
-A 401 or `Your saved Meta credentials are invalid` / `No Meta credentials
-were found` fails the run with the error code `muse_auth_required` and a
-"log in to Muse again" message. There is no retry.
-
-### 4. Wiring
-
-- `server/src/adapters/registry.ts`: register execute, skills, testEnvironment,
-  sessionCodec, and login command/parser.
-- `server/src/services/device-login-service.ts`: add `muse_local` to the
-  reachable allow-list and profile map; `homeEnvVar` is not used for Muse. The
-  profile passes the XDG and backend variables from section 2 instead.
-- UI adapter picker and login button: the same registration points as `grok_local`.
-- Package manifests, workspace, tsconfig references, changelog.
+- argv: `exec --json --model <m> --reasoning-effort <e> --approval-mode never
+  --trust-workspace --workspace <cwd> --prompt-file <tmp> [--session-id <id>]
+  [extraArgs]`. `--trust-workspace` is required: without it Muse loads no
+  project skills or rules.
+- Instructions file: its contents are prepended to the prompt (as in kimi and gemini).
+  Skills: copied into `<cwd>/.agents/skills/<name>` for the run and removed
+  afterwards. Muse discovers `.agents/skills` and `.claude/skills` in trusted
+  workspaces (verified).
+- Env: `XDG_DATA_HOME` = `<instance>/companies/<companyId>/muse-data/<agentId>`
+  (session store, so resume survives heartbeats), `TBH_CREDENTIAL_BACKEND=file`,
+  and `MUSE_NO_AUTO_UPDATE=1`. `XDG_CONFIG_HOME` is left alone, so a host `muse login`
+  still works when no `META_API_KEY` is provided.
+- JSONL (fixtures `doc/plans/2026-09-26-muse-exec-{basic,tool,badkey}.jsonl`):
+  the session id is `stream.id`, and the model is `payload.model_id` on
+  `run.model.configured`. Assistant deltas are `payload.text` on `run.output.delta`.
+  Tool output is `payload.call_id` / `payload.text` on `tool.result`. The
+  final answer and status are `payload.text`, `payload.terminal`
+  (`completed|failed|cancelled`) and `payload.reason` on `run.terminal.completed`.
+  Failed tasks are `task.lifecycle.*` with `payload.event.kind = "failed"` and
+  `payload.event.reason`. **Muse emits no token usage in JSONL**, so usage
+  is reported as zero.
+- Auth failure: `terminal: "failed"` with a reason matching
+  `/API key .* was rejected|No Meta credentials|saved Meta credentials are invalid/`
+  sets `errorCode: "muse_auth_required"` and a "log in to Muse again" message.
+  There is no retry. An unknown resume session triggers one retry without
+  `--session-id`.
+- Billing: `provider: "meta"`, `biller: "muse"`, `billingType: "subscription"`,
+  `costUsd: null`.
 
 ## Security
 
-- Muse keys are stored only as company secrets. They never go into
+- Muse keys are stored only as Paperclip secrets or AI connection secrets (or the
+  0600 company-home file in phase 3). They never go into
   config JSON, logs, transcripts, thrown errors, or run results. Add `LLM|…`
   to `server/src/middleware/redact-sensitive.ts` patterns.
 - The parser rejects any URL that isn't `https://auth.meta.com/oauth/device/`,
