@@ -64,3 +64,4 @@ export { execute, resolveMuseDataHome } from "./execute.js";
 export { listMuseSkills, syncMuseSkills } from "./skills.js";
 export { parseMuseJsonl, isMuseAuthError, type ParsedMuseJsonl } from "./parse.js";
 export { testEnvironment } from "./test.js";
+export { parseMuseAuthApiKey } from "./muse-auth.js";
