@@ -17,7 +17,7 @@ import { admitExplicitNativeContinuation, undeliveredLegacyUserCommentIds } from
 import { connectionIntentService } from "./connection-intents.js";
 import { managedAiSessionFingerprintConfig, prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
 import { aiConnectionBindingSchema } from "@paperclipai/shared";
-import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
+import { executionBlockerPredicate, getExecutionBlocker, isSettledNoReplayHoldOnly, releaseSettledNoReplayHold } from "./execution-blocker.js";
 import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
 import { recordExecutionWait } from "./execution-wait.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-runtime/native-review-participant.js";
@@ -26932,6 +26932,7 @@ export function heartbeatService(
               executionWorkspacePreference: issues.executionWorkspacePreference,
               executionWorkspaceSettings: issues.executionWorkspaceSettings,
               assigneeAgentId: issues.assigneeAgentId,
+              assigneeUserId: issues.assigneeUserId,
               executionRunId: issues.executionRunId,
               executionAgentNameKey: issues.executionAgentNameKey,
               createdAt: issues.createdAt,
@@ -27140,6 +27141,43 @@ export function heartbeatService(
             }
             return { kind: "deferred" as const };
           };
+          // A settled automatic no-replay hold is a durable "verify before
+          // continuing" decision, but it must not lock an issue forever:
+          // without a release every later wake is parked as
+          // `deferred_issue_execution` with no run and the board has no action
+          // to resolve. Prove eligibility here and release the hold below, on
+          // the path that actually creates this wake's run.
+          let strandedNoReplayHoldReleasable = false;
+          // A refusal that names a live obligation — a pending decision, an
+          // unsettled provider, an unsafe workspace — is not the hold's own
+          // verdict, so the fallback must not overrule it.
+          let continuationRefusedByLiveObligation = false;
+          const canReleaseStrandedNoReplayHold = async () => {
+            // Only a fresh assignment of this issue to this agent is a new
+            // execution decision. Every continuation of the parked execution —
+            // an automation wake, a comment, a queued interrupt — stays parked,
+            // so the one-time release can never grant the automatic retry the
+            // no-replay hold refuses.
+            if (source !== "assignment") return false;
+            // A mention can wake an agent who does not own the issue; only the
+            // agent the issue is assigned to may retire its hold.
+            if (!issue.assigneeAgentId || issue.assigneeAgentId !== agentId) return false;
+            // A wake that carries a user message is judged by the explicit
+            // continuation contract; the release must not overrule that verdict.
+            // Only a message-less assignment decision retires the hold.
+            if (durableRequest || wakeCommentId) return false;
+            if (continuationRefusedByLiveObligation) return false;
+            // Only a plainly re-runnable issue may lose the hold: an open task
+            // with a single invokable agent owner and no human owner. An active
+            // or escalated action, a conversation owner, or an unsafe workspace
+            // archive keeps parking exactly as before.
+            if (!["todo", "blocked"].includes(issue.status)) return false;
+            if (issue.assigneeUserId) return false;
+            const assignee = await getAgent(issue.assigneeAgentId);
+            if (!assignee || assignee.companyId !== issue.companyId ||
+                assignee.status === "paused" || assignee.status === "terminated") return false;
+            return isSettledNoReplayHoldOnly(tx as unknown as Db, issue.companyId, issue.id);
+          };
           const explicitContinuationRunId = randomUUID();
           const executionBlocker = await getExecutionBlocker(
             tx as unknown as Db, issue.companyId, issue.id,
@@ -27150,16 +27188,27 @@ export function heartbeatService(
           // A bound chat request has already rechecked its current principal
           // above. Treat its new user message like a board comment, but keep
           // failed-run retry actions on their separate exact-request path.
-          if (executionBlocker && !(await admitExplicitNativeContinuation({
-            db: tx as unknown as Db, companyId: issue.companyId, issueId: issue.id,
-            agentId, actorType: opts.requestedByActorType, actorId: opts.requestedByActorId,
-            reason: durableRequest && !failedChatRetry ? "issue_commented" : reason,
-            commentId: wakeCommentId ?? null, failedRunId: opts.failedRunId, successorRunId: explicitContinuationRunId,
-            queuedCommentInterruptId: opts.queuedCommentInterruptId,
-            queuedCommentRequestId: opts.queuedCommentRequestId,
-            dryRun: true,
-            onBlocked: (reason, message) => { continuationWait = { reason, message }; },
-          }))) return deferBlockedExecution(executionBlocker);
+          if (executionBlocker) {
+            // Prove the existing explicit-continuation contract first; only a
+            // wake that contract refuses may fall back to the one-time release
+            // of a settled no-replay hold.
+            if (!(await admitExplicitNativeContinuation({
+              db: tx as unknown as Db, companyId: issue.companyId, issueId: issue.id,
+              agentId, actorType: opts.requestedByActorType, actorId: opts.requestedByActorId,
+              reason: durableRequest && !failedChatRetry ? "issue_commented" : reason,
+              commentId: wakeCommentId ?? null, failedRunId: opts.failedRunId, successorRunId: explicitContinuationRunId,
+              queuedCommentInterruptId: opts.queuedCommentInterruptId,
+              queuedCommentRequestId: opts.queuedCommentRequestId,
+              dryRun: true,
+              onBlocked: (reason, message) => {
+                continuationRefusedByLiveObligation = true;
+                continuationWait = { reason, message };
+              },
+            }))) {
+              strandedNoReplayHoldReleasable = await canReleaseStrandedNoReplayHold();
+              if (!strandedNoReplayHoldReleasable) return deferBlockedExecution(executionBlocker);
+            }
+          }
 
           const issueStateGuard = opts.issueStateGuard;
           if (
@@ -27924,7 +27973,18 @@ export function heartbeatService(
             queuedCommentInterruptId: opts.queuedCommentInterruptId,
             queuedCommentRequestId: opts.queuedCommentRequestId,
           });
-          if (!explicitContinuation && executionBlocker) return deferBlockedExecution(executionBlocker);
+          // Retire a settled no-replay hold on the path that actually creates
+          // this wake's run, in the same transaction, so a declined wake can
+          // never leave the issue unblocked without a run.
+          if (!explicitContinuation && executionBlocker) {
+            if (!strandedNoReplayHoldReleasable ||
+                !(await releaseSettledNoReplayHold(tx as unknown as Db, {
+                  companyId: issue.companyId, issueId: issue.id, agentId, reason,
+                  actorType: opts.requestedByActorType, actorId: opts.requestedByActorId,
+                }))) {
+              return deferBlockedExecution(executionBlocker);
+            }
+          }
           if (explicitContinuation) {
             enrichedContextSnapshot.forceFreshSession = true;
             enrichedContextSnapshot.previousRunId = explicitContinuation.previousRunId;
