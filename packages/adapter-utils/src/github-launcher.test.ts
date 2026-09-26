@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { createServer } from "node:http";
+import { connect, type AddressInfo } from "node:net";
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -66,9 +67,9 @@ describe("managed GitHub launchers", () => {
     } });
   });
 
-  it("retries the broker through an authenticating HTTP proxy when direct loopback is refused", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-proxy-"));
-    cleanups.push(() => rm(root, { recursive: true, force: true }));
+  // Claude Code's Seatbelt sandbox denies direct sockets with EPERM. Reproduce that
+  // failure without a sandbox by preloading a fetch that fails the same way.
+  async function sandboxLauncher(root: string) {
     const bin = path.join(root, "managed"), realBin = path.join(root, "real");
     await mkdir(bin); await mkdir(realBin);
     await writeFile(path.join(bin, "gh"), githubLauncherSource(), { mode: 0o700 });
@@ -77,32 +78,119 @@ const env = process.env, count = Number(env.GIT_CONFIG_COUNT);
 const config = Array.from({ length: count }, (_, i) => env['GIT_CONFIG_KEY_' + i] + '=' + env['GIT_CONFIG_VALUE_' + i]);
 process.stdout.write(JSON.stringify({ token: env.GH_TOKEN ?? null, config }));
 `, { mode: 0o700 });
-    // Nothing listens on the broker port, so the direct fetch fails like a sandbox EPERM.
+    const denyDirect = path.join(root, "deny-direct-sockets.cjs");
+    await writeFile(denyDirect, `globalThis.fetch = async () => { throw new TypeError("fetch failed", { cause: Object.assign(new Error("connect EPERM"), { code: "EPERM" }) }); };\n`);
+    return async (brokerUrl: string, proxyEnv: Record<string, string>, options: { sandboxed: boolean } = { sandboxed: true }) => {
+      const result = await exec(path.join(bin, "gh"), [], { env: {
+        ...process.env, HTTP_PROXY: "", http_proxy: "", HTTPS_PROXY: "", https_proxy: "",
+        ...githubBrokerEnvironment({}, { url: brokerUrl, token: "run-capability" }),
+        PAPERCLIP_API_KEY: "agent-api-key", ...proxyEnv,
+        NODE_OPTIONS: options.sandboxed ? `--require ${denyDirect}` : "",
+        PATH: `${bin}:${realBin}:${process.env.PATH}`,
+      } });
+      return { stderr: result.stderr, output: JSON.parse(result.stdout) as { token: string | null; config: string[] } };
+    };
+  }
+
+  // Records everything a proxy receives: absolute-form requests, CONNECT
+  // requests, and every byte sent through an accepted tunnel.
+  async function recordingProxy(host = "127.0.0.1", tunnelTo?: number) {
+    const seen: Array<{ method?: string; target?: string; headers: Record<string, unknown>; bytes: Buffer }> = [];
+    const server = createServer((req, res) => {
+      seen.push({ method: req.method, target: req.url, headers: req.headers, bytes: Buffer.alloc(0) });
+      res.statusCode = 502; res.end();
+    });
+    server.on("connect", (req, socket, head: Buffer) => {
+      const entry = { method: req.method, target: req.url, headers: req.headers, bytes: head };
+      seen.push(entry);
+      if (tunnelTo) {
+        const upstream = connect(tunnelTo, "127.0.0.1", () => {
+          socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+          upstream.write(head); upstream.pipe(socket); socket.pipe(upstream);
+        });
+        upstream.on("error", () => socket.destroy());
+        return;
+      }
+      socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      // Capture what the launcher sends, then drop the tunnel.
+      socket.once("data", (chunk: Buffer) => { entry.bytes = Buffer.concat([entry.bytes, chunk]); socket.destroy(); });
+      socket.on("error", () => {});
+    });
+    await new Promise<void>(resolve => server.listen(0, host, resolve));
+    cleanups.push(() => new Promise<void>(resolve => { server.closeAllConnections(); server.close(() => resolve()); }));
+    return { seen, port: (server.address() as AddressInfo).port };
+  }
+
+  async function closedPort() {
     const closed = createServer();
     await new Promise<void>(resolve => closed.listen(0, "127.0.0.1", resolve));
-    const brokerPort = (closed.address() as { port: number }).port;
+    const port = (closed.address() as AddressInfo).port;
     await new Promise<void>(resolve => closed.close(() => resolve()));
-    const seen: Array<{ method?: string; url?: string; proxyAuthorization?: string; capability?: string | string[] }> = [];
-    const proxy = createServer((req, res) => {
-      seen.push({ method: req.method, url: req.url, proxyAuthorization: req.headers["proxy-authorization"], capability: req.headers["x-paperclip-github-capability"] });
+    return port;
+  }
+
+  it("tunnels the broker call through the loopback sandbox proxy when direct sockets are denied", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-proxy-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const run = await sandboxLauncher(root);
+    const brokerSeen: Array<{ method?: string; url?: string; capability?: string | string[] }> = [];
+    const broker = createServer((req, res) => {
+      brokerSeen.push({ method: req.method, url: req.url, capability: req.headers["x-paperclip-github-capability"] });
       res.setHeader("content-type", "application/json");
       res.end(JSON.stringify({ status: "available", env: { GH_TOKEN: "brokered-token" } }));
     });
-    await new Promise<void>(resolve => proxy.listen(0, "127.0.0.1", resolve));
-    cleanups.push(() => new Promise<void>((resolve, reject) => proxy.close(error => error ? reject(error) : resolve())));
-    const proxyUrl = `http://proxy-user:proxy%20pass@127.0.0.1:${(proxy.address() as { port: number }).port}`;
-    const result = await exec(path.join(bin, "gh"), [], { env: {
-      ...process.env, ...githubBrokerEnvironment({}, { url: `http://127.0.0.1:${brokerPort}`, token: "run-capability" }),
-      HTTP_PROXY: proxyUrl, HTTPS_PROXY: proxyUrl, PATH: `${bin}:${realBin}:${process.env.PATH}`,
-    } });
-    const output = JSON.parse(result.stdout);
+    await new Promise<void>(resolve => broker.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>(resolve => { broker.closeAllConnections(); broker.close(() => resolve()); }));
+    const brokerPort = (broker.address() as AddressInfo).port;
+    const proxy = await recordingProxy("127.0.0.1", brokerPort);
+    const proxyUrl = `http://proxy-user:proxy%20pass@127.0.0.1:${proxy.port}`;
+    const { stderr, output } = await run(`http://127.0.0.1:${brokerPort}`, { HTTP_PROXY: proxyUrl, HTTPS_PROXY: proxyUrl });
     expect(output.token).toBe("brokered-token");
     expect(output.config).toContain("http.proxyAuthMethod=basic");
-    expect(result.stderr).not.toContain("broker_transport_unavailable");
-    expect(seen).toEqual([{
-      method: "POST", url: `http://127.0.0.1:${brokerPort}/runtime-tools/github/credentials`,
-      proxyAuthorization: `Basic ${Buffer.from("proxy-user:proxy pass").toString("base64")}`, capability: "run-capability",
-    }]);
+    expect(stderr).not.toContain("broker_transport_unavailable");
+    expect(proxy.seen).toHaveLength(1);
+    expect(proxy.seen[0]).toMatchObject({ method: "CONNECT", target: `127.0.0.1:${brokerPort}` });
+    expect(proxy.seen[0].headers["proxy-authorization"]).toBe(`Basic ${Buffer.from("proxy-user:proxy pass").toString("base64")}`);
+    expect(proxy.seen[0].headers).not.toHaveProperty("authorization");
+    expect(proxy.seen[0].headers).not.toHaveProperty("x-paperclip-github-capability");
+    expect(brokerSeen).toEqual([{ method: "POST", url: "/runtime-tools/github/credentials", capability: "run-capability" }]);
+  });
+
+  it.each([
+    ["the overridden proxy is not on loopback", { sandboxed: true, proxyHost: "0.0.0.0", scheme: "http", broker: "loopback" }],
+    ["the overridden proxy is not plain HTTP", { sandboxed: true, proxyHost: "127.0.0.1", scheme: "https", broker: "loopback" }],
+    ["the direct failure is not a sandbox denial", { sandboxed: false, proxyHost: "127.0.0.1", scheme: "http", broker: "loopback" }],
+    ["a plain-HTTP broker is not on loopback", { sandboxed: true, proxyHost: "127.0.0.1", scheme: "http", broker: "remote" }],
+  ] as const)("never sends broker credentials to HTTP_PROXY when %s", async (_case, scenario) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-rogue-proxy-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const run = await sandboxLauncher(root);
+    const rogue = await recordingProxy(scenario.proxyHost === "0.0.0.0" ? "0.0.0.0" : "127.0.0.1");
+    const rogueUrl = `${scenario.scheme}://rogue:rogue@${scenario.proxyHost}:${rogue.port}`;
+    const brokerUrl = scenario.broker === "loopback" ? `http://127.0.0.1:${await closedPort()}` : "http://broker.example.test";
+    const { stderr, output } = await run(brokerUrl, { HTTP_PROXY: rogueUrl, http_proxy: rogueUrl }, { sandboxed: scenario.sandboxed });
+    expect(stderr).toContain("broker_transport_unavailable");
+    expect(output.token).toBeNull();
+    expect(rogue.seen).toEqual([]);
+  });
+
+  it("retries an unreachable HTTPS broker through the sandbox proxy inside end-to-end TLS", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-https-proxy-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const run = await sandboxLauncher(root);
+    const proxy = await recordingProxy();
+    const proxyUrl = `http://127.0.0.1:${proxy.port}`;
+    // No preload: .test never resolves, like the sandbox's denied DNS.
+    const { stderr, output } = await run("https://broker.example.test:8443", { HTTPS_PROXY: proxyUrl, HTTP_PROXY: proxyUrl }, { sandboxed: false });
+    // The recording proxy is not the broker, so TLS cannot complete.
+    expect(stderr).toContain("broker_transport_unavailable");
+    expect(output.token).toBeNull();
+    expect(proxy.seen).toHaveLength(1);
+    expect(proxy.seen[0]).toMatchObject({ method: "CONNECT", target: "broker.example.test:8443" });
+    const tunneled = proxy.seen[0].bytes;
+    expect(tunneled[0]).toBe(0x16); // TLS handshake record, not a plaintext request
+    expect(tunneled.includes("broker.example.test")).toBe(true); // SNI names the broker
+    for (const secret of ["run-capability", "agent-api-key", "Bearer", "credentials"]) expect(tunneled.includes(secret)).toBe(false);
   });
 
   it("explains unavailable access while allowing local work without credentials", async () => {

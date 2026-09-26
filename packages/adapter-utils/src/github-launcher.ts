@@ -62,39 +62,71 @@ async function main() {
       const url = base.replace(/\/+$/, '').replace(/\/api$/, '') + '/runtime-tools/github/credentials';
       const headers = { authorization: 'Bearer ' + (env.PAPERCLIP_GITHUB_BRIDGE_TOKEN || env.PAPERCLIP_API_KEY || env.PAPERCLIP_GITHUB_BROKER_TOKEN),
         'x-paperclip-github-capability': env.PAPERCLIP_GITHUB_BROKER_TOKEN, 'content-type': 'application/json' };
-      // Node fetch ignores HTTP_PROXY, and agent sandboxes (Claude Code Seatbelt)
-      // deny direct sockets, loopback included, while forcing loopback into
-      // NO_PROXY. If the direct call fails, retry through the sandbox's HTTP
-      // proxy; its allowlist still decides. Egress is never widened.
-      const proxy = env.HTTP_PROXY || env.http_proxy;
+      // Node fetch ignores HTTP_PROXY. Agent sandboxes (Claude Code Seatbelt) deny
+      // direct sockets, loopback included, with EPERM and leave a loopback proxy as
+      // the only way out. The broker bearer and capability must not reach a proxy
+      // the agent picked, so the fallback is deliberately narrow:
+      // - the proxy must be http:// on a loopback literal with an explicit port.
+      //   Inside the sandbox the agent cannot bind loopback, so that is the
+      //   sandbox's own proxy; remote proxies are never used;
+      // - requests always go through a CONNECT tunnel. HTTPS brokers get
+      //   end-to-end TLS verified against the broker host, so the proxy sees only
+      //   ciphertext; the sandbox also denies DNS, so any direct failure retries.
+      // - plain-HTTP brokers must be loopback IPs and retry only after a sandbox
+      //   socket denial (EPERM/EACCES); a refused or timed-out broker never
+      //   consults HTTP_PROXY. The proxy allowlist still decides egress.
+      const target = new URL(url);
+      const secure = target.protocol === 'https:';
+      const proxy = (() => {
+        try { return new URL(secure ? (env.HTTPS_PROXY || env.https_proxy || '') : (env.HTTP_PROXY || env.http_proxy || '')); } catch { return null; }
+      })();
+      const trustedProxy = proxy && proxy.protocol === 'http:' && proxy.port && ['localhost', '127.0.0.1', '[::1]'].includes(proxy.hostname) ? proxy : null;
+      const tunnelable = secure || (target.protocol === 'http:' && ['127.0.0.1', '[::1]'].includes(target.hostname));
+      const retryable = (error) => secure || ['EPERM', 'EACCES'].includes(error && error.cause && error.cause.code);
       let viaProxy = false;
-      const proxyPost = () => new Promise((resolve, reject) => {
+      const tunnelPost = () => new Promise((resolve, reject) => {
         const http = require('node:http');
-        const p = new URL(proxy);
-        const proxyHeaders = { ...headers, 'content-length': '2' };
-        if (p.username) proxyHeaders['proxy-authorization'] = 'Basic ' + Buffer.from(decodeURIComponent(p.username) + ':' + decodeURIComponent(p.password)).toString('base64');
-        const request = http.request({ host: p.hostname, port: p.port || 80, method: 'POST', path: url, headers: proxyHeaders, timeout: 10000 }, (res) => {
-          const chunks = [];
-          res.on('data', (c) => chunks.push(c));
-          res.on('end', () => {
-            const text = Buffer.concat(chunks).toString('utf8');
-            const status = res.statusCode || 0;
-            resolve({ status, ok: status >= 200 && status < 300, json: async () => JSON.parse(text), arrayBuffer: async () => {} });
+        const port = target.port || (secure ? '443' : '80');
+        const authority = target.hostname + ':' + port;
+        const connectHeaders = { host: authority };
+        if (trustedProxy.username) connectHeaders['proxy-authorization'] = 'Basic ' + Buffer.from(decodeURIComponent(trustedProxy.username) + ':' + decodeURIComponent(trustedProxy.password)).toString('base64');
+        const connect = http.request({ host: trustedProxy.hostname.replace(/^\[|\]$/g, ''), port: trustedProxy.port, method: 'CONNECT', path: authority, headers: connectHeaders, timeout: 10000, agent: false });
+        connect.on('timeout', () => connect.destroy(new Error('timeout')));
+        connect.on('error', reject);
+        connect.on('connect', (res, socket) => {
+          if (res.statusCode !== 200) { socket.destroy(); reject(new Error('proxy refused tunnel')); return; }
+          const host = target.hostname.replace(/^\[|\]$/g, '');
+          const stream = secure
+            ? require('node:tls').connect({ socket, host, rejectUnauthorized: true, servername: require('node:net').isIP(host) ? undefined : host })
+            : socket;
+          const request = http.request({
+            createConnection: () => stream, method: 'POST', path: target.pathname + target.search, timeout: 10000,
+            headers: { ...headers, host: target.host, 'content-length': '2', connection: 'close' },
+          }, (response) => {
+            const chunks = [];
+            response.on('data', (c) => chunks.push(c));
+            response.on('end', () => {
+              stream.destroy();
+              const text = Buffer.concat(chunks).toString('utf8');
+              const status = response.statusCode || 0;
+              resolve({ status, ok: status >= 200 && status < 300, json: async () => JSON.parse(text), arrayBuffer: async () => {} });
+            });
+            response.on('error', reject);
           });
-          res.on('error', reject);
+          request.on('timeout', () => request.destroy(new Error('timeout')));
+          request.on('error', reject);
+          request.end('{}');
         });
-        request.on('timeout', () => request.destroy(new Error('timeout')));
-        request.on('error', reject);
-        request.end('{}');
+        connect.end();
       });
       const post = async () => {
-        if (viaProxy) return proxyPost();
+        if (viaProxy) return tunnelPost();
         try {
           return await fetch(url, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10000), headers, body: '{}' });
         } catch (error) {
-          if (!proxy || !/^http:\/\//i.test(url) || !/^http:\/\//i.test(proxy)) throw error;
+          if (!retryable(error) || !trustedProxy || !tunnelable) throw error;
           viaProxy = true;
-          return proxyPost();
+          return tunnelPost();
         }
       };
       for (let attempt = 0; attempt < 30; attempt++) {
