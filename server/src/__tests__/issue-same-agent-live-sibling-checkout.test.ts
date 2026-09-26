@@ -201,7 +201,11 @@ describeEmbeddedPostgres("same-agent live sibling checkout lock", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]);
     expect(row?.title).toBe("Written by sibling run");
-    expect(row?.checkoutRunId).toBe(seed.actorRunId);
+    // TES-256: authorization must not be a side effect of a write. The sibling is
+    // allowed to write, but the live holder keeps its lock. This assertion used to
+    // read `.toBe(seed.actorRunId)` — it enshrined the lock theft as intended
+    // behaviour, which is the defect.
+    expect(row?.checkoutRunId).toBe(seed.siblingRunId);
   });
 
   it("lets the same assignee agent comment on an issue held by a live sibling run", async () => {
@@ -299,10 +303,11 @@ describeEmbeddedPostgres("same-agent live sibling checkout lock", () => {
     });
     const svc = issueService(db);
 
-    // The assignee's sibling run: admitted.
+    // The assignee's sibling run: admitted, WITHOUT taking the holder's lock.
+    // The returned `checkoutRunId` is still the live holder's (TES-256).
     await expect(
       svc.assertCheckoutOwner(issueId, seed.assigneeAgentId, seed.actorRunId),
-    ).resolves.toMatchObject({ checkoutRunId: seed.actorRunId });
+    ).resolves.toMatchObject({ checkoutRunId: seed.siblingRunId });
 
     // A different agent: refused, and the refusal names the true actor.
     await expect(

@@ -7023,7 +7023,7 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
     ).rejects.toMatchObject({ status: 409 });
   });
 
-  it("admits a live sibling run of the assignee agent", async () => {
+  it("admits a live sibling run of the assignee agent without taking its lock", async () => {
     const seeded = await seedOwnershipIssue({ checkoutStatus: "running" });
 
     const ownership = await svc.assertCheckoutOwner(
@@ -7032,8 +7032,25 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
       seeded.actorRunId,
     );
 
-    expect(ownership.checkoutRunId).toBe(seeded.actorRunId);
-    expect(ownership.adoptedFromRunId).toBe(seeded.staleRunId);
+    // The holder is `running`, so it holds the lock legitimately. The sibling is
+    // authorized to write, but the lock does not move (TES-256) and nothing is
+    // reported as adopted. This used to assert the opposite — that a live
+    // holder's lock is handed to a sibling run.
+    expect(ownership.checkoutRunId).toBe(seeded.staleRunId);
+    expect(ownership.adoptedFromRunId).toBeNull();
+
+    const row = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, seeded.issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      checkoutRunId: seeded.staleRunId,
+      executionRunId: seeded.staleRunId,
+    });
   });
 
   it("does not let terminal actor runs adopt stale checkout ownership", async () => {

@@ -5282,11 +5282,12 @@ export function issueRoutes(
     options: {
       allowVisibleIssueWrite?: boolean;
       /**
-       * Set by channels that must not take ownership of a run lock as a side
-       * effect. `assertCheckoutOwner` adopts a live same-agent sibling's
-       * checkout so the assignee can WRITE, but release is not a write: adopting
-       * first would rebind the holder's lock to the actor and make the release
-       * look like the actor's own run releasing its own lock (TES-250).
+       * Set by channels that must not consult run-lock adoption at all.
+       * `assertCheckoutOwner` only writes on the stale-holder path (TES-256); on a
+       * LIVE same-agent sibling it now returns an authorization without touching
+       * the lock. Release additionally skips the check entirely, so a channel that
+       * only needs to know whether the lock is its own can never be the thing that
+       * moves it.
        */
       skipRunLockAdoption?: boolean;
     } = {},
@@ -15242,10 +15243,11 @@ export function issueRoutes(
       "Issue not found",
     );
     if (!existing) return;
-    // Release must judge the lock as the HOLDER left it. Adopting a live
-    // same-agent sibling's checkout here would rebind the lock to this run
-    // first, so the release would always look like a self-release and the
-    // running holder would lose its issue mid-flight (TES-250).
+    // Release must judge the lock as the HOLDER left it. Defence in depth: since
+    // TES-256 a live same-agent sibling's write authorization no longer moves the
+    // lock, so the release can no longer be tricked into looking like a
+    // self-release. Skipping the check keeps that guarantee from depending on the
+    // service layer's current shape.
     if (
       !(await assertAgentIssueMutationAllowed(req, res, existing, {
         skipRunLockAdoption: true,

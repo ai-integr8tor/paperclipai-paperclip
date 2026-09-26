@@ -7429,10 +7429,6 @@ export function issueService(db: Db) {
     actorAgentId: string;
     actorRunId: string;
     expectedCheckoutRunId: string;
-    // Checkout acquisition stays strictly per-run: a second run of the same agent
-    // must not steal the lock. Writes are different — the assignee has to be able to
-    // write its own issue — so only that path opts in to yielding to a live sibling.
-    allowSameAgentLiveSibling?: boolean;
   }) {
     return db.transaction(async (tx) => {
       const lockedIssue = await tx
@@ -7448,7 +7444,7 @@ export function issueService(db: Db) {
         .for("update")
         .then((rows) => rows[0] ?? null);
       if (!lockedIssue) {
-        return { adopted: null, latest: null };
+        return { adopted: null, latest: null, sameAgentLiveSibling: false };
       }
 
       if (
@@ -7456,7 +7452,7 @@ export function issueService(db: Db) {
         lockedIssue.assigneeAgentId !== input.actorAgentId ||
         lockedIssue.checkoutRunId !== input.expectedCheckoutRunId
       ) {
-        return { adopted: null, latest: lockedIssue };
+        return { adopted: null, latest: lockedIssue, sameAgentLiveSibling: false };
       }
 
       await Promise.all([
@@ -7482,11 +7478,10 @@ export function issueService(db: Db) {
       // A live sibling run of the SAME agent holds the lock legitimately, but the
       // assignee must still be able to write its own issue. The lock is stored per
       // issue yet granted per run, so a second concurrent run of the assignee can
-      // never satisfy sameRunLock. Yield the lock to the actor when the holder is a
-      // non-terminal run of the same agent; the holder can re-adopt on its next
-      // write by the symmetric path.
+      // never satisfy sameRunLock. Report that case so the caller can AUTHORIZE the
+      // write without touching the lock — taking the lock here is what let a
+      // sibling strip a still-running holder's issue (TES-256).
       const sameAgentLiveSibling =
-        input.allowSameAgentLiveSibling === true &&
         existingRun != null &&
         actorRun != null &&
         existingRun.agentId === actorRun.agentId &&
@@ -7495,8 +7490,17 @@ export function issueService(db: Db) {
         !existingRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(existingRun.status);
       const actorLive =
         actorRun && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status);
-      if ((!stale && !sameAgentLiveSibling) || !actorLive) {
-        return { adopted: null, latest: lockedIssue };
+      if (sameAgentLiveSibling) {
+        // A TERMINAL actor run is not a live sibling: it must gain no write
+        // rights through this path, exactly as on the stale-adoption path.
+        if (!actorLive) {
+          return { adopted: null, latest: lockedIssue, sameAgentLiveSibling: false };
+        }
+        // No write. The holder keeps its lock, its assignee and its status.
+        return { adopted: null, latest: lockedIssue, sameAgentLiveSibling: true };
+      }
+      if (!stale || !actorLive) {
+        return { adopted: null, latest: lockedIssue, sameAgentLiveSibling: false };
       }
 
       const now = new Date();
@@ -7525,7 +7529,7 @@ export function issueService(db: Db) {
         })
         .then((rows) => rows[0] ?? null);
       if (adopted) {
-        return { adopted, latest: adopted };
+        return { adopted, latest: adopted, sameAgentLiveSibling: false };
       }
 
       const latest = await tx
@@ -7539,7 +7543,7 @@ export function issueService(db: Db) {
         .from(issues)
         .where(eq(issues.id, input.issueId))
         .then((rows) => rows[0] ?? null);
-      return { adopted: null, latest };
+      return { adopted: null, latest, sameAgentLiveSibling: false };
     });
   }
 
@@ -11666,7 +11670,6 @@ export function issueService(db: Db) {
             actorAgentId,
             actorRunId,
             expectedCheckoutRunId: previousCheckoutRunId,
-            allowSameAgentLiveSibling: true,
           });
 
           if (staleAdoption.adopted) {
@@ -11674,6 +11677,32 @@ export function issueService(db: Db) {
               ownership: {
                 ...staleAdoption.adopted,
                 adoptedFromRunId: previousCheckoutRunId,
+              },
+              latest: null,
+            };
+          }
+
+          // The holder is a live run of the SAME agent, so it holds the lock
+          // legitimately — but the assignee must still be able to WRITE its own
+          // issue, and the lock is stored per issue while granted per run, so a
+          // second concurrent run of the assignee can never satisfy sameRunLock.
+          //
+          // Authorize the write WITHOUT taking the lock (TES-256). Rebinding
+          // `checkoutRunId` here made authorization a side effect of a write:
+          // the holder lost its own issue mid-flight, and because the caller then
+          // saw `checkoutRunId === actorRunId`, every later channel (notably
+          // `release`) concluded it was acting on its own lock and cleared the
+          // assignee, the checkout and the status. A grant that reads the holder's
+          // liveness and writes nothing cannot strip a still-running run.
+          if (staleAdoption.sameAgentLiveSibling && staleAdoption.latest) {
+            return {
+              ownership: {
+                id,
+                status: staleAdoption.latest.status,
+                assigneeAgentId: staleAdoption.latest.assigneeAgentId,
+                checkoutRunId: staleAdoption.latest.checkoutRunId,
+                executionRunId: staleAdoption.latest.executionRunId,
+                adoptedFromRunId: null as string | null,
               },
               latest: null,
             };
