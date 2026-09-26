@@ -2342,6 +2342,21 @@ function shouldHumanCommentResumeInProgressScheduledRetry(input: {
   );
 }
 
+function isFutureProviderQuotaRetry(
+  retry: {
+    status: string;
+    errorFamily?: string | null;
+    scheduledRetryAt: Date | null;
+  } | null,
+) {
+  return (
+    retry?.status === "scheduled_retry" &&
+    retry.errorFamily === "provider_quota" &&
+    retry.scheduledRetryAt != null &&
+    retry.scheduledRetryAt.getTime() > Date.now()
+  );
+}
+
 function isExplicitResumeCapableStatus(status: string | null | undefined) {
   return (
     status === "done" ||
@@ -13027,7 +13042,9 @@ export function issueRoutes(
           : null;
       const shouldResumeInProgressScheduledRetry =
         !!scheduledRetryForHumanComment &&
-        scheduledRetryForHumanComment.agentId === requestedAssigneeAgentId;
+        scheduledRetryForHumanComment.agentId === requestedAssigneeAgentId &&
+        (resumeRequested === true ||
+          !isFutureProviderQuotaRetry(scheduledRetryForHumanComment));
       const assigneeSelfCommentOnTerminal =
         isAssigneeSelfCommentOnTerminalIssue({
           hasCommentBody: !!commentBody,
@@ -17437,7 +17454,9 @@ export function issueRoutes(
           : null;
       const shouldResumeInProgressScheduledRetry =
         !!scheduledRetryForHumanComment &&
-        scheduledRetryForHumanComment.agentId === issue.assigneeAgentId;
+        scheduledRetryForHumanComment.agentId === issue.assigneeAgentId &&
+        (resumeRequested === true ||
+          !isFutureProviderQuotaRetry(scheduledRetryForHumanComment));
       const assigneeSelfCommentOnTerminal =
         isAssigneeSelfCommentOnTerminalIssue({
           hasCommentBody: true,

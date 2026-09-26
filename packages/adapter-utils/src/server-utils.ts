@@ -804,6 +804,12 @@ export type PaperclipExternalChatProvider =
 type PaperclipWakePayload = {
   executionContinuation: ExecutionContinuationEnvelope | null;
   reason: string | null;
+  providerQuotaHeldWakes: Array<{
+    issueId: string | null;
+    source: string | null;
+    reason: string | null;
+    commentIds: string[];
+  }>;
   recovery: PaperclipWakeRecovery | null;
   issue: PaperclipWakeIssue | null;
   checkedOutByHarness: boolean;
@@ -1745,6 +1751,19 @@ export function normalizePaperclipWakePayload(
         )
         .map((entry) => entry.trim())
     : [];
+  const providerQuotaHeldWakes = Array.isArray(payload.providerQuotaHeldWakes)
+    ? payload.providerQuotaHeldWakes.map((entry) => {
+        const wake = parseObject(entry);
+        return {
+          issueId: asString(wake.issueId, "").trim() || null,
+          source: asString(wake.source, "").trim() || null,
+          reason: asString(wake.reason, "").trim() || null,
+          commentIds: Array.isArray(wake.commentIds)
+            ? wake.commentIds.filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+            : [],
+        };
+      })
+    : [];
   const executionStage = normalizePaperclipWakeExecutionStage(
     payload.executionStage,
   );
@@ -1836,6 +1855,7 @@ export function normalizePaperclipWakePayload(
     commentIds.length === 0 &&
     annotationDeltas.length === 0 &&
     childIssueSummaries.length === 0 &&
+    providerQuotaHeldWakes.length === 0 &&
     unresolvedBlockerIssueIds.length === 0 &&
     unresolvedBlockerSummaries.length === 0 &&
     !activeTreeHold &&
@@ -1858,6 +1878,7 @@ export function normalizePaperclipWakePayload(
 
   return {
     reason: asString(payload.reason, "").trim() || null,
+    providerQuotaHeldWakes,
     executionContinuation: parseObject(payload.executionContinuation).version === 1 ? payload.executionContinuation as ExecutionContinuationEnvelope : null,
     recovery,
     issue,
@@ -2997,6 +3018,13 @@ function renderPaperclipWakePromptBody(
     }
     if (normalized.childIssueSummaryTruncated) {
       lines.push("[child issue summaries truncated]");
+    }
+  }
+
+  if (normalized.providerQuotaHeldWakes.length > 0) {
+    lines.push("", "Automatic wakes held during provider quota reset:");
+    for (const wake of normalized.providerQuotaHeldWakes) {
+      lines.push(`- ${wake.reason ?? "unknown"} for issue ${wake.issueId ?? "none"} (${wake.source ?? "unknown"})${wake.commentIds.length ? `; comment ids: ${wake.commentIds.join(", ")}` : ""}`);
     }
   }
 

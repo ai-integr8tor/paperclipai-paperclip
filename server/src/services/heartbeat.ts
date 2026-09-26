@@ -8040,6 +8040,18 @@ export async function buildPaperclipWakePayload(input: {
     : [];
   const payload = {
     reason: readNonEmptyString(input.contextSnapshot.wakeReason),
+    providerQuotaHeldWakes: Array.isArray(input.contextSnapshot.providerQuotaHeldWakes)
+      ? input.contextSnapshot.providerQuotaHeldWakes.map((value) => {
+          const wake = parseObject(value);
+          const context = parseObject(wake.contextSnapshot);
+          return {
+            issueId: readNonEmptyString(wake.issueId),
+            source: readNonEmptyString(wake.source),
+            reason: readNonEmptyString(wake.reason),
+            commentIds: extractWakeCommentIds(context),
+          };
+        })
+      : [],
     executionContinuation: input.contextSnapshot.executionContinuation ?? null,
     attachmentOmissions,
     externalChatProvider,
@@ -26322,6 +26334,84 @@ export function heartbeatService(
       queuedCommentIdsFromRunContext(enrichedContextSnapshot).length === 0 &&
       !isInteractionResolutionWakePayload(payload ?? {}) &&
       !hasInteractionContinuationWakeContext(enrichedContextSnapshot);
+    const canCoalesceProviderQuotaWake =
+      !(source === "on_demand" && triggerDetail === "manual" && opts.requestedByActorType === "user") &&
+      !opts.manualUserWake &&
+      !opts.failedRunId &&
+      !durableRequest &&
+      !executionReconciliationWake &&
+      !opts.queuedCommentInterruptId &&
+      !opts.queuedCommentRequestId &&
+      opts.allowRunCoalescing !== false &&
+      !hasInteractionContinuationWakeContext(enrichedContextSnapshot);
+    const coalesceProviderQuotaWake = async (tx: Db, heldIssueId: string | null) => {
+      if (!canCoalesceProviderQuotaWake) return null;
+      // A quota retry holds the agent, not just its original issue. Preserve
+      // other issue wakes separately so the retry keeps its issue binding.
+      const quotaRetries = await tx.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, agent.companyId),
+        eq(heartbeatRuns.agentId, agentId),
+        eq(heartbeatRuns.status, "scheduled_retry"),
+        gt(heartbeatRuns.scheduledRetryAt, new Date()),
+        sql`${heartbeatRuns.contextSnapshot}->>'errorFamily' = 'provider_quota'`,
+      )).orderBy(asc(heartbeatRuns.scheduledRetryAt), asc(heartbeatRuns.createdAt)).for("update");
+      for (const retry of quotaRetries) {
+        if (!retry.retryOfRunId) continue;
+        const [failed] = await tx.select({ errorCode: heartbeatRuns.errorCode, resultJson: heartbeatRuns.resultJson })
+          .from(heartbeatRuns).where(and(
+            eq(heartbeatRuns.id, retry.retryOfRunId),
+            eq(heartbeatRuns.companyId, agent.companyId),
+            eq(heartbeatRuns.agentId, agentId),
+          )).limit(1);
+        if (failed?.errorCode !== "provider_quota" && parseObject(failed?.resultJson).errorFamily !== "provider_quota") continue;
+        const existingContext = parseObject(retry.contextSnapshot);
+        const heldWakes = Array.isArray(existingContext.providerQuotaHeldWakes)
+          ? existingContext.providerQuotaHeldWakes : [];
+        if (opts.idempotencyKey && heldWakes.some((value) =>
+          parseObject(value).idempotencyKey === opts.idempotencyKey)) return retry;
+        const mergedContext = {
+          ...existingContext,
+          providerQuotaHeldWakes: [...heldWakes, {
+            issueId: heldIssueId, source, triggerDetail, reason,
+            contextSnapshot: enrichedContextSnapshot, payload,
+            requestedByActorType: opts.requestedByActorType ?? null,
+            requestedByActorId: opts.requestedByActorId ?? null,
+            idempotencyKey: opts.idempotencyKey ?? null,
+          }],
+        };
+        if (heldIssueId && readNonEmptyString(existingContext.issueId) === heldIssueId) {
+          Object.assign(mergedContext, withQueuedCommentIdsInRunContext(
+            mergedContext,
+            [...new Set([
+              ...queuedCommentIdsFromRunContext(existingContext),
+              ...queuedCommentIdsFromRunContext(enrichedContextSnapshot),
+              ...(wakeCommentId ? [wakeCommentId] : []),
+            ])],
+          ));
+        }
+        const [heldRetry] = await tx.update(heartbeatRuns).set({
+          contextSnapshot: mergedContext, updatedAt: new Date(),
+        }).where(and(
+          eq(heartbeatRuns.id, retry.id),
+          eq(heartbeatRuns.status, "scheduled_retry"),
+        )).returning();
+        if (!heldRetry) continue;
+        await tx.insert(agentWakeupRequests).values({
+          ...durableReceiptFields,
+          companyId: agent.companyId, agentId, source, triggerDetail, reason,
+          payload: { ...(payload ?? {}), ...(heldIssueId ? { issueId: heldIssueId } : {}),
+            [DEFERRED_WAKE_CONTEXT_KEY]: enrichedContextSnapshot,
+            providerQuotaHoldUntil: retry.scheduledRetryAt?.toISOString() },
+          status: "coalesced", coalescedCount: 1, runId: retry.id,
+          requestedByActorType: opts.requestedByActorType ?? null,
+          requestedByActorId: opts.requestedByActorId ?? null,
+          idempotencyKey: opts.idempotencyKey ?? null,
+          finishedAt: new Date(),
+        });
+        return heldRetry;
+      }
+      return null;
+    };
     const writeSkippedRequest = async (
       skipReason: string,
       patch: Partial<typeof agentWakeupRequests.$inferInsert> = {},
@@ -26698,6 +26788,12 @@ export function heartbeatService(
           interaction: true,
         };
       }
+    }
+
+    if (!issueId) {
+      const heldRetry = await db.transaction((tx) =>
+        coalesceProviderQuotaWake(tx as unknown as Db, null));
+      if (heldRetry) return heldRetry;
     }
 
     if (issueId) {
@@ -27355,6 +27451,50 @@ export function heartbeatService(
             activeExecutionRun = null;
           }
 
+          if (
+            opts.manualUserWake &&
+            activeExecutionRun?.status === "scheduled_retry" &&
+            activeExecutionRun.scheduledRetryAt &&
+            activeExecutionRun.scheduledRetryAt > new Date() &&
+            parseObject(activeExecutionRun.contextSnapshot).errorFamily === "provider_quota" &&
+            activeExecutionRun.retryOfRunId
+          ) {
+            const [failed] = await tx.select({
+              errorCode: heartbeatRuns.errorCode,
+              resultJson: heartbeatRuns.resultJson,
+            }).from(heartbeatRuns).where(eq(heartbeatRuns.id, activeExecutionRun.retryOfRunId));
+            if (
+              failed?.errorCode === "provider_quota" ||
+              parseObject(failed?.resultJson).errorFamily === "provider_quota"
+            ) {
+              const now = new Date();
+              const [cancelled] = await tx.update(heartbeatRuns).set({
+                status: "cancelled", finishedAt: now, updatedAt: now,
+                error: "Quota retry superseded by Board manual wake",
+                errorCode: "manual_quota_retry_override",
+              }).where(and(
+                eq(heartbeatRuns.id, activeExecutionRun.id),
+                eq(heartbeatRuns.status, "scheduled_retry"),
+              )).returning();
+              if (cancelled) {
+                if (cancelled.wakeupRequestId) {
+                  await tx.update(agentWakeupRequests).set({
+                    status: "cancelled", finishedAt: now, updatedAt: now,
+                    error: "Quota retry superseded by Board manual wake",
+                  }).where(eq(agentWakeupRequests.id, cancelled.wakeupRequestId));
+                }
+                const retryContext = parseObject(activeExecutionRun.contextSnapshot);
+                enrichedContextSnapshot.providerQuotaHeldWakes = retryContext.providerQuotaHeldWakes;
+                Object.assign(enrichedContextSnapshot, withQueuedCommentIdsInRunContext(
+                  enrichedContextSnapshot,
+                  queuedCommentIdsFromRunContext(retryContext),
+                ));
+                cancelledRunsToEmit.push(cancelled);
+                activeExecutionRun = null;
+              }
+            }
+          }
+
           // A queued/scheduled run holding the lock for an agent that is
           // no longer the issue's assignee is stale by design — the issue
           // has been re-routed (e.g. blocked → in_review with a different
@@ -27677,6 +27817,9 @@ export function heartbeatService(
               return { kind: "skipped" as const };
             }
           }
+
+          const heldRetry = await coalesceProviderQuotaWake(tx as unknown as Db, issue.id);
+          if (heldRetry) return { kind: "quota_held" as const, run: heldRetry };
 
           if (activeExecutionRun) {
             // The resolved action is already a durable retry outbox. Do not merge
@@ -28103,6 +28246,7 @@ export function heartbeatService(
         await startNextQueuedRunForAgent(agent.id);
         return outcome.run;
       }
+      if (outcome.kind === "quota_held") return outcome.run;
       if (outcome.kind === "replayed") {
         if (outcome.run.status === "queued")
           await startNextQueuedRunForAgent(agent.id);
