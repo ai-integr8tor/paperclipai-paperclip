@@ -1,6 +1,6 @@
 # `muse_local` adapter: Muse Code subscription support
 
-Status: design approved 2026-09-26; rev 2 (phased, AI-connection provider `meta`) 2026-09-26.
+Status: design approved 2026-09-26; rev 2 (phased, AI-connection provider `meta`) 2026-09-26; Phase 1 implemented 2026-09-26 (live-smoked on a Muse Code subscription).
 
 ## Goal
 
