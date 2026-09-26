@@ -562,4 +562,73 @@ describeEmbeddedPostgres("same-agent live sibling checkout lock", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(409);
   });
+
+  // Opting out of run-lock ADOPTION must not opt out of the actor-liveness check
+  // that assertCheckoutOwner performs on the way through. That check refuses a
+  // terminal or missing actor run from taking over a checkout. Without it a dead
+  // run can clear a stale-held issue, because the release route no longer
+  // verifies the caller is still alive before dropping the holder's lock.
+  it("refuses to release when the ACTOR's own run is terminal and the holder is stale", async () => {
+    const seed = await seedCompanyAgentsAndRuns();
+    const issueId = await seedIssue({
+      companyId: seed.companyId,
+      assigneeAgentId: seed.assigneeAgentId,
+      checkoutRunId: seed.siblingRunId,
+    });
+    // Both runs are dead, so the issue is stale and a LIVE actor would be
+    // allowed to release it. Only the actor's own liveness is under test here.
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded" })
+      .where(eq(heartbeatRuns.id, seed.actorRunId));
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded" })
+      .where(eq(heartbeatRuns.id, seed.siblingRunId));
+
+    const res = await request(
+      createApp(agentActor(seed.companyId, seed.assigneeAgentId, seed.actorRunId)),
+    )
+      .post(`/api/issues/${issueId}/release`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    const row = await db
+      .select({
+        status: issues.status,
+        checkoutRunId: issues.checkoutRunId,
+        assigneeAgentId: issues.assigneeAgentId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(row[0]?.status).toBe("in_progress");
+    expect(row[0]?.checkoutRunId).toBe(seed.siblingRunId);
+    expect(row[0]?.assigneeAgentId).toBe(seed.assigneeAgentId);
+  });
+
+  it("refuses to release when the ACTOR's run row is missing entirely", async () => {
+    const seed = await seedCompanyAgentsAndRuns();
+    const issueId = await seedIssue({
+      companyId: seed.companyId,
+      assigneeAgentId: seed.assigneeAgentId,
+      checkoutRunId: seed.siblingRunId,
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded" })
+      .where(eq(heartbeatRuns.id, seed.siblingRunId));
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, seed.actorRunId));
+
+    const res = await request(
+      createApp(agentActor(seed.companyId, seed.assigneeAgentId, seed.actorRunId)),
+    )
+      .post(`/api/issues/${issueId}/release`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    const row = await db
+      .select({ status: issues.status, checkoutRunId: issues.checkoutRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(row[0]?.status).toBe("in_progress");
+    expect(row[0]?.checkoutRunId).toBe(seed.siblingRunId);
+  });
 });

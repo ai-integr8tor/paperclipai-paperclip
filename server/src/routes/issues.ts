@@ -274,6 +274,7 @@ import {
   ISSUE_WAKE_DIAGNOSTICS_LOOKBACK_DAYS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_ACTIVITY_RECORDS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS,
+  heartbeatRunIsTerminalOrMissing,
   readAcceptedPlanConfirmationTarget,
   type IssuePostCommitAction,
 } from "../services/issues.js";
@@ -5399,6 +5400,27 @@ export function issueRoutes(
     // adopt a live sibling's checkout on the way past. Adoption is a WRITE
     // affordance; for release it would silently transfer the holder's lock to
     // the actor and then let the actor clear it.
+    //
+    // Opting out of adoption must NOT opt out of the actor-liveness check that
+    // assertCheckoutOwner performs on the way through. That check refuses a
+    // terminal or missing actor run from taking over a checkout. Without it a
+    // dead run can clear an issue that still looks held.
+    if (
+      options.skipRunLockAdoption &&
+      (await heartbeatRunIsTerminalOrMissing(db, runId))
+    ) {
+      res.status(409).json({
+        error: "Issue run ownership conflict",
+        details: {
+          issueId: issue.id,
+          status: issue.status,
+          assigneeAgentId: issue.assigneeAgentId,
+          actorAgentId,
+          actorRunId: runId,
+        },
+      });
+      return false;
+    }
     const ownership = options.skipRunLockAdoption
       ? null
       : await svc.assertCheckoutOwner(issue.id, actorAgentId, runId);
