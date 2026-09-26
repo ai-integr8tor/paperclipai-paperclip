@@ -1,14 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import {
-  agentRuntimeState,
   agents,
-  agentTaskSessions,
-  agentWakeupRequests,
   companies,
   createDb,
-  heartbeatRunEvents,
   heartbeatRuns,
 } from "@paperclipai/db";
 import {
@@ -68,15 +64,11 @@ describeEmbeddedPostgres("heartbeat external run id persistence", () => {
 
   afterEach(async () => {
     adapterExecute.mockClear();
-    // Finalization writes rows that reference the run and the agent, so they go
-    // first: the foreign keys do not cascade.
-    await db.delete(heartbeatRunEvents);
-    await db.delete(heartbeatRuns);
-    await db.delete(agentWakeupRequests);
-    await db.delete(agentTaskSessions);
-    await db.delete(agentRuntimeState);
-    await db.delete(agents);
-    await db.delete(companies);
+    // Finalization writes rows across several tables that reference the run,
+    // the agent, and the company. An ordered list of deletes has to be kept in
+    // sync with every new foreign key, so the fixture clears its own embedded
+    // database with one cascade instead.
+    await db.execute(sql`TRUNCATE TABLE companies CASCADE`);
   });
 
   afterAll(async () => {
@@ -91,6 +83,7 @@ describeEmbeddedPostgres("heartbeat external run id persistence", () => {
       id: companyId,
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      defaultResponsibleUserId: "board-user",
       requireBoardApprovalForNewAgents: false,
     });
     await db.insert(agents).values({
