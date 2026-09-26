@@ -35,7 +35,7 @@ describe("managed GitHub launchers", () => {
       .toBe("Local Author <local@example.test>|Local Author <local@example.test>");
   });
 
-  it.each(["broker-offline", "config-unwritable", "capability-rejected"])("keeps real local Git usable when %s", async (failure) => {
+  it.each(["broker-offline", "config-unwritable", "config-fallback", "capability-rejected"])("keeps real local Git usable when %s", async (failure) => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-failure-"));
     cleanups.push(() => rm(root, { recursive: true, force: true }));
     const bin = path.join(root, "managed");
@@ -50,17 +50,59 @@ describe("managed GitHub launchers", () => {
     if (failure === "broker-offline") await new Promise<void>(resolve => server.close(() => resolve()));
     else cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
     const configRoot = path.join(root, "config");
-    if (failure === "config-unwritable") await writeFile(configRoot, "not a directory");
+    if (failure === "config-unwritable" || failure === "config-fallback") await writeFile(configRoot, "not a directory");
+    // An unwritable GH_CONFIG_DIR falls back to the OS temp dir; only both failing is reported.
+    const tempRoot = failure === "config-unwritable" ? configRoot : os.tmpdir();
     const result = await exec(path.join(bin, "git"), ["status", "--porcelain"], { cwd: root, env: {
       ...process.env, ...githubBrokerEnvironment({ GH_TOKEN: "host-must-not-leak" }, { url: `http://127.0.0.1:${port}`, token: "private-capability" }),
-      GH_CONFIG_DIR: configRoot, PATH: `${bin}:${process.env.PATH}`,
+      GH_CONFIG_DIR: configRoot, TMPDIR: tempRoot, PATH: `${bin}:${process.env.PATH}`,
     } });
     expect(result.stderr).toContain(failure === "broker-offline" ? "broker_transport_unavailable" : failure === "config-unwritable" ? "configuration_directory_unavailable" : "capability_rejected");
+    if (failure === "config-fallback") expect(result.stderr).not.toContain("configuration_directory_unavailable");
     expect(result.stderr).not.toMatch(/host-must-not-leak|private-capability/);
     await exec(path.join(bin, "git"), ["commit", "--allow-empty", "-m", "Offline work"], { cwd: root, env: {
       ...process.env, ...githubBrokerEnvironment({}, { url: `http://127.0.0.1:${port}`, token: "private-capability" }),
       GH_CONFIG_DIR: configRoot, PATH: `${bin}:${process.env.PATH}`,
     } });
+  });
+
+  it("retries the broker through an authenticating HTTP proxy when direct loopback is refused", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-proxy-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed"), realBin = path.join(root, "real");
+    await mkdir(bin); await mkdir(realBin);
+    await writeFile(path.join(bin, "gh"), githubLauncherSource(), { mode: 0o700 });
+    await writeFile(path.join(realBin, "gh"), `#!/usr/bin/env node
+const env = process.env, count = Number(env.GIT_CONFIG_COUNT);
+const config = Array.from({ length: count }, (_, i) => env['GIT_CONFIG_KEY_' + i] + '=' + env['GIT_CONFIG_VALUE_' + i]);
+process.stdout.write(JSON.stringify({ token: env.GH_TOKEN ?? null, config }));
+`, { mode: 0o700 });
+    // Nothing listens on the broker port, so the direct fetch fails like a sandbox EPERM.
+    const closed = createServer();
+    await new Promise<void>(resolve => closed.listen(0, "127.0.0.1", resolve));
+    const brokerPort = (closed.address() as { port: number }).port;
+    await new Promise<void>(resolve => closed.close(() => resolve()));
+    const seen: Array<{ method?: string; url?: string; proxyAuthorization?: string; capability?: string | string[] }> = [];
+    const proxy = createServer((req, res) => {
+      seen.push({ method: req.method, url: req.url, proxyAuthorization: req.headers["proxy-authorization"], capability: req.headers["x-paperclip-github-capability"] });
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ status: "available", env: { GH_TOKEN: "brokered-token" } }));
+    });
+    await new Promise<void>(resolve => proxy.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>((resolve, reject) => proxy.close(error => error ? reject(error) : resolve())));
+    const proxyUrl = `http://proxy-user:proxy%20pass@127.0.0.1:${(proxy.address() as { port: number }).port}`;
+    const result = await exec(path.join(bin, "gh"), [], { env: {
+      ...process.env, ...githubBrokerEnvironment({}, { url: `http://127.0.0.1:${brokerPort}`, token: "run-capability" }),
+      HTTP_PROXY: proxyUrl, HTTPS_PROXY: proxyUrl, PATH: `${bin}:${realBin}:${process.env.PATH}`,
+    } });
+    const output = JSON.parse(result.stdout);
+    expect(output.token).toBe("brokered-token");
+    expect(output.config).toContain("http.proxyAuthMethod=basic");
+    expect(result.stderr).not.toContain("broker_transport_unavailable");
+    expect(seen).toEqual([{
+      method: "POST", url: `http://127.0.0.1:${brokerPort}/runtime-tools/github/credentials`,
+      proxyAuthorization: `Basic ${Buffer.from("proxy-user:proxy pass").toString("base64")}`, capability: "run-capability",
+    }]);
   });
 
   it("explains unavailable access while allowing local work without credentials", async () => {

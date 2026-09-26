@@ -20,18 +20,24 @@ if (!['git', 'gh'].includes(program) || !executable) {
 async function main() {
   let env = { ...process.env };
   const diagnostic = (code) => process.stderr.write('Paperclip: GitHub ' + code + '; continuing without managed credentials.\n');
-  const configRoot = env.GH_CONFIG_DIR || os.tmpdir();
   // A missing/unwritable scratch directory must not break local Git. The
   // fallback deliberately cannot load the host's gh authentication files.
+  // Agent sandboxes (e.g. Claude Code Seatbelt) may deny writes to the staged
+  // GH_CONFIG_DIR, so fall back to the sandbox-provided temp directory.
   let configDirectory = path.join(directory, 'unavailable-gh-config');
   let configReady = false;
-  try {
-    fs.mkdirSync(configRoot, { recursive: true, mode: 0o700 });
-    configDirectory = fs.mkdtempSync(path.join(configRoot, 'paperclip-github-operation-'));
-    fs.chmodSync(configDirectory, 0o700);
-    configReady = true;
-    process.once('exit', () => { try { fs.rmSync(configDirectory, { recursive: true, force: true }); } catch {} });
-  } catch { diagnostic('configuration_directory_unavailable'); }
+  for (const configRoot of [...new Set([env.GH_CONFIG_DIR, os.tmpdir()].filter(Boolean))]) {
+    try {
+      fs.mkdirSync(configRoot, { recursive: true, mode: 0o700 });
+      configDirectory = fs.mkdtempSync(path.join(configRoot, 'paperclip-github-operation-'));
+      fs.chmodSync(configDirectory, 0o700);
+      configReady = true;
+      const created = configDirectory;
+      process.once('exit', () => { try { fs.rmSync(created, { recursive: true, force: true }); } catch {} });
+      break;
+    } catch {}
+  }
+  if (!configReady) diagnostic('configuration_directory_unavailable');
   {
     for (const key of Object.keys(env)) {
       if (/^(GH_TOKEN|GITHUB_TOKEN|GH_ENTERPRISE_TOKEN|GITHUB_ENTERPRISE_TOKEN|PAPERCLIP_GIT_TOKEN|GIT_AUTHOR_.*|GIT_COMMITTER_.*|GIT_CONFIG_.*|GIT_ASKPASS|SSH_ASKPASS|SSH_AUTH_SOCK|GIT_SSH.*)$/.test(key)) delete env[key];
@@ -54,13 +60,45 @@ async function main() {
     let response;
     if (base && env.PAPERCLIP_GITHUB_BROKER_TOKEN) {
       const url = base.replace(/\/+$/, '').replace(/\/api$/, '') + '/runtime-tools/github/credentials';
-      for (let attempt = 0; attempt < 30; attempt++) {
-        response = await fetch(url, {
-          method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10000),
-          headers: { authorization: 'Bearer ' + (env.PAPERCLIP_GITHUB_BRIDGE_TOKEN || env.PAPERCLIP_API_KEY || env.PAPERCLIP_GITHUB_BROKER_TOKEN),
-            'x-paperclip-github-capability': env.PAPERCLIP_GITHUB_BROKER_TOKEN, 'content-type': 'application/json' },
-          body: '{}',
+      const headers = { authorization: 'Bearer ' + (env.PAPERCLIP_GITHUB_BRIDGE_TOKEN || env.PAPERCLIP_API_KEY || env.PAPERCLIP_GITHUB_BROKER_TOKEN),
+        'x-paperclip-github-capability': env.PAPERCLIP_GITHUB_BROKER_TOKEN, 'content-type': 'application/json' };
+      // Node fetch ignores HTTP_PROXY, and agent sandboxes (Claude Code Seatbelt)
+      // deny direct sockets, loopback included, while forcing loopback into
+      // NO_PROXY. If the direct call fails, retry through the sandbox's HTTP
+      // proxy; its allowlist still decides. Egress is never widened.
+      const proxy = env.HTTP_PROXY || env.http_proxy;
+      let viaProxy = false;
+      const proxyPost = () => new Promise((resolve, reject) => {
+        const http = require('node:http');
+        const p = new URL(proxy);
+        const proxyHeaders = { ...headers, 'content-length': '2' };
+        if (p.username) proxyHeaders['proxy-authorization'] = 'Basic ' + Buffer.from(decodeURIComponent(p.username) + ':' + decodeURIComponent(p.password)).toString('base64');
+        const request = http.request({ host: p.hostname, port: p.port || 80, method: 'POST', path: url, headers: proxyHeaders, timeout: 10000 }, (res) => {
+          const chunks = [];
+          res.on('data', (c) => chunks.push(c));
+          res.on('end', () => {
+            const text = Buffer.concat(chunks).toString('utf8');
+            const status = res.statusCode || 0;
+            resolve({ status, ok: status >= 200 && status < 300, json: async () => JSON.parse(text), arrayBuffer: async () => {} });
+          });
+          res.on('error', reject);
         });
+        request.on('timeout', () => request.destroy(new Error('timeout')));
+        request.on('error', reject);
+        request.end('{}');
+      });
+      const post = async () => {
+        if (viaProxy) return proxyPost();
+        try {
+          return await fetch(url, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10000), headers, body: '{}' });
+        } catch (error) {
+          if (!proxy || !/^http:\/\//i.test(url) || !/^http:\/\//i.test(proxy)) throw error;
+          viaProxy = true;
+          return proxyPost();
+        }
+      };
+      for (let attempt = 0; attempt < 30; attempt++) {
+        response = await post();
         if (response.status !== 409) break;
         await response.arrayBuffer();
         await new Promise(resolve => setTimeout(resolve, 1000));
@@ -83,6 +121,15 @@ async function main() {
       }
     } else { diagnostic('capability_missing'); }
     } catch { diagnostic('broker_transport_unavailable'); }
+  }
+  // Sandboxes hand git its proxy auth mode through GIT_CONFIG_PARAMETERS, which
+  // is cleared above. Without it git's CONNECT to an authenticating proxy fails.
+  const gitProxy = env.HTTPS_PROXY || env.https_proxy || env.HTTP_PROXY || env.http_proxy || '';
+  if (/^https?:\/\/[^/@]+@/i.test(gitProxy)) {
+    const index = Number.parseInt(env.GIT_CONFIG_COUNT || '0', 10) || 0;
+    env['GIT_CONFIG_KEY_' + index] = 'http.proxyAuthMethod';
+    env['GIT_CONFIG_VALUE_' + index] = 'basic';
+    env.GIT_CONFIG_COUNT = String(index + 1);
   }
   // Only this invocation and its children inherit the captured credential.
   // Its Git children use the real binary, so steering cannot split a gh operation.
