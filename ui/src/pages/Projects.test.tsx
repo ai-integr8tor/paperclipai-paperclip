@@ -115,6 +115,7 @@ describe("Projects", () => {
   let queryClient: QueryClient;
 
   beforeEach(() => {
+    window.localStorage.clear();
     container = document.createElement("div");
     document.body.appendChild(container);
     root = null;
@@ -196,6 +197,16 @@ describe("Projects", () => {
     await flushReact();
   }
 
+  async function clickViewMode(label: string) {
+    const button = container.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`);
+    expect(button).not.toBeNull();
+
+    await act(async () => {
+      button?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+  }
+
   async function chooseSortField(label: string) {
     const item = Array.from(document.body.querySelectorAll("button"))
       .find((element) => element.textContent?.includes(label));
@@ -240,5 +251,60 @@ describe("Projects", () => {
 
     expect(hiddenDescriptionLine).not.toBeNull();
     expect(hiddenDescriptionLine?.className).toContain("min-h-4");
+  });
+
+  it("defaults to the list view and switches to a card grid on request", async () => {
+    await renderProjects();
+
+    expect(container.querySelector('[data-testid="projects-list"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="projects-grid"]')).toBeNull();
+    expect(container.querySelector('button[aria-label="List view"]')?.getAttribute("aria-pressed"))
+      .toBe("true");
+
+    await clickViewMode("Grid view");
+
+    expect(container.querySelector('[data-testid="projects-list"]')).toBeNull();
+    const grid = container.querySelector('[data-testid="projects-grid"]');
+    expect(grid).not.toBeNull();
+    expect(container.querySelector('button[aria-label="Grid view"]')?.getAttribute("aria-pressed"))
+      .toBe("true");
+    expect(window.localStorage.getItem("paperclip.projects.viewMode")).toBe("grid");
+  });
+
+  it("restores the stored grid preference on mount", async () => {
+    window.localStorage.setItem("paperclip.projects.viewMode", "grid");
+    await renderProjects();
+
+    expect(container.querySelector('[data-testid="projects-grid"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="projects-list"]')).toBeNull();
+  });
+
+  it("keeps grouping, sorting, and project links in the grid view", async () => {
+    window.localStorage.setItem("paperclip.projects.viewMode", "grid");
+    await renderProjects();
+
+    const content = container.textContent ?? "";
+    expect(content.indexOf("My Projects")).toBeLessThan(content.indexOf("Alpha"));
+    expect(content.indexOf("Alpha")).toBeLessThan(content.indexOf("Charlie"));
+    expect(content.indexOf("Charlie")).toBeLessThan(content.indexOf("Other Projects"));
+    expect(content.indexOf("Other Projects")).toBeLessThan(content.indexOf("Bravo"));
+
+    const cardLinks = Array.from(
+      container.querySelectorAll<HTMLAnchorElement>('[data-testid="projects-grid"] a'),
+    );
+    expect(cardLinks.map((link) => link.getAttribute("href"))).toEqual([
+      "/projects/alpha",
+      "/projects/charlie",
+      "/projects/bravo",
+    ]);
+    expect(cardLinks[0]?.textContent).toContain("First project");
+  });
+
+  it("exposes the star control on each grid card", async () => {
+    window.localStorage.setItem("paperclip.projects.viewMode", "grid");
+    await renderProjects();
+
+    expect(container.querySelector('button[aria-label="Star Alpha"]')).not.toBeNull();
+    expect(container.querySelector('button[aria-label="Join Bravo"]')).not.toBeNull();
   });
 });
