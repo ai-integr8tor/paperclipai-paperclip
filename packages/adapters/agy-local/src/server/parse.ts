@@ -17,6 +17,11 @@ export interface AgyToolInvocation {
   isError: boolean;
 }
 
+export interface AgyDeniedAction {
+  action: string;
+  displayName: string | null;
+}
+
 export interface ParsedAgyOutput {
   sessionId: string | null;
   conversationId: string | null;
@@ -32,8 +37,14 @@ export interface ParsedAgyOutput {
   summary: string;
   resultJson: Record<string, unknown> | null;
   resultEvent: Record<string, unknown> | null;
+  /** True only when the terminal result reports a failure; tool step errors do not set it. */
   isError: boolean;
+  /** Terminal failure message from the result event; never a mid-run tool error. */
   errorMessage: string | null;
+  /** First tool step error, kept as a message fallback when no result event arrives. */
+  toolErrorMessage: string | null;
+  /** Tool actions agy auto-denied because headless mode cannot prompt for permission. */
+  deniedActions: AgyDeniedAction[];
   tools: AgyToolInvocation[];
   availableTools: string[];
   permissionMode: string | null;
@@ -78,6 +89,18 @@ function readResultError(result: Record<string, unknown>): string | null {
   return null;
 }
 
+function readDeniedActions(value: unknown): AgyDeniedAction[] {
+  if (!Array.isArray(value)) return [];
+  const denied: AgyDeniedAction[] = [];
+  for (const entry of value) {
+    const obj = parseObject(entry);
+    const action = asString(obj.action, "").trim();
+    if (!action) continue;
+    denied.push({ action, displayName: asString(obj.display_name, "").trim() || null });
+  }
+  return denied;
+}
+
 function firstLine(text: string): string | null {
   const line = text
     .split(/\r?\n/)
@@ -98,10 +121,13 @@ export function parseAgyJsonl(stdout: string): ParsedAgyOutput {
   let durationSeconds: number | null = null;
   let isError = false;
   let errorMessage: string | null = null;
+  let toolErrorMessage: string | null = null;
+  let deniedActions: AgyDeniedAction[] = [];
   let permissionMode: string | null = null;
   const availableTools: string[] = [];
   let assistantText = "";
   let malformedLines = 0;
+  let sawJsonEvent = false;
 
   const toolsByStep = new Map<number, AgyToolInvocation>();
   let lastStepUsage: { usage: UsageSummary; thinkingTokens: number | null } | null = null;
@@ -122,6 +148,7 @@ export function parseAgyJsonl(stdout: string): ParsedAgyOutput {
       malformedLines += 1;
       continue;
     }
+    sawJsonEvent = true;
 
     const eventType = asString(event.event, "");
 
@@ -183,7 +210,7 @@ export function parseAgyJsonl(stdout: string): ParsedAgyOutput {
               invocation.isError = true;
               const errorObj = parseObject(toolInfo.error);
               const msg = asString(errorObj.message, "");
-              if (msg && !errorMessage) errorMessage = msg;
+              if (msg && !toolErrorMessage) toolErrorMessage = msg;
             }
           }
           const dur = asNumber(stepUpdate.duration_seconds, -1);
@@ -220,6 +247,7 @@ export function parseAgyJsonl(stdout: string): ParsedAgyOutput {
       if (resultObj.duration_seconds !== undefined) {
         durationSeconds = asNumber(resultObj.duration_seconds, 0);
       }
+      deniedActions = readDeniedActions(resultObj.denied_actions);
       const err = readResultError(resultObj);
       if (err) {
         errorMessage = err;
@@ -236,7 +264,9 @@ export function parseAgyJsonl(stdout: string): ParsedAgyOutput {
   }
 
   const responseText = response ?? assistantText;
-  const summary = firstLine(responseText) ?? (responseText.trim() || stdout.trim());
+  // Raw stdout is a useful summary only for plain-text output; once agy spoke
+  // stream-json, an empty response must not surface the JSON events instead.
+  const summary = firstLine(responseText) ?? (sawJsonEvent ? "" : stdout.trim());
 
   if (!errorMessage && status !== null && status !== AGY_SUCCESS_STATUS) {
     errorMessage = `agy finished with status ${status}`;
@@ -260,6 +290,8 @@ export function parseAgyJsonl(stdout: string): ParsedAgyOutput {
     resultEvent,
     isError,
     errorMessage,
+    toolErrorMessage,
+    deniedActions,
     tools,
     availableTools,
     permissionMode,
@@ -270,6 +302,68 @@ export function parseAgyJsonl(stdout: string): ParsedAgyOutput {
 
 export function isAgySuccessResult(parsed: ParsedAgyOutput): boolean {
   return parsed.status === AGY_SUCCESS_STATUS;
+}
+
+export function describeAgyDeniedActions(deniedActions: AgyDeniedAction[]): string {
+  const names = deniedActions.map((denied) => denied.displayName ?? denied.action).join(", ");
+  return (
+    `Antigravity auto-denied ${deniedActions.length} tool action(s): ${names}. ` +
+    "Headless runs cannot prompt for permission; enable dangerouslySkipPermissions " +
+    "or add allow rules under permissions.allow in agy's settings.json."
+  );
+}
+
+export interface AgyRunOutcome {
+  failed: boolean;
+  errorMessage: string | null;
+  permissionDenied: boolean;
+}
+
+/**
+ * Decide whether a run failed from agy's terminal result, not from intermediate
+ * tool step errors: agents routinely hit a tool error and recover. Without a
+ * result event (crash or kill), fall back to the exit code and first tool error.
+ */
+export function resolveAgyRunOutcome(parsed: ParsedAgyOutput, exitCode: number | null): AgyRunOutcome {
+  const exitedNonZero = (exitCode ?? 0) !== 0;
+  if (parsed.status === null) {
+    return exitedNonZero || parsed.toolErrorMessage
+      ? { failed: true, errorMessage: parsed.toolErrorMessage, permissionDenied: false }
+      : { failed: false, errorMessage: null, permissionDenied: false };
+  }
+  if (parsed.isError) {
+    return { failed: true, errorMessage: describeAgyFailure(parsed), permissionDenied: false };
+  }
+  // agy reports SUCCESS with an empty response when its only work was auto-denied.
+  if (parsed.deniedActions.length > 0 && !(parsed.response ?? "").trim()) {
+    return {
+      failed: true,
+      errorMessage: describeAgyDeniedActions(parsed.deniedActions),
+      permissionDenied: true,
+    };
+  }
+  if (exitedNonZero) {
+    return { failed: true, errorMessage: null, permissionDenied: false };
+  }
+  return { failed: false, errorMessage: null, permissionDenied: false };
+}
+
+/**
+ * The non-JSON lines of agy's stdout: CLI banners and errors printed around the
+ * stream-json events. Error heuristics scan only these (plus stderr and the
+ * terminal error), never the JSON events, which carry the agent's own
+ * transcript and tool output: an agent auditing logs quotes "401" or
+ * "unauthenticated" constantly.
+ */
+export function extractAgyDiagnosticText(stdout: string | null | undefined): string {
+  if (!stdout) return "";
+  return stdout
+    .split(/\r?\n/)
+    .filter((line) => {
+      const trimmed = line.trim();
+      return trimmed.length > 0 && !trimmed.startsWith("{");
+    })
+    .join("\n");
 }
 
 export const AUTH_PATTERNS: RegExp[] = [
@@ -329,7 +423,12 @@ export function detectAgyAuthRequired(input: {
 }): { requiresAuth: boolean } {
   const resultError = input.parsed?.errorMessage ?? null;
   return {
-    requiresAuth: matchesAny(AUTH_PATTERNS, input.stdout, input.stderr, resultError),
+    requiresAuth: matchesAny(
+      AUTH_PATTERNS,
+      extractAgyDiagnosticText(input.stdout),
+      input.stderr,
+      resultError,
+    ),
   };
 }
 
@@ -339,21 +438,21 @@ export function detectAgyQuotaExhausted(input: {
   parsed?: ParsedAgyOutput | null;
 }): boolean {
   const resultError = input.parsed?.errorMessage ?? null;
-  return matchesAny(QUOTA_PATTERNS, input.stdout, input.stderr, resultError);
+  return matchesAny(QUOTA_PATTERNS, extractAgyDiagnosticText(input.stdout), input.stderr, resultError);
 }
 
 export function isAgyTransientNetworkError(
   stdout?: string | null,
   stderr?: string | null,
 ): boolean {
-  return matchesAny(TRANSIENT_PATTERNS, stdout, stderr);
+  return matchesAny(TRANSIENT_PATTERNS, extractAgyDiagnosticText(stdout), stderr);
 }
 
 export function isAgySessionUnrecoverableError(
   stdout?: string | null,
   stderr?: string | null,
 ): boolean {
-  return matchesAny(SESSION_UNRECOVERABLE_PATTERNS, stdout, stderr);
+  return matchesAny(SESSION_UNRECOVERABLE_PATTERNS, extractAgyDiagnosticText(stdout), stderr);
 }
 
 export function isAgyUnknownSessionError(input: {
@@ -364,7 +463,7 @@ export function isAgyUnknownSessionError(input: {
   return matchesAny(
     SESSION_UNRECOVERABLE_PATTERNS,
     input.errorMessage,
-    input.stdout,
+    extractAgyDiagnosticText(input.stdout),
     input.stderr,
   );
 }
