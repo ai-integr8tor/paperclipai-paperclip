@@ -41,15 +41,11 @@ export function ExecutionBlockerNotice({ companyId, issueId, blocker, onRetried 
     ["failed", "timed_out"].includes(run.status));
   const requiresInspection = blocker.cause === "native_continuation_requires_reconciliation" ||
     blocker.cause === "native_session_cleanup_quarantined";
-  const inspectRun = requiresInspection && blocker.agentId && blocker.runId;
-  // This notice already offers the supported recovery for the incident when a
-  // control for it renders: retry the exact failed run, or inspect the run that
-  // needs reconciling. Surfacing a second path on top of a working one would
-  // only compete with it, so the settled hold is shown when the notice has no
-  // other control — the stranded case this exists for. `resolvable` comes from
-  // the server's release predicate, so a hold it would refuse (an unsafe
-  // workspace archive) never gets a control that only looks like it works.
-  const settledHoldRunId = !failedRun && !inspectRun && recovery?.referencedByExecutionBlockerResolvable
+  // `resolvable` is the server's release predicate, so a hold it would refuse
+  // (an unsafe workspace archive) never gets a control that only looks like it
+  // works. The resolution carries the reconciliation of the recorded run, so the
+  // form needs that run's id.
+  const settledHoldRunId = recovery?.referencedByExecutionBlockerResolvable
     ? blocker.runId
     : null;
   const settledHoldAction = settledHoldRunId ? settledHold : null;
@@ -87,24 +83,36 @@ export function ExecutionBlockerNotice({ companyId, issueId, blocker, onRetried 
     onSuccess: refresh,
   });
   return (
-    <div role="status" aria-label="Task recovery" className="mx-(--sz-execution-blocker-inline) my-(--sz-execution-blocker-block) flex flex-wrap items-center justify-between execution-blocker-notice border border-border bg-muted text-foreground">
-      <span>{blocker.cause === "legacy_execution_requires_reconciliation"
-        ? "Automatic recovery of this task stopped."
-        : `${requiresInspection ? "Recovery needed. " : ""}${blocker.nextAction}`}</span>
-      {requiresInspection && blocker.agentId && blocker.runId && (
-        <Button variant="outline" size="sm" asChild>
-          <Link to={`/agents/${blocker.agentId}/runs/${blocker.runId}`}>Inspect run</Link>
-        </Button>
-      )}
-      {!requiresInspection && failedRun && (
-        <Button variant="outline" size="sm" disabled={retry.isPending} onClick={() => retry.mutate()}>
-          {retry.isPending ? "Retrying…" : "Retry"}
-        </Button>
-      )}
+    <>
+      <div role="status" aria-label="Task recovery" className="mx-(--sz-execution-blocker-inline) my-(--sz-execution-blocker-block) flex flex-wrap items-center justify-between execution-blocker-notice border border-border bg-muted text-foreground">
+        <span>{blocker.cause === "legacy_execution_requires_reconciliation"
+          ? "Automatic recovery of this task stopped."
+          : `${requiresInspection ? "Recovery needed. " : ""}${blocker.nextAction}`}</span>
+        {requiresInspection && blocker.agentId && blocker.runId && (
+          <Button variant="outline" size="sm" asChild>
+            <Link to={`/agents/${blocker.agentId}/runs/${blocker.runId}`}>Inspect run</Link>
+          </Button>
+        )}
+        {!requiresInspection && failedRun && (
+          <Button variant="outline" size="sm" disabled={retry.isPending} onClick={() => retry.mutate()}>
+            {retry.isPending ? "Retrying…" : "Retry"}
+          </Button>
+        )}
+        {retry.isError && (
+          <p role="alert" className="w-full text-destructive">{retry.error.message}</p>
+        )}
+      </div>
+      {/* The hold that parks every wake is its own fact with its own operator
+          decision, so it is reported next to the notice rather than folded into
+          it: the notice stays the statement of what the recorded run did. Both
+          controls stay available, because a retry of the recorded run is
+          deferred by this same hold. */}
       {settledHoldAction && (
-        <div className="w-full text-muted-foreground">
-          <p>{`Settled recovery action (${settledHoldAction.cause}) still holds this task. Reconcile the stopped run to resume it.`}</p>
-          <div className="mt-2 flex flex-wrap items-center gap-2">
+        <div role="status" aria-label="Settled execution hold" className="mx-(--sz-execution-blocker-inline) my-(--sz-execution-blocker-block) flex flex-wrap items-center justify-between execution-blocker-notice border border-border bg-muted text-foreground">
+          <p className="w-full text-muted-foreground">
+            {`Settled recovery action (${settledHoldAction.cause}) still holds this task. Reconcile the stopped run to resume it.`}
+          </p>
+          <div className="mt-2 flex w-full flex-wrap items-center gap-2">
             <select
               aria-label="Recorded action outcome"
               className="rounded border border-border bg-background px-2 py-1 text-sm"
@@ -141,14 +149,11 @@ export function ExecutionBlockerNotice({ companyId, issueId, blocker, onRetried 
               {resolveSettledHold.isPending ? "Resolving…" : "Resolve recovery"}
             </Button>
           </div>
+          {resolveSettledHold.isError && (
+            <p role="alert" className="w-full text-destructive">{resolveSettledHold.error.message}</p>
+          )}
         </div>
       )}
-      {retry.isError && (
-        <p role="alert" className="w-full text-destructive">{retry.error.message}</p>
-      )}
-      {resolveSettledHold.isError && (
-        <p role="alert" className="w-full text-destructive">{resolveSettledHold.error.message}</p>
-      )}
-    </div>
+    </>
   );
 }

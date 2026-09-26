@@ -155,16 +155,23 @@ describe("stopped task recovery notice", () => {
     expect(container.textContent).toContain("Settled recovery action (native_event_replay_conflict) still holds this task.");
     expect(onRetried).not.toHaveBeenCalled();
   });
-  it("keeps the retry notice unchanged while the exact failed run can be retried", async () => {
+  it("keeps the retry notice unchanged and reports the settled hold beside it", async () => {
     client.clear();
     vi.mocked(issuesApi.recoveryActions).mockResolvedValue(settledHoldResponse(true));
     await renderNotice({
       recoveryActionId: "recovery", runId: "failed-run", agentId: "agent", cause: "legacy_execution_requires_reconciliation",
       nextAction: "Automatic recovery stopped. Recorded work is preserved; actions with unverified outcomes will not be repeated.",
     });
+    // The notice that reports the recorded run keeps its exact text and control.
     const notice = container.querySelector('[role="status"][aria-label="Task recovery"]')!;
     expect(notice.textContent).toBe("Automatic recovery of this task stopped.Retry");
     expect([...notice.querySelectorAll("button")].map(button => button.textContent)).toEqual(["Retry"]);
+    // The hold that parks every wake is reported separately, with its own
+    // decision, because a retry of the recorded run is deferred by that hold.
+    const hold = container.querySelector('[role="status"][aria-label="Settled execution hold"]')!;
+    expect(hold.textContent).toContain("Settled recovery action (native_event_replay_conflict) still holds this task.");
+    expect([...hold.querySelectorAll("button")].map(button => button.textContent)).toEqual(["Resolve recovery"]);
+    expect(hold.querySelector('[aria-label="Recorded action outcome"]')).not.toBeNull();
   });
   it("does not offer a resolution for a hold the server reports as not resolvable", async () => {
     client.clear();

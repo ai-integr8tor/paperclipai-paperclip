@@ -5,10 +5,12 @@
  * board had no action to resolve. These cases pin the fix:
  *
  *  T1  settled no-replay hold + `todo` issue + invokable agent owner + a fresh
- *      assignment wake → a run is created once and the hold is released
- *      (marked, never deleted)
+ *      assignment wake made by a person → a run is created once and the hold is
+ *      released (marked, never deleted)
  *  T1b the same wake declared by the agent itself (the wakeup API lets an agent
  *      wake itself) stays parked: an agent cannot retire its own hold
+ *  T1c the same wake requested by a plugin for the already-assigned agent stays
+ *      parked: a system wake is not a new assignment decision
  *  T2  an open (`active`) action still parks the wake
  *  T3  a human owner (`assigneeUserId`) still parks the wake — a person decides
  *  T4  an issue that is not `todo`/`blocked` still parks the wake
@@ -189,16 +191,18 @@ describeEmbeddedPostgres("issue stranded by a settled no-replay hold", () => {
   const wakeIssue = (
     agentId: string,
     issueId: string,
-    requestedByActorType: "user" | "agent" | "system" = "system",
+    requestedByActorType: "user" | "agent" | "system" = "user",
+    requestedByActorId = requestedByActorType === "user" ? "blocker-owner" : "assignment",
+    opts: { reason?: string } = {},
   ) =>
     heartbeatService(db).wakeup(agentId, {
       source: "assignment",
       triggerDetail: "system",
-      reason: "issue_assigned",
+      reason: opts.reason ?? "issue_assigned",
       payload: { issueId },
       contextSnapshot: { issueId },
       requestedByActorType,
-      requestedByActorId: "assignment",
+      requestedByActorId,
     });
 
   const runsForIssue = async (issueId: string) =>
@@ -245,7 +249,7 @@ describeEmbeddedPostgres("issue stranded by a settled no-replay hold", () => {
       cause: "legacy_execution_requires_reconciliation",
       sourceRunId: seed.sourceRunId,
       agentId: seed.agentId,
-      actorType: "system",
+      actorType: "user",
     });
 
     // A second wake on the now-released issue neither re-releases nor re-parks.
@@ -263,6 +267,27 @@ describeEmbeddedPostgres("issue stranded by a settled no-replay hold", () => {
     const seed = await seedBlockedIssue({ issueStatus: "todo", replay: "blocked" });
 
     await wakeIssue(seed.agentId, seed.issueId, "agent");
+
+    const waits = await executionWaits(seed.agentId);
+    expect(waits).toHaveLength(1);
+    expect(waits[0]).toMatchObject({ status: "skipped", reason: "execution_reconciliation_required" });
+    expect(await runsForIssue(seed.issueId)).toHaveLength(0);
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, seed.actionId));
+    expect(action!.evidence.settledNoReplayHoldReleasedAt).toBeUndefined();
+    expect(await getExecutionBlocker(db, seed.companyId, seed.issueId)).not.toBeNull();
+  });
+
+  it("T1c: a plugin's assignment wake for the already-assigned agent cannot retire the hold", async () => {
+    const seed = await seedBlockedIssue({ issueStatus: "todo", replay: "blocked" });
+
+    // The shape measured in server/src/services/plugin-host-services.ts: a plugin
+    // requests an assignment wake for the agent that is already assigned.
+    await wakeIssue(seed.agentId, seed.issueId, "system", "plugin-fixture", {
+      reason: "plugin_issue_wakeup_requested",
+    });
 
     const waits = await executionWaits(seed.agentId);
     expect(waits).toHaveLength(1);
