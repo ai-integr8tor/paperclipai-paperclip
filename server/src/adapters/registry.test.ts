@@ -60,6 +60,7 @@ describe("built-in runtime connection tool delivery", () => {
     ["cursor", "environment"],
     ["gemini_local", "environment"],
     ["grok_local", "environment"],
+    ["muse_local", "environment"],
     ["hermes_gateway", "invocation_context"],
     ["hermes_local", "environment"],
     ["kimi_local", "environment"],

@@ -85,6 +85,17 @@ import {
   models as grokModels,
 } from "@paperclipai/adapter-grok-local";
 import {
+  execute as museExecute,
+  listMuseSkills,
+  syncMuseSkills,
+  testEnvironment as museTestEnvironment,
+  sessionCodec as museSessionCodec,
+} from "@paperclipai/adapter-muse-local/server";
+import {
+  agentConfigurationDoc as museAgentConfigurationDoc,
+  models as museModels,
+} from "@paperclipai/adapter-muse-local";
+import {
   execute as kimiExecute,
   listKimiSkills,
   syncKimiSkills,
@@ -751,6 +762,28 @@ const grokLocalAdapter: ServerAdapterModule = {
   loginCapability: grokLoginCapability,
 };
 
+const museLocalAdapter: ServerAdapterModule = {
+  type: "muse_local",
+  runtimeToolDelivery: "environment",
+  execute: museExecute,
+  testEnvironment: museTestEnvironment,
+  listSkills: listMuseSkills,
+  syncSkills: syncMuseSkills,
+  sessionCodec: museSessionCodec,
+  sessionManagement: getAdapterSessionManagement("muse_local") ?? undefined,
+  models: museModels,
+  supportsLocalAgentJwt: true,
+  supportsInstructionsBundle: true,
+  instructionsPathKey: "instructionsFilePath",
+  requiresMaterializedRuntimeSkills: true,
+  getRuntimeCommandSpec: (config) => ({
+    command: readConfiguredCommand(config, "muse"),
+    detectCommand: readConfiguredCommand(config, "muse"),
+    installCommand: null,
+  }),
+  agentConfigurationDoc: museAgentConfigurationDoc,
+};
+
 const kimiLocalAdapter: ServerAdapterModule = {
   type: "kimi_local",
   runtimeToolDelivery: "environment",
@@ -862,6 +895,7 @@ function registerBuiltInAdapters() {
     cursorLocalAdapter,
     geminiLocalAdapter,
     grokLocalAdapter,
+    museLocalAdapter,
     kimiLocalAdapter,
     hermesGatewayAdapter,
     hermesLocalAdapter,
