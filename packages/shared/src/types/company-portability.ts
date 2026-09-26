@@ -125,6 +125,9 @@ export interface CompanyPortabilityIssueRoutineTriggerManifestEntry {
 export interface CompanyPortabilityIssueRoutineManifestEntry {
   concurrencyPolicy: string | null;
   catchUpPolicy: string | null;
+  // Unset is the historical behaviour, so both are optional on the wire.
+  repeatPolicy?: string | null;
+  repeatWindowSeconds?: number | null;
   variables?: RoutineVariable[] | null;
   triggers: CompanyPortabilityIssueRoutineTriggerManifestEntry[];
 }

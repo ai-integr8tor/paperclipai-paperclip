@@ -38,6 +38,12 @@ export const routines = pgTable(
     catchUpPolicy: text("catch_up_policy").notNull().default("skip_missed"),
     activityGatePolicy: text("activity_gate_policy").notNull().default("always"),
     activityGateScope: text("activity_gate_scope").notNull().default("company"),
+    // A routine whose condition can never become false re-fires forever, because the
+    // open-issue coalescing cannot see a `done` issue. "skip_if_completed" lets a routine
+    // treat a finished execution issue with the same dispatch fingerprint as satisfying
+    // the trigger, for repeatWindowSeconds. Absent/null means the old behaviour exactly.
+    repeatPolicy: text("repeat_policy"),
+    repeatWindowSeconds: integer("repeat_window_seconds"),
     originKind: text("origin_kind").notNull().default("manual"),
     originId: text("origin_id"),
     variables: jsonb("variables").$type<RoutineVariable[]>().notNull().default([]),

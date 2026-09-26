@@ -1,7 +1,7 @@
 import { verifyAppWebhook } from "./app-webhook.js";
 import crypto from "node:crypto";
 import { verifyFirefliesWebhook } from "./fireflies-webhook.js";
-import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lte, ne, not, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, lte, ne, not, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -569,6 +569,8 @@ function routineRevisionSnapshotRoutine(routine: RoutineRow): RoutineRevisionSna
     catchUpPolicy: routine.catchUpPolicy as RoutineRevisionSnapshotV1["routine"]["catchUpPolicy"],
     activityGatePolicy: routine.activityGatePolicy as RoutineRevisionSnapshotV1["routine"]["activityGatePolicy"],
     activityGateScope: routine.activityGateScope as RoutineRevisionSnapshotV1["routine"]["activityGateScope"],
+    repeatPolicy: (routine.repeatPolicy as RoutineRevisionSnapshotV1["routine"]["repeatPolicy"]) ?? null,
+    repeatWindowSeconds: routine.repeatWindowSeconds ?? null,
     variables: routine.variables ?? [],
     env: routine.env ?? null,
     responsibleUserId: routine.responsibleUserId ?? null,
@@ -1511,6 +1513,81 @@ export function routineService(
     );
   }
 
+  /**
+   * The most recent FINISHED execution issue for this exact work, or null.
+   *
+   * `findLiveExecutionIssue` cannot answer this: it only looks at open statuses, so a
+   * `done` issue is invisible to it forever. That is what lets a routine whose trigger
+   * condition is a permanent truth regenerate identical work on every tick.
+   *
+   * Identity is (company, originKind, originId, dispatch fingerprint) — never the title.
+   * A different fingerprint means the routine body changed, which is genuinely new work.
+   */
+  async function findRecentlyCompletedExecutionIssue(
+    routine: typeof routines.$inferSelect,
+    executor: Db,
+    dispatchFingerprint: string | null | undefined,
+    origin: { kind: string; id: string },
+    now: Date,
+  ) {
+    // Without a fingerprint there is no way to tell this work from any other, and
+    // suppressing on a guess would eat real work. Opt out.
+    if (!dispatchFingerprint) return null;
+
+    const windowSeconds = routine.repeatWindowSeconds;
+    // A 0 or absent window means "off", never "never fire": a misconfigured window
+    // must not be able to silence a routine permanently.
+    if (typeof windowSeconds !== "number" || !Number.isFinite(windowSeconds) || windowSeconds <= 0) {
+      return null;
+    }
+
+    const since = new Date(now.getTime() - windowSeconds * 1000);
+
+    // A cancelled issue may carry cancelledAt rather than completedAt, so fall back to
+    // updatedAt. A clock-skewed future completion still counts as inside the window.
+    // Both legs stay on plain columns: a raw sql fragment on the left of gte() makes
+    // drizzle emit a bound parameter that postgres.js cannot bind as a Date.
+    const finishedWithinWindow = or(
+      gte(issues.completedAt, since),
+      and(isNull(issues.completedAt), gte(issues.updatedAt, since)),
+    );
+
+    return executor
+      .select({
+        id: issues.id,
+        originRunId: issues.originRunId,
+        status: issues.status,
+        completedAt: issues.completedAt,
+        updatedAt: issues.updatedAt,
+      })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, routine.companyId),
+          eq(issues.originKind, origin.kind),
+          eq(issues.originId, origin.id),
+          inArray(issues.status, [...TERMINAL_ISSUE_STATUSES]),
+          finishedWithinWindow,
+          visibleIssueCondition(),
+          or(
+            eq(issues.originFingerprint, dispatchFingerprint),
+            eq(issues.originFingerprint, "default"),
+          ),
+        ),
+      )
+      .orderBy(desc(issues.updatedAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
+  /** True when this routine opted in to treating a finished run as satisfying the trigger. */
+  function suppressesCompletedWork(routine: typeof routines.$inferSelect) {
+    if (routine.repeatPolicy !== "skip_if_completed") return false;
+    // always_enqueue means always enqueue. TestList case 12.
+    if (routine.concurrencyPolicy === "always_enqueue") return false;
+    return true;
+  }
+
   async function findLiveExecutionIssue(
     routine: typeof routines.$inferSelect,
     executor: Db = db,
@@ -1903,6 +1980,50 @@ export function routineService(
           return updated ?? createdRun;
         }
 
+        // The open-issue path above cannot see a finished issue, so a routine whose
+        // trigger condition is a permanent truth regenerates identical work every tick.
+        // This is the opt-in bound on that. TestList case 19: the tick is still consumed
+        // and nextRunAt still advances, because a suppression must never wedge a schedule.
+        if (suppressesCompletedWork(input.routine)) {
+          const completed = await findRecentlyCompletedExecutionIssue(
+            input.routine,
+            txDb,
+            dispatchFingerprint,
+            { kind: issueOriginKind, id: issueOriginId },
+            triggeredAt,
+          );
+          if (completed) {
+            // TestList case 20: record the suppression. A routine that silently does
+            // nothing is a worse failure than one that loops.
+            const updated = await finalizeRun(createdRun.id, {
+              status: "skipped",
+              linkedIssueId: completed.id,
+              // A run id, like every other coalescing site: this is the run that
+              // produced the issue satisfying this trigger.
+              coalescedIntoRunId: completed.originRunId,
+              completedAt: triggeredAt,
+              triggerPayload: {
+                ...triggerPayload,
+                repeatSuppression: {
+                  reason: "completed_within_window",
+                  satisfiedIssueId: completed.id,
+                  satisfiedIssueStatus: completed.status,
+                  windowSeconds: input.routine.repeatWindowSeconds ?? null,
+                },
+              },
+            }, txDb);
+            await updateRoutineTouchedState({
+              routineId: input.routine.id,
+              triggerId: input.trigger?.id ?? null,
+              triggeredAt,
+              status: "skipped",
+              issueId: completed.id,
+              nextRunAt,
+            }, txDb);
+            return updated ?? createdRun;
+          }
+        }
+
         try {
           createdIssue = await issueSvc.create(input.routine.companyId, {
             projectId,
@@ -2237,6 +2358,8 @@ export function routineService(
             catchUpPolicy: input.catchUpPolicy,
             activityGatePolicy: input.activityGatePolicy ?? "always",
             activityGateScope: input.activityGateScope ?? "company",
+            repeatPolicy: input.repeatPolicy ?? null,
+            repeatWindowSeconds: input.repeatWindowSeconds ?? null,
             variables,
             env,
             responsibleUserId,
@@ -2353,6 +2476,11 @@ export function routineService(
           catchUpPolicy: patch.catchUpPolicy ?? locked.catchUpPolicy,
           activityGatePolicy: patch.activityGatePolicy ?? locked.activityGatePolicy,
           activityGateScope: patch.activityGateScope ?? locked.activityGateScope,
+          // `??` cannot be used: an explicit null means "clear this", and ?? would
+          // resurrect the old value, leaving an owner unable to opt back out.
+          repeatPolicy: patch.repeatPolicy === undefined ? locked.repeatPolicy : patch.repeatPolicy,
+          repeatWindowSeconds:
+            patch.repeatWindowSeconds === undefined ? locked.repeatWindowSeconds : patch.repeatWindowSeconds,
           variables: nextVariables,
           env: nextEnv,
           responsibleUserId: locked.responsibleUserId ?? responsibleUserId,
@@ -2418,6 +2546,8 @@ export function routineService(
             catchUpPolicy: candidate.catchUpPolicy,
             activityGatePolicy: candidate.activityGatePolicy,
             activityGateScope: candidate.activityGateScope,
+            repeatPolicy: candidate.repeatPolicy,
+            repeatWindowSeconds: candidate.repeatWindowSeconds,
             variables: candidate.variables,
             env: candidate.env,
             responsibleUserId: candidate.responsibleUserId,
@@ -2760,6 +2890,9 @@ export function routineService(
             catchUpPolicy: routineSnapshot.catchUpPolicy,
             activityGatePolicy: routineSnapshot.activityGatePolicy,
             activityGateScope: routineSnapshot.activityGateScope,
+            // A pre-existing snapshot has neither field; restore must not resurrect one.
+            repeatPolicy: routineSnapshot.repeatPolicy ?? null,
+            repeatWindowSeconds: routineSnapshot.repeatWindowSeconds ?? null,
             variables: routineSnapshot.variables,
             env: routineSnapshot.env,
             updatedByAgentId: actor.agentId ?? null,

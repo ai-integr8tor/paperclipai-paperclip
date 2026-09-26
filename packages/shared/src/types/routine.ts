@@ -5,6 +5,7 @@ import type {
   RoutineActivityGateScope,
   RoutineCatchUpPolicy,
   RoutineConcurrencyPolicy,
+  RoutineRepeatPolicy,
   RoutineStatus,
   RoutineTriggerKind,
   RoutineTriggerSigningMode,
@@ -85,6 +86,8 @@ export interface Routine {
   catchUpPolicy: string;
   activityGatePolicy: string;
   activityGateScope: string;
+  repeatPolicy?: string | null;
+  repeatWindowSeconds?: number | null;
   originKind?: string;
   originId?: string | null;
   variables: RoutineVariable[];
@@ -130,6 +133,8 @@ export interface RoutineRevisionSnapshotRoutineV1 {
   catchUpPolicy: RoutineCatchUpPolicy;
   activityGatePolicy: RoutineActivityGatePolicy;
   activityGateScope: RoutineActivityGateScope;
+  repeatPolicy?: RoutineRepeatPolicy | null;
+  repeatWindowSeconds?: number | null;
   originKind?: string;
   originId?: string | null;
   variables: RoutineVariable[];

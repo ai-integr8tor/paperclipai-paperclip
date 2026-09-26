@@ -645,6 +645,12 @@ export type RoutineActivityGatePolicy = (typeof ROUTINE_ACTIVITY_GATE_POLICIES)[
 export const ROUTINE_ACTIVITY_GATE_SCOPES = ["company", "project"] as const;
 export type RoutineActivityGateScope = (typeof ROUTINE_ACTIVITY_GATE_SCOPES)[number];
 
+// "skip_if_completed" bounds a routine whose condition can never become false:
+// a finished execution issue carrying the same dispatch fingerprint satisfies the
+// trigger for repeatWindowSeconds. Unset keeps the historical re-fire-every-tick.
+export const ROUTINE_REPEAT_POLICIES = ["always", "skip_if_completed"] as const;
+export type RoutineRepeatPolicy = (typeof ROUTINE_REPEAT_POLICIES)[number];
+
 export const ROUTINE_TRIGGER_KINDS = ["schedule", "webhook", "api"] as const;
 export type RoutineTriggerKind = (typeof ROUTINE_TRIGGER_KINDS)[number];
 

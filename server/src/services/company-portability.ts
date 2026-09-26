@@ -52,6 +52,7 @@ import {
   PROJECT_ICON_NAMES,
   PROJECT_STATUSES,
   ROUTINE_CATCH_UP_POLICIES,
+  ROUTINE_REPEAT_POLICIES,
   ROUTINE_CONCURRENCY_POLICIES,
   ROUTINE_STATUSES,
   ROUTINE_TRIGGER_KINDS,
@@ -1263,6 +1264,12 @@ function normalizeRoutineExtension(value: unknown): CompanyPortabilityIssueRouti
   const routine = {
     concurrencyPolicy: asString(value.concurrencyPolicy),
     catchUpPolicy: asString(value.catchUpPolicy),
+    // A manifest without these must import as "unset", not as a default.
+    repeatPolicy: asString(value.repeatPolicy),
+    repeatWindowSeconds:
+      typeof value.repeatWindowSeconds === "number" && Number.isFinite(value.repeatWindowSeconds)
+        ? Math.floor(value.repeatWindowSeconds)
+        : null,
     variables,
     triggers,
   };
@@ -1273,6 +1280,8 @@ function buildRoutineManifestFromLiveRoutine(routine: RoutineLike): CompanyPorta
   return {
     concurrencyPolicy: routine.concurrencyPolicy,
     catchUpPolicy: routine.catchUpPolicy,
+    repeatPolicy: routine.repeatPolicy ?? null,
+    repeatWindowSeconds: routine.repeatWindowSeconds ?? null,
     variables: routine.variables,
     triggers: routine.triggers.map((trigger) => ({
       kind: trigger.kind,
@@ -1797,16 +1806,20 @@ function resolvePortableRoutineDefinition(
     return { routine: null, warnings, errors };
   }
 
-  const routine = issue.routine
+  const routine: CompanyPortabilityIssueRoutineManifestEntry = issue.routine
     ? {
       concurrencyPolicy: issue.routine.concurrencyPolicy,
       catchUpPolicy: issue.routine.catchUpPolicy,
+      repeatPolicy: issue.routine.repeatPolicy ?? null,
+      repeatWindowSeconds: issue.routine.repeatWindowSeconds ?? null,
       variables: issue.routine.variables ?? null,
       triggers: [...issue.routine.triggers],
     }
     : {
       concurrencyPolicy: null,
       catchUpPolicy: null,
+      repeatPolicy: null,
+      repeatWindowSeconds: null,
       variables: null,
       triggers: [] as CompanyPortabilityIssueRoutineTriggerManifestEntry[],
     };
@@ -1816,6 +1829,9 @@ function resolvePortableRoutineDefinition(
   }
   if (routine.catchUpPolicy && !ROUTINE_CATCH_UP_POLICIES.includes(routine.catchUpPolicy as any)) {
     errors.push(`Recurring task ${issue.slug} uses unsupported routine catchUpPolicy "${routine.catchUpPolicy}".`);
+  }
+  if (routine.repeatPolicy && !ROUTINE_REPEAT_POLICIES.includes(routine.repeatPolicy as any)) {
+    errors.push(`Recurring task ${issue.slug} uses unsupported routine repeatPolicy "${routine.repeatPolicy}".`);
   }
 
   for (const trigger of routine.triggers) {
@@ -4578,6 +4594,9 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
         priority: routine.priority !== "medium" ? routine.priority : undefined,
         concurrencyPolicy: routine.concurrencyPolicy !== "coalesce_if_active" ? routine.concurrencyPolicy : undefined,
         catchUpPolicy: routine.catchUpPolicy !== "skip_missed" ? routine.catchUpPolicy : undefined,
+        // Unset is the historical behaviour, so only a configured value is exported.
+        repeatPolicy: routine.repeatPolicy && routine.repeatPolicy !== "always" ? routine.repeatPolicy : undefined,
+        repeatWindowSeconds: routine.repeatWindowSeconds ?? undefined,
         variables: (routine.variables ?? []).length > 0 ? routine.variables : undefined,
         triggers: routine.triggers.map((trigger) => stripEmptyValues({
           kind: trigger.kind,
@@ -5978,6 +5997,8 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
             const routineDefinition = resolvedRoutine.routine ?? {
               concurrencyPolicy: null,
               catchUpPolicy: null,
+              repeatPolicy: null,
+              repeatWindowSeconds: null,
               variables: null,
               triggers: [],
             };
@@ -6004,6 +6025,16 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
                 routineDefinition.catchUpPolicy && ROUTINE_CATCH_UP_POLICIES.includes(routineDefinition.catchUpPolicy as any)
                   ? routineDefinition.catchUpPolicy as typeof ROUTINE_CATCH_UP_POLICIES[number]
                   : "skip_missed",
+              repeatPolicy:
+                routineDefinition.repeatPolicy && ROUTINE_REPEAT_POLICIES.includes(routineDefinition.repeatPolicy as any)
+                  ? routineDefinition.repeatPolicy as typeof ROUTINE_REPEAT_POLICIES[number]
+                  : null,
+              repeatWindowSeconds:
+                typeof routineDefinition.repeatWindowSeconds === "number" &&
+                Number.isFinite(routineDefinition.repeatWindowSeconds) &&
+                routineDefinition.repeatWindowSeconds > 0
+                  ? Math.floor(routineDefinition.repeatWindowSeconds)
+                  : null,
               variables: routineDefinition.variables ?? [],
             }, {
               agentId: null,
