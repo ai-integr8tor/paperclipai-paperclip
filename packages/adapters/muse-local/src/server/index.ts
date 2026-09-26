@@ -65,3 +65,10 @@ export { listMuseSkills, syncMuseSkills } from "./skills.js";
 export { parseMuseJsonl, isMuseAuthError, type ParsedMuseJsonl } from "./parse.js";
 export { testEnvironment } from "./test.js";
 export { parseMuseAuthApiKey } from "./muse-auth.js";
+export {
+  MUSE_DEVICE_LOGIN_COMMAND,
+  MUSE_DEVICE_LOGIN_URL_ORIGIN,
+  MUSE_DEVICE_LOGIN_URL_PATH,
+  parseMuseDeviceLoginPrompt,
+  type DeviceLoginPrompt as MuseDeviceLoginPrompt,
+} from "./device-login-parse.js";
