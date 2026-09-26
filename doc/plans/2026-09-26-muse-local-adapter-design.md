@@ -80,7 +80,7 @@ Modelled on `grok-local` (smallest adapter with device login) and
   does.
 - **Sessions:** the session codec stores `{sessionId, cwd}`. A heartbeat
   reuses `sessionId` when the stored cwd matches the current cwd; otherwise
-  it lets Muse mint one and records `stream.id` from the output. Muse's session
+  it passes a fresh `randomUUID()` (Muse creates the session under that id). Muse's session
   store lives in the per-agent `XDG_DATA_HOME`, so resume survives across heartbeats.
 - **`parse.ts`:** a pure JSONL parser over MSP records, built from
   `muse schema` output and the recorded fixture
@@ -175,8 +175,11 @@ its own line after `confirm this code matches:`.
 - Auth failure: `terminal: "failed"` with a reason matching
   `/API key .* was rejected|No Meta credentials|saved Meta credentials are invalid/`
   sets `errorCode: "muse_auth_required"` and a "log in to Muse again" message.
-  There is no retry. An unknown resume session triggers one retry without
-  `--session-id`.
+  There is no retry.
+- Sessions (verified): `--session-id <uuid>` resumes that session when it exists in
+  `XDG_DATA_HOME` and otherwise creates a new session with that id. So `execute`
+  always passes `--session-id`: the stored id when cwd matches, else
+  `randomUUID()`. No unknown-session retry path is needed.
 - Billing: `provider: "meta"`, `biller: "muse"`, `billingType: "subscription"`,
   `costUsd: null`.
 
