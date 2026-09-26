@@ -208,6 +208,11 @@ import {
   promoteGrokDeviceLoginCredential,
 } from "@paperclipai/adapter-grok-local/server";
 import {
+  checkStagedMuseCredentialReadiness,
+  parseMuseAuthApiKey,
+  promoteMuseDeviceLoginCredential,
+} from "@paperclipai/adapter-muse-local/server";
+import {
   AdapterAuthSessionConflictError,
   createDeviceLoginService,
   createWorkerBoundLoginPtyOpener,
@@ -1092,6 +1097,44 @@ export function agentRoutes(
           // copy while this login was in progress), so a later run still
           // authenticates as the same account.
           if (outcome !== "promoted" && outcome !== "kept") {
+            throw new Error(`device-login credential promotion rejected: ${outcome}`);
+          }
+        },
+      },
+      muse_local: {
+        async promote(authBytes, context) {
+          const managedSession = await adapterLoginStore.get(context.sessionId);
+          if (managedSession?.aiConnection) {
+            await adapterLoginStore.withCompanyAdapterPromotionLock(context.companyId, context.startedByUserId, context.adapterType, async () => {
+              // Only the Meta API key is saved; the auth file's OAuth token and
+              // account identity never leave this function.
+              const key = checkStagedMuseCredentialReadiness(authBytes).ready
+                ? parseMuseAuthApiKey(authBytes.toString("utf8"))
+                : null;
+              if (!key) throw new Error("Provider credential is not ready");
+              await aiConnectionService(db).save(context.companyId, context.startedByUserId, managedSession.aiConnection!, key, context.sessionId);
+            });
+            return;
+          }
+          const outcome = await adapterLoginStore.withCompanyAdapterPromotionLock(
+            context.companyId,
+            context.startedByUserId,
+            context.adapterType,
+            () =>
+              promoteMuseDeviceLoginCredential({
+                authBytes,
+                companyId: context.companyId,
+                userInitiated: true,
+                isSoleActiveOwner: async () => {
+                  const row = await adapterLoginStore.get(context.sessionId);
+                  return row?.status === "promoting" && row.companyId === context.companyId;
+                },
+                log: (line) => {
+                  logger.info({ sessionId: context.sessionId }, line);
+                },
+              }),
+          );
+          if (outcome !== "promoted") {
             throw new Error(`device-login credential promotion rejected: ${outcome}`);
           }
         },

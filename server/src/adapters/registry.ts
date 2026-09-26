@@ -86,6 +86,8 @@ import {
 } from "@paperclipai/adapter-grok-local";
 import {
   execute as museExecute,
+  MUSE_DEVICE_LOGIN_COMMAND,
+  parseMuseDeviceLoginPrompt,
   listMuseSkills,
   syncMuseSkills,
   testEnvironment as museTestEnvironment,
@@ -259,6 +261,19 @@ const grokLoginCapability: AdapterLoginCapability = {
   getCommand: () => GROK_DEVICE_LOGIN_COMMAND,
   parsePrompt: (output) => {
     const prompt = parseGrokDeviceLoginPrompt(output);
+    return prompt ? { url: prompt.url, code: prompt.code } : null;
+  },
+};
+
+// The Muse interactive login capability, the same displayed-code shape as Grok.
+// `getCommand` is descriptive only: the login path selects the real command
+// from the closed key map in `login-command.ts`.
+const museLoginCapability: AdapterLoginCapability = {
+  panelMode: "displayed_code",
+  timeoutPolicy: "caller_bounded",
+  getCommand: () => MUSE_DEVICE_LOGIN_COMMAND,
+  parsePrompt: (output) => {
+    const prompt = parseMuseDeviceLoginPrompt(output);
     return prompt ? { url: prompt.url, code: prompt.code } : null;
   },
 };
@@ -783,6 +798,7 @@ const museLocalAdapter: ServerAdapterModule = {
     installCommand: MUSE_SANDBOX_INSTALL_COMMAND,
   }),
   agentConfigurationDoc: museAgentConfigurationDoc,
+  loginCapability: museLoginCapability,
 };
 
 const kimiLocalAdapter: ServerAdapterModule = {
