@@ -2525,24 +2525,6 @@ export async function heartbeatRunIsTerminalOrMissing(
 }
 
 /**
- * Returns whether the given heartbeat run belongs to the given agent. A checkout
- * held by a live run of the assignee is not a cross-agent lock, so it must not
- * block the assignee from writing to (or releasing) its own issue.
- */
-export async function heartbeatRunBelongsToAgent(
-  dbOrTx: Pick<Db, "select">,
-  runId: string,
-  agentId: string,
-): Promise<boolean> {
-  const run = await dbOrTx
-    .select({ agentId: heartbeatRuns.agentId })
-    .from(heartbeatRuns)
-    .where(eq(heartbeatRuns.id, runId))
-    .then((rows: Array<{ agentId: string }>) => rows[0] ?? null);
-  return run?.agentId === agentId;
-}
-
-/**
  * Returns whether a specific run's sync-back on a specific execution workspace
  * has settled — i.e. the accept/review gates that guard against a still-in-flight
  * worktree sync no longer need to block on this run.
@@ -11777,14 +11759,12 @@ export function issueService(db: Db) {
             existing.checkoutRunId,
             tx,
           );
-          // A live sibling run of the same agent is not a reason to deny the
-          // assignee; releasing is how an agent stops holding a lock.
-          const holderIsSameAgent = await heartbeatRunBelongsToAgent(
-            tx,
-            existing.checkoutRunId,
-            actorAgentId,
-          );
-          if (!stale && !holderIsSameAgent) {
+          // A LIVE holder keeps its issue, even when the holder is a sibling run
+          // of this same agent. Releasing hands the holder's in-flight work to
+          // anyone, and the widening that allowed it was never part of the
+          // TES-114 fix (whose failure was "cannot write", not "cannot release").
+          // A terminal or missing holder is stale and still releasable.
+          if (!stale) {
             throw conflict("Only checkout run can release issue", {
               issueId: existing.id,
               assigneeAgentId: existing.assigneeAgentId,

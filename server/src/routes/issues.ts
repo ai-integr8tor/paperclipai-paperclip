@@ -5279,7 +5279,17 @@ export function issueRoutes(
       /** Used only to name the task in denial copy (plan §6). */
       identifier?: string | null;
     },
-    options: { allowVisibleIssueWrite?: boolean } = {},
+    options: {
+      allowVisibleIssueWrite?: boolean;
+      /**
+       * Set by channels that must not take ownership of a run lock as a side
+       * effect. `assertCheckoutOwner` adopts a live same-agent sibling's
+       * checkout so the assignee can WRITE, but release is not a write: adopting
+       * first would rebind the holder's lock to the actor and make the release
+       * look like the actor's own run releasing its own lock (TES-250).
+       */
+      skipRunLockAdoption?: boolean;
+    } = {},
   ) {
     if (req.actor.type !== "agent") return true;
     const actorAgentId = req.actor.agentId;
@@ -5385,12 +5395,14 @@ export function issueRoutes(
     }
     const runId = requireAgentRunId(req, res);
     if (!runId) return false;
-    const ownership = await svc.assertCheckoutOwner(
-      issue.id,
-      actorAgentId,
-      runId,
-    );
-    if (ownership.adoptedFromRunId) {
+    // Channels that only need to know whether the run lock is theirs must not
+    // adopt a live sibling's checkout on the way past. Adoption is a WRITE
+    // affordance; for release it would silently transfer the holder's lock to
+    // the actor and then let the actor clear it (TES-250).
+    const ownership = options.skipRunLockAdoption
+      ? null
+      : await svc.assertCheckoutOwner(issue.id, actorAgentId, runId);
+    if (ownership?.adoptedFromRunId) {
       const actor = getActorInfo(req);
       await logActivity(db, {
         companyId: issue.companyId,
@@ -15230,7 +15242,16 @@ export function issueRoutes(
       "Issue not found",
     );
     if (!existing) return;
-    if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
+    // Release must judge the lock as the HOLDER left it. Adopting a live
+    // same-agent sibling's checkout here would rebind the lock to this run
+    // first, so the release would always look like a self-release and the
+    // running holder would lose its issue mid-flight (TES-250).
+    if (
+      !(await assertAgentIssueMutationAllowed(req, res, existing, {
+        skipRunLockAdoption: true,
+      }))
+    )
+      return;
     const actorRunId = requireAgentRunId(req, res);
     if (req.actor.type === "agent" && !actorRunId) return;
 

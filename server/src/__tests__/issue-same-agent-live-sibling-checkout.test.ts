@@ -316,12 +316,138 @@ describeEmbeddedPostgres("same-agent live sibling checkout lock", () => {
     });
   });
 
-  it("lets the assignee release a lock held by a live sibling run of the same agent", async () => {
+  it("refuses to release a lock held by a LIVE sibling run of the same agent", async () => {
     const seed = await seedCompanyAgentsAndRuns();
     const issueId = await seedIssue({
       companyId: seed.companyId,
       assigneeAgentId: seed.assigneeAgentId,
       checkoutRunId: seed.siblingRunId,
+    });
+
+    const res = await request(
+      createApp(agentActor(seed.companyId, seed.assigneeAgentId, seed.actorRunId)),
+    )
+      .post(`/api/issues/${issueId}/release`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.error).toBe("Only checkout run can release issue");
+    // The holder is still running: it must keep its issue, its assignee and its
+    // checkout. A release here would hand a still-active run's work to anyone.
+    const row = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        assigneeAgentId: issues.assigneeAgentId,
+        status: issues.status,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.checkoutRunId).toBe(seed.siblingRunId);
+    expect(row?.assigneeAgentId).toBe(seed.assigneeAgentId);
+    expect(row?.status).toBe("in_progress");
+  });
+
+  it("still releases when the holder run has gone terminal (stale-lock escape route)", async () => {
+    const seed = await seedCompanyAgentsAndRuns();
+    const issueId = await seedIssue({
+      companyId: seed.companyId,
+      assigneeAgentId: seed.assigneeAgentId,
+      checkoutRunId: seed.siblingRunId,
+    });
+    // "succeeded" is a status the product actually writes on a run. (An earlier
+    // draft of this test used "completed", which is not in
+    // TERMINAL_HEARTBEAT_RUN_STATUSES and is never written to heartbeat_runs —
+    // it made the stale path look broken when the guard was correct.)
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded" })
+      .where(eq(heartbeatRuns.id, seed.siblingRunId));
+
+    const res = await request(
+      createApp(agentActor(seed.companyId, seed.assigneeAgentId, seed.actorRunId)),
+    )
+      .post(`/api/issues/${issueId}/release`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const row = await db
+      .select({ checkoutRunId: issues.checkoutRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.checkoutRunId).toBeNull();
+  });
+
+  // The stale escape route must hold for EVERY terminal status the product
+  // writes, not just one. A status the guard fails to recognise would strand a
+  // finished run's issue forever, which is the wedge this change must not cause.
+  it.each(["succeeded", "interrupted", "failed", "cancelled", "timed_out"])(
+    "still releases when the holder run is terminal (%s)",
+    async (terminalStatus) => {
+      const seed = await seedCompanyAgentsAndRuns();
+      const issueId = await seedIssue({
+        companyId: seed.companyId,
+        assigneeAgentId: seed.assigneeAgentId,
+        checkoutRunId: seed.siblingRunId,
+      });
+      await db
+        .update(heartbeatRuns)
+        .set({ status: terminalStatus })
+        .where(eq(heartbeatRuns.id, seed.siblingRunId));
+
+      const res = await request(
+        createApp(agentActor(seed.companyId, seed.assigneeAgentId, seed.actorRunId)),
+      )
+        .post(`/api/issues/${issueId}/release`);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const row = await db
+        .select({ checkoutRunId: issues.checkoutRunId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row?.checkoutRunId).toBeNull();
+    },
+  );
+
+  // A queued sibling has not started, but it is not terminal either. It holds a
+  // claim on the issue, so release must refuse just as it does for `running`.
+  it.each(["queued", "retrying", "pending_cleanup"])(
+    "refuses to release when the holder run is non-terminal but not running (%s)",
+    async (nonTerminalStatus) => {
+      const seed = await seedCompanyAgentsAndRuns();
+      const issueId = await seedIssue({
+        companyId: seed.companyId,
+        assigneeAgentId: seed.assigneeAgentId,
+        checkoutRunId: seed.siblingRunId,
+      });
+      await db
+        .update(heartbeatRuns)
+        .set({ status: nonTerminalStatus })
+        .where(eq(heartbeatRuns.id, seed.siblingRunId));
+
+      const res = await request(
+        createApp(agentActor(seed.companyId, seed.assigneeAgentId, seed.actorRunId)),
+      )
+        .post(`/api/issues/${issueId}/release`);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      const row = await db
+        .select({ checkoutRunId: issues.checkoutRunId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row?.checkoutRunId).toBe(seed.siblingRunId);
+    },
+  );
+
+  // The holder is the actor's own run: releasing is the normal way an agent
+  // drops a lock it legitimately holds, and it must keep working.
+  it("still releases when the holder is the actor's OWN run", async () => {
+    const seed = await seedCompanyAgentsAndRuns();
+    const issueId = await seedIssue({
+      companyId: seed.companyId,
+      assigneeAgentId: seed.assigneeAgentId,
+      checkoutRunId: seed.actorRunId,
     });
 
     const res = await request(
@@ -336,6 +462,89 @@ describeEmbeddedPostgres("same-agent live sibling checkout lock", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]);
     expect(row?.checkoutRunId).toBeNull();
+  });
+
+  // A refused release must not write ANY column. Partial state here is how an
+  // issue ends up assignee-less but still locked, or locked but re-queued.
+  it("a refused release leaves every column untouched", async () => {
+    const seed = await seedCompanyAgentsAndRuns();
+    const issueId = await seedIssue({
+      companyId: seed.companyId,
+      assigneeAgentId: seed.assigneeAgentId,
+      checkoutRunId: seed.siblingRunId,
+    });
+
+    const res = await request(
+      createApp(agentActor(seed.companyId, seed.assigneeAgentId, seed.actorRunId)),
+    )
+      .post(`/api/issues/${issueId}/release`);
+
+    expect(res.status).toBe(409);
+    const row = await db
+      .select({
+        title: issues.title,
+        status: issues.status,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        executionLockedAt: issues.executionLockedAt,
+        assigneeAgentId: issues.assigneeAgentId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toMatchObject({
+      title: "Sibling-held issue",
+      status: "in_progress",
+      checkoutRunId: seed.siblingRunId,
+      executionRunId: seed.siblingRunId,
+      assigneeAgentId: seed.assigneeAgentId,
+    });
+    expect(row?.executionLockedAt).not.toBeNull();
+  });
+
+  // Two releases racing the same live holder: at most one may win, and the
+  // holder must never be left half-cleared.
+  it("concurrent releases against a live holder do not corrupt the lock", async () => {
+    const seed = await seedCompanyAgentsAndRuns();
+    const issueId = await seedIssue({
+      companyId: seed.companyId,
+      assigneeAgentId: seed.assigneeAgentId,
+      checkoutRunId: seed.siblingRunId,
+    });
+    const app = createApp(
+      agentActor(seed.companyId, seed.assigneeAgentId, seed.actorRunId),
+    );
+
+    const results = await Promise.all([
+      request(app).post(`/api/issues/${issueId}/release`),
+      request(app).post(`/api/issues/${issueId}/release`),
+    ]);
+    for (const r of results) expect(r.status).toBe(409);
+
+    const row = await db
+      .select({ checkoutRunId: issues.checkoutRunId, status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.checkoutRunId).toBe(seed.siblingRunId);
+    expect(row?.status).toBe("in_progress");
+  });
+
+  it("still releases when the holder run row is missing entirely", async () => {
+    const seed = await seedCompanyAgentsAndRuns();
+    const issueId = await seedIssue({
+      companyId: seed.companyId,
+      assigneeAgentId: seed.assigneeAgentId,
+      checkoutRunId: seed.siblingRunId,
+    });
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, seed.siblingRunId));
+
+    const res = await request(
+      createApp(agentActor(seed.companyId, seed.assigneeAgentId, seed.actorRunId)),
+    )
+      .post(`/api/issues/${issueId}/release`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
   });
 
   it("still refuses to release when the holder is a live run of a DIFFERENT agent", async () => {
