@@ -27166,6 +27166,9 @@ export function heartbeatService(
             // continuation contract; the release must not overrule that verdict.
             // Only a message-less assignment decision retires the hold.
             if (durableRequest || wakeCommentId) return false;
+            // The wakeup API lets an agent wake itself with the same declared
+            // source; an agent must not retire the hold on its own issue.
+            if (opts.requestedByActorType === "agent") return false;
             if (continuationRefusedByLiveObligation) return false;
             // Only a plainly re-runnable issue may lose the hold: an open task
             // with a single invokable agent owner and no human owner. An active

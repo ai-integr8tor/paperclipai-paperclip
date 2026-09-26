@@ -7,11 +7,19 @@
  *  T1  settled no-replay hold + `todo` issue + invokable agent owner + a fresh
  *      assignment wake → a run is created once and the hold is released
  *      (marked, never deleted)
+ *  T1b the same wake declared by the agent itself (the wakeup API lets an agent
+ *      wake itself) stays parked: an agent cannot retire its own hold
  *  T2  an open (`active`) action still parks the wake
  *  T3  a human owner (`assigneeUserId`) still parks the wake — a person decides
  *  T4  an issue that is not `todo`/`blocked` still parks the wake
  *  T5  GET /issues/:id/recovery-actions surfaces the settled action referenced
  *      by `executionBlocker` (Patch A)
+ *  T6  a board resolve of that settled action releases the hold, closes the
+ *      action with the operator's decision, and resumes the task
+ *  T7  an agent resolve of the same action is still a replay no-op: only the
+ *      board decides
+ *  T8  a settled hold that is not a plain no-replay hold (an unsafe workspace
+ *      archive) is never released by a resolve
  */
 import { randomUUID } from "node:crypto";
 import express from "express";
@@ -94,6 +102,7 @@ describeEmbeddedPostgres("issue stranded by a settled no-replay hold", () => {
     replay?: "blocked" | null;
     assigneeUserId?: string | null;
     includeAssignee?: boolean;
+    unsafeWorkspace?: boolean;
   } = {}) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -147,6 +156,9 @@ describeEmbeddedPostgres("issue stranded by a settled no-replay hold", () => {
       nextAction: "Reconcile the stopped run before continuing.",
       evidence: {
         runId: sourceRunId,
+        ...(opts.unsafeWorkspace
+          ? { workspaceRestoreFailure: "restore_unsafe_archive" }
+          : {}),
         ...(opts.replay ? { automaticRecovery: { replay: opts.replay, actionOutcome: "blocked" } } : {}),
       },
     }).returning();
@@ -160,14 +172,18 @@ describeEmbeddedPostgres("issue stranded by a settled no-replay hold", () => {
     return { companyId, issueId, agentId, sourceRunId, actionId: action!.id };
   }
 
-  const wakeIssue = (agentId: string, issueId: string) =>
+  const wakeIssue = (
+    agentId: string,
+    issueId: string,
+    requestedByActorType: "user" | "agent" | "system" = "system",
+  ) =>
     heartbeatService(db).wakeup(agentId, {
       source: "assignment",
       triggerDetail: "system",
       reason: "issue_assigned",
       payload: { issueId },
       contextSnapshot: { issueId },
-      requestedByActorType: "system",
+      requestedByActorType,
       requestedByActorId: "assignment",
     });
 
@@ -229,6 +245,23 @@ describeEmbeddedPostgres("issue stranded by a settled no-replay hold", () => {
     expect(await executionWaits(seed.agentId)).toHaveLength(0);
   });
 
+  it("T1b: an agent's own assignment wake cannot retire the hold", async () => {
+    const seed = await seedBlockedIssue({ issueStatus: "todo", replay: "blocked" });
+
+    await wakeIssue(seed.agentId, seed.issueId, "agent");
+
+    const waits = await executionWaits(seed.agentId);
+    expect(waits).toHaveLength(1);
+    expect(waits[0]).toMatchObject({ status: "skipped", reason: "execution_reconciliation_required" });
+    expect(await runsForIssue(seed.issueId)).toHaveLength(0);
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, seed.actionId));
+    expect(action!.evidence.settledNoReplayHoldReleasedAt).toBeUndefined();
+    expect(await getExecutionBlocker(db, seed.companyId, seed.issueId)).not.toBeNull();
+  });
+
   it("T2: an open recovery action still parks the wake", async () => {
     const seed = await seedBlockedIssue({ issueStatus: "todo", recoveryStatus: "active", replay: "blocked" });
     expect(await getExecutionBlocker(db, seed.companyId, seed.issueId)).not.toBeNull();
@@ -285,5 +318,86 @@ describeEmbeddedPostgres("issue stranded by a settled no-replay hold", () => {
     expect(response.body.referencedByExecutionBlocker).toBe(seed.actionId);
     // Surfacing is read-only: the blocker is untouched by the read.
     expect(await getExecutionBlocker(db, seed.companyId, seed.issueId)).not.toBeNull();
+  });
+
+  const resolveSettledAction = (
+    companyId: string,
+    issueId: string,
+    actionId: string,
+    agentId?: string,
+  ) =>
+    request(app(companyId, agentId))
+      .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+      .send({ actionId, outcome: "restored", sourceIssueStatus: "todo" });
+
+  const readAction = async (actionId: string) =>
+    db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, actionId))
+      .then((rows) => rows[0]!);
+
+  it("T6: a board resolve of the settled action releases the hold and resumes the task", async () => {
+    const seed = await seedBlockedIssue({ issueStatus: "blocked", replay: "blocked" });
+
+    const response = await resolveSettledAction(seed.companyId, seed.issueId, seed.actionId);
+
+    expect(response.status).toBe(200);
+    // The hold is gone, and the operator's decision is recorded on the record
+    // itself instead of deleting the no-replay evidence.
+    expect(await getExecutionBlocker(db, seed.companyId, seed.issueId)).toBeNull();
+    const action = await readAction(seed.actionId);
+    expect(action).toMatchObject({ status: "resolved", outcome: "restored" });
+    expect(action.evidence.automaticRecovery).toMatchObject({ replay: "blocked" });
+    expect(action.evidence.settledNoReplayHoldReleasedAt).toEqual(expect.any(String));
+    expect(action.evidence.settledNoReplayHoldRelease).toMatchObject({
+      cause: "legacy_execution_requires_reconciliation",
+      sourceRunId: seed.sourceRunId,
+      reason: "recovery_action_resolution",
+    });
+    // The task actually resumed: a run exists for it.
+    expect((await runsForIssue(seed.issueId)).length).toBeGreaterThan(0);
+    // The projection stops pointing at the released record.
+    const projection = await request(app(seed.companyId)).get(
+      `/api/issues/${seed.issueId}/recovery-actions`,
+    );
+    expect(projection.body.referencedByExecutionBlocker).toBeNull();
+    expect(projection.body.active).toBeNull();
+  });
+
+  it("T7: an agent resolve of the settled action releases nothing", async () => {
+    const seed = await seedBlockedIssue({ issueStatus: "blocked", replay: "blocked" });
+
+    const response = await resolveSettledAction(
+      seed.companyId,
+      seed.issueId,
+      seed.actionId,
+      seed.agentId,
+    );
+
+    // An agent write is refused before it can reach the settled action; whichever
+    // gate refuses it, the hold must survive and no run may start.
+    expect(response.status).toBe(403);
+    expect(await getExecutionBlocker(db, seed.companyId, seed.issueId)).not.toBeNull();
+    const action = await readAction(seed.actionId);
+    expect(action.status).toBe("resolved");
+    expect(action.evidence.settledNoReplayHoldReleasedAt).toBeUndefined();
+    expect((await runsForIssue(seed.issueId)).length).toBe(0);
+  });
+
+  it("T8: an unsafe workspace archive is never released by a resolve", async () => {
+    const seed = await seedBlockedIssue({
+      issueStatus: "blocked",
+      replay: "blocked",
+      unsafeWorkspace: true,
+    });
+
+    const response = await resolveSettledAction(seed.companyId, seed.issueId, seed.actionId);
+
+    expect(response.status).toBe(200);
+    expect(await getExecutionBlocker(db, seed.companyId, seed.issueId)).not.toBeNull();
+    const action = await readAction(seed.actionId);
+    expect(action.evidence.settledNoReplayHoldReleasedAt).toBeUndefined();
+    expect((await runsForIssue(seed.issueId)).length).toBe(0);
   });
 });

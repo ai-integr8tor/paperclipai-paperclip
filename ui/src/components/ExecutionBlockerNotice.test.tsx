@@ -6,11 +6,15 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ExecutionBlockerNotice } from "./ExecutionBlockerNotice";
 import { agentsApi } from "../api/agents";
 import { activityApi } from "../api/activity";
+import { issuesApi } from "../api/issues";
 vi.mock("../lib/router", () => ({
   Link: ({ to, ...props }: AnchorHTMLAttributes<HTMLAnchorElement> & { to: string }) => <a href={to} {...props} />,
 }));
 vi.mock("../api/agents", () => ({ agentsApi: { retryFailedRun: vi.fn() } }));
 vi.mock("../api/activity", () => ({ activityApi: { runsForIssue: vi.fn() } }));
+vi.mock("../api/issues", () => ({
+  issuesApi: { recoveryActions: vi.fn(), resolveRecoveryAction: vi.fn() },
+}));
 
 describe("stopped task recovery notice", () => {
   let root: Root;
@@ -23,6 +27,11 @@ describe("stopped task recovery notice", () => {
     root = createRoot(container);
     client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
     vi.mocked(activityApi.runsForIssue).mockResolvedValue([{ runId: "failed-run", agentId: "agent", status: "failed" }] as never);
+    vi.mocked(issuesApi.recoveryActions).mockResolvedValue({
+      active: null,
+      actions: [],
+      referencedByExecutionBlocker: null,
+    } as never);
     await act(async () => root.render(<QueryClientProvider client={client}>
       <ExecutionBlockerNotice companyId="company" issueId="task" onRetried={onRetried} blocker={{
         recoveryActionId: "recovery", runId: "failed-run", agentId: "agent", cause: "legacy_execution_requires_reconciliation",
@@ -78,5 +87,69 @@ describe("stopped task recovery notice", () => {
     expect(container.querySelector('[role="alert"]')?.textContent).toBe("Environment cleanup is still running.");
     expect(container.querySelector<HTMLButtonElement>("button")!.disabled).toBe(false);
     expect(onRetried).not.toHaveBeenCalled();
+  });
+  it("surfaces the settled recovery action the blocker references and resolves it on the task", async () => {
+    client.clear();
+    vi.mocked(issuesApi.recoveryActions).mockResolvedValue({
+      active: null,
+      actions: [{ id: "recovery", status: "resolved", cause: "native_event_replay_conflict" }],
+      referencedByExecutionBlocker: "recovery",
+    } as never);
+    vi.mocked(issuesApi.resolveRecoveryAction).mockResolvedValue({} as never);
+    await act(async () => root.render(<QueryClientProvider client={client}>
+      <ExecutionBlockerNotice companyId="company" issueId="task" onRetried={onRetried} blocker={{
+        recoveryActionId: "recovery", runId: null, agentId: null, cause: "native_event_replay_conflict",
+        nextAction: "Verify the external action outcome before continuing.",
+      }} />
+    </QueryClientProvider>));
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 10)); });
+    expect(container.textContent).toContain("Settled recovery action (native_event_replay_conflict) still holds this task. Resolve it to resume.");
+    expect(issuesApi.recoveryActions).toHaveBeenCalledWith("task");
+    const resolve = [...container.querySelectorAll("button")].find(button => button.textContent === "Resolve recovery")!;
+    expect(resolve).toBeTruthy();
+    await act(async () => resolve.click());
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 10)); });
+    expect(issuesApi.resolveRecoveryAction).toHaveBeenCalledWith("task", {
+      actionId: "recovery", outcome: "restored", sourceIssueStatus: "todo",
+    });
+    expect(onRetried).toHaveBeenCalledOnce();
+  });
+  it("reports a refused resolution instead of dropping the settled action", async () => {
+    client.clear();
+    vi.mocked(issuesApi.recoveryActions).mockResolvedValue({
+      active: null,
+      actions: [{ id: "recovery", status: "resolved", cause: "native_event_replay_conflict" }],
+      referencedByExecutionBlocker: "recovery",
+    } as never);
+    vi.mocked(issuesApi.resolveRecoveryAction).mockRejectedValue(new Error("Board access required"));
+    await act(async () => root.render(<QueryClientProvider client={client}>
+      <ExecutionBlockerNotice companyId="company" issueId="task" onRetried={onRetried} blocker={{
+        recoveryActionId: "recovery", runId: null, agentId: null, cause: "native_event_replay_conflict",
+        nextAction: "Verify the external action outcome before continuing.",
+      }} />
+    </QueryClientProvider>));
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 10)); });
+    const resolve = [...container.querySelectorAll("button")].find(button => button.textContent === "Resolve recovery")!;
+    await act(async () => resolve.click());
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 10)); });
+    expect(container.querySelector('[role="alert"]')?.textContent).toBe("Board access required");
+    expect(container.textContent).toContain("Settled recovery action (native_event_replay_conflict) still holds this task.");
+    expect(onRetried).not.toHaveBeenCalled();
+  });
+  it("shows no settled action when the blocker does not reference one", async () => {
+    vi.mocked(issuesApi.recoveryActions).mockResolvedValue({
+      active: null,
+      actions: [{ id: "recovery", status: "resolved", cause: "native_event_replay_conflict" }],
+      referencedByExecutionBlocker: null,
+    } as never);
+    await act(async () => root.render(<QueryClientProvider client={client}>
+      <ExecutionBlockerNotice companyId="company" issueId="task" onRetried={onRetried} blocker={{
+        recoveryActionId: "recovery", runId: null, agentId: null, cause: "native_event_replay_conflict",
+        nextAction: "Verify the external action outcome before continuing.",
+      }} />
+    </QueryClientProvider>));
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 10)); });
+    expect(container.textContent).not.toContain("Settled recovery action");
+    expect([...container.querySelectorAll("button")]).toHaveLength(0);
   });
 });
