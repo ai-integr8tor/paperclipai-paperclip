@@ -244,7 +244,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     });
     const resolvedCommand = await resolveAdapterExecutionTargetCommandForLogs(command, executionTarget, cwd, runtimeEnv);
     const loggedEnv = buildInvocationEnvForLogs(env, { runtimeEnv, includeRuntimeKeys: ["HOME"], resolvedCommand });
-    const billingType: "api" | "subscription" = hasNonEmptyEnvValue(effectiveEnv, "META_API_KEY") ? "api" : "subscription";
+    // A managed AI connection injects META_API_KEY for both of its methods, so
+    // its own method decides billing; otherwise a bound key means API billing.
+    const managedMethod = asString(parseObject(config.managedAiConnection).method, "");
+    const billingType: "api" | "subscription" = managedMethod
+      ? (managedMethod === "api_key" ? "api" : "subscription")
+      : hasNonEmptyEnvValue(effectiveEnv, "META_API_KEY") ? "api" : "subscription";
 
     const runtimeSessionParams = parseObject(runtime.sessionParams);
     const storedSessionId = asString(runtimeSessionParams.sessionId, runtime.sessionId ?? "");

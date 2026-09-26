@@ -166,6 +166,20 @@ describe("muse_local execute", () => {
     expect(JSON.stringify(result)).not.toContain("LLM|test-key");
   });
 
+  it("bills a managed Muse subscription connection as subscription even though it injects META_API_KEY", async () => {
+    const root = await makeTempRoot();
+    mocks.runProcessMock.mockResolvedValue(await okRun());
+    const result = await execute(makeCtx(root, {
+      config: {
+        cwd: root,
+        paperclipRuntimeSkills: [],
+        env: { META_API_KEY: "LLM|subscription-key-0000000000000000000000000000" },
+        managedAiConnection: { method: "subscription", provider: "meta", grantId: "g", identity: "g:u:x" },
+      },
+    }));
+    expect(result.billingType).toBe("subscription");
+  });
+
   it("stages skills into .agents/skills and cleans them up", async () => {
     const root = await makeTempRoot();
     const skills = await makeSkill(root);
