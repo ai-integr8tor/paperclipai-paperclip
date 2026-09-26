@@ -632,6 +632,13 @@ describe("managed AI connections", () => {
     await expect(validateAiApiKey("anthropic", "fixture", request)).rejects.toThrow("rejected");
     expect(request.mock.calls[0][1].redirect).toBe("error");
   });
+  it("validates Muse API keys against the fixed Meta endpoint", async () => {
+    const ok = vi.fn().mockResolvedValue(new Response("{}"));
+    await validateAiApiKey("meta", "LLM|fixture", ok);
+    expect(ok).toHaveBeenCalledWith("https://api.meta.ai/v1/models", expect.objectContaining({ redirect: "error", headers: { Authorization: "Bearer LLM|fixture" } }));
+    const rejected = vi.fn().mockResolvedValue(new Response("secret-provider-body", { status: 401 }));
+    await expect(validateAiApiKey("meta", "LLM|fixture", rejected)).rejects.toThrow("The provider rejected this API key.");
+  });
   it("uses the authenticated responsible user for agent-originated configuration and tests", async () => {
     const req = { actor: { type: "agent", agentId, onBehalfOfUserId: "alice" } } as express.Request;
     const selected = await service.select({ ...input, userId: responsibleUserForAiRequest(req) });
