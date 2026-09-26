@@ -84,7 +84,7 @@ Modelled on `grok-local` (smallest adapter with device login) and
   `XDG_DATA_HOME`, so resume survives across heartbeats.
 - **`parse.ts`:** a pure JSONL parser over MSP records, built from
   `muse schema` output and the recorded fixture
-  `src/server/__fixtures__/exec-basic.jsonl` (recorded copy: `docs/specs/2026-09-26-muse-exec-basic.jsonl`). Unknown `record_type` values are
+  `src/server/__fixtures__/exec-basic.jsonl` (recorded copy: `doc/plans/2026-09-26-muse-exec-basic.jsonl`). Unknown `record_type` values are
   ignored, not fatal.
 - **Skills:** Paperclip skills are linked into the agent's
   `XDG_DATA_HOME/muse/skills/`, following `grok-local/src/server/skills.ts`.
