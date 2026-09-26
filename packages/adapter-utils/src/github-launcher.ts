@@ -64,17 +64,21 @@ async function main() {
         'x-paperclip-github-capability': env.PAPERCLIP_GITHUB_BROKER_TOKEN, 'content-type': 'application/json' };
       // Node fetch ignores HTTP_PROXY. Agent sandboxes (Claude Code Seatbelt) deny
       // direct sockets, loopback included, with EPERM and leave a loopback proxy as
-      // the only way out. The broker bearer and capability must not reach a proxy
-      // the agent picked, so the fallback is deliberately narrow:
-      // - the proxy must be http:// on a loopback literal with an explicit port.
-      //   Inside the sandbox the agent cannot bind loopback, so that is the
-      //   sandbox's own proxy; remote proxies are never used;
-      // - requests always go through a CONNECT tunnel. HTTPS brokers get
-      //   end-to-end TLS verified against the broker host, so the proxy sees only
-      //   ciphertext; the sandbox also denies DNS, so any direct failure retries.
-      // - plain-HTTP brokers must be loopback IPs and retry only after a sandbox
-      //   socket denial (EPERM/EACCES); a refused or timed-out broker never
-      //   consults HTTP_PROXY. The proxy allowlist still decides egress.
+      // the only way out. The agent environment can repoint that proxy, so nothing
+      // sent through it may be a reusable secret:
+      // - the direct attempt uses node:http(s) with a private agent, so
+      //   NODE_USE_ENV_PROXY cannot route the bearer through an env proxy;
+      // - the fallback is a sealed exchange (see github-broker-seal.ts). It never
+      //   sends the bearer, the API key, or the capability signature. It proves
+      //   possession of the signature over a fresh transcript bound to an
+      //   ephemeral X25519 key, and only accepts a response that decrypts under a
+      //   key derived from that X25519 exchange and the signature. Whoever sits at
+      //   the proxy address sees nothing reusable and cannot forge credentials;
+      // - it also stays narrow: http:// proxy on a loopback literal with an
+      //   explicit port, CONNECT only (TLS end-to-end for HTTPS brokers), and
+      //   plain-HTTP brokers must be loopback IPs and retry only after a sandbox
+      //   socket denial (EPERM/EACCES). The proxy allowlist still decides egress.
+      const crypto = require('node:crypto');
       const target = new URL(url);
       const secure = target.protocol === 'https:';
       const proxy = (() => {
@@ -82,11 +86,32 @@ async function main() {
       })();
       const trustedProxy = proxy && proxy.protocol === 'http:' && proxy.port && ['localhost', '127.0.0.1', '[::1]'].includes(proxy.hostname) ? proxy : null;
       const tunnelable = secure || (target.protocol === 'http:' && ['127.0.0.1', '[::1]'].includes(target.hostname));
-      const retryable = (error) => secure || ['EPERM', 'EACCES'].includes(error && error.cause && error.cause.code);
-      let viaProxy = false;
-      const tunnelPost = () => new Promise((resolve, reject) => {
+      const retryable = (error) => secure || ['EPERM', 'EACCES'].includes(error && (error.code || (error.cause && error.cause.code)));
+      const capability = String(env.PAPERCLIP_GITHUB_BROKER_TOKEN).split('.');
+      const host = target.hostname.replace(/^\[|\]$/g, '');
+      const port = target.port || (secure ? '443' : '80');
+      const exchange = (options, body, open) => new Promise((resolve, reject) => {
+        const request = require(options.createConnection || !secure ? 'node:http' : 'node:https').request({ timeout: 10000, ...options }, (response) => {
+          const chunks = [];
+          response.on('data', (c) => chunks.push(c));
+          response.on('end', () => {
+            if (options.stream) options.stream.destroy();
+            const text = Buffer.concat(chunks).toString('utf8');
+            const status = response.statusCode || 0;
+            resolve({ status, ok: status >= 200 && status < 300, json: async () => open(JSON.parse(text)), arrayBuffer: async () => {} });
+          });
+          response.on('error', reject);
+        });
+        request.on('timeout', () => request.destroy(new Error('timeout')));
+        request.on('error', reject);
+        request.end(body);
+      });
+      const directPost = () => exchange({
+        host, port, method: 'POST', path: target.pathname + target.search, agent: false,
+        headers: { ...headers, host: target.host, 'content-length': '2' },
+      }, '{}', (value) => value);
+      const sealedPost = () => new Promise((resolve, reject) => {
         const http = require('node:http');
-        const port = target.port || (secure ? '443' : '80');
         const authority = target.hostname + ':' + port;
         const connectHeaders = { host: authority };
         if (trustedProxy.username) connectHeaders['proxy-authorization'] = 'Basic ' + Buffer.from(decodeURIComponent(trustedProxy.username) + ':' + decodeURIComponent(trustedProxy.password)).toString('base64');
@@ -95,38 +120,42 @@ async function main() {
         connect.on('error', reject);
         connect.on('connect', (res, socket) => {
           if (res.statusCode !== 200) { socket.destroy(); reject(new Error('proxy refused tunnel')); return; }
-          const host = target.hostname.replace(/^\[|\]$/g, '');
           const stream = secure
             ? require('node:tls').connect({ socket, host, rejectUnauthorized: true, servername: require('node:net').isIP(host) ? undefined : host })
             : socket;
-          const request = http.request({
-            createConnection: () => stream, method: 'POST', path: target.pathname + target.search, timeout: 10000,
-            headers: { ...headers, host: target.host, 'content-length': '2', connection: 'close' },
-          }, (response) => {
-            const chunks = [];
-            response.on('data', (c) => chunks.push(c));
-            response.on('end', () => {
-              stream.destroy();
-              const text = Buffer.concat(chunks).toString('utf8');
-              const status = response.statusCode || 0;
-              resolve({ status, ok: status >= 200 && status < 300, json: async () => JSON.parse(text), arrayBuffer: async () => {} });
-            });
-            response.on('error', reject);
-          });
-          request.on('timeout', () => request.destroy(new Error('timeout')));
-          request.on('error', reject);
-          request.end('{}');
+          const pair = crypto.generateKeyPairSync('x25519');
+          const key = pair.publicKey.export({ type: 'spki', format: 'der' }).toString('base64url');
+          const token = capability[0] + '.' + capability[1];
+          const ts = Date.now();
+          const nonce = crypto.randomBytes(16).toString('base64url');
+          const transcript = ['paperclip-github-sealed-v1', 'POST', '/runtime-tools/github/credentials', token, String(ts), nonce, key].join('\n');
+          const proof = crypto.createHmac('sha256', capability[2]).update(transcript).digest('base64url');
+          const open = (sealed) => {
+            if (!sealed || sealed.v !== 1) throw new Error('unsealed broker response');
+            const aad = transcript + '\n' + sealed.key;
+            const shared = crypto.diffieHellman({ privateKey: pair.privateKey, publicKey: crypto.createPublicKey({ key: Buffer.from(sealed.key, 'base64url'), format: 'der', type: 'spki' }) });
+            const decipher = crypto.createDecipheriv('aes-256-gcm', Buffer.from(crypto.hkdfSync('sha256', shared, Buffer.from(capability[2]), Buffer.from(aad), 32)), Buffer.from(sealed.iv, 'base64url'));
+            decipher.setAAD(Buffer.from(aad));
+            decipher.setAuthTag(Buffer.from(sealed.tag, 'base64url'));
+            return JSON.parse(Buffer.concat([decipher.update(Buffer.from(sealed.data, 'base64url')), decipher.final()]).toString('utf8'));
+          };
+          exchange({
+            createConnection: () => stream, stream, method: 'POST', path: target.pathname + target.search,
+            headers: { host: target.host, 'content-type': 'application/json', 'content-length': '2', connection: 'close',
+              'x-paperclip-github-sealed': Buffer.from(JSON.stringify({ v: 1, token, ts, nonce, key, proof })).toString('base64url') },
+          }, '{}', open).then(resolve, reject);
         });
         connect.end();
       });
+      let viaProxy = false;
       const post = async () => {
-        if (viaProxy) return tunnelPost();
+        if (viaProxy) return sealedPost();
         try {
-          return await fetch(url, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10000), headers, body: '{}' });
+          return await directPost();
         } catch (error) {
-          if (!retryable(error) || !trustedProxy || !tunnelable) throw error;
+          if (!retryable(error) || !trustedProxy || !tunnelable || capability.length !== 3) throw error;
           viaProxy = true;
-          return tunnelPost();
+          return sealedPost();
         }
       };
       for (let attempt = 0; attempt < 30; attempt++) {

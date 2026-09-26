@@ -131,7 +131,8 @@ request_json() {
   local response_file
   local status_code
 
-  response_file="$(make_temp_file)"
+  # Command substitution drops errexit; stop before any API call.
+  response_file="$(make_temp_file)" || return 1
   if [[ -n "$body" ]]; then
     status_code="$(
       curl -sS -X "$method" -w '%{http_code}' -o "$response_file" \
@@ -174,7 +175,8 @@ upload_file() {
 
   escaped_path="${path//\\/\\\\}"
   escaped_path="${escaped_path//\"/\\\"}"
-  response_file="$(make_temp_file)"
+  # Command substitution drops errexit; stop before any API call.
+  response_file="$(make_temp_file)" || return 1
   status_code="$(
     curl -sS -X POST -w '%{http_code}' -o "$response_file" \
       "$url" \
