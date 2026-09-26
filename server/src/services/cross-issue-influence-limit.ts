@@ -5,6 +5,9 @@ import { isUuidLike, issueWriteDenialResponse } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 
+/** The transaction handle Drizzle hands to a `db.transaction` callback. */
+type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
+
 export const CROSS_ISSUE_INFLUENCE_LIMIT = 20;
 export const CROSS_ISSUE_INFLUENCE_ENFORCE_AT = new Date("2026-08-11T00:00:00.000Z");
 
@@ -35,10 +38,11 @@ export function crossIssueInfluenceRunContextError() {
 }
 
 export function crossIssueInfluenceUnattributedRunError() {
-  // Distinct from the malformed/unknown-run case above: the run here resolved
-  // fine, it simply is not bound to the target task. The remedy is therefore
-  // different -- check the task out -- and merging the two copies would tell a
-  // caller to start a new run for a run that is already correct.
+  // Distinct from the run-context branch: the run row was found and matched the
+  // caller, but nothing binds it to an issue -- neither the run's context
+  // snapshot nor the target issue's checkout/execution lock. Telling the caller
+  // to resend X-Paperclip-Run-Id here is false advice: the header was
+  // already read and validated above.
   const { body } = issueWriteDenialResponse("cross_issue_influence_unattributed_run");
   return forbidden(body.error, body.details);
 }
