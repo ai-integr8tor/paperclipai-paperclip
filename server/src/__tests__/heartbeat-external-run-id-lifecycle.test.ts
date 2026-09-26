@@ -1,7 +1,16 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
-import { agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
+import {
+  agentRuntimeState,
+  agents,
+  agentTaskSessions,
+  agentWakeupRequests,
+  companies,
+  createDb,
+  heartbeatRunEvents,
+  heartbeatRuns,
+} from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -59,7 +68,13 @@ describeEmbeddedPostgres("heartbeat external run id persistence", () => {
 
   afterEach(async () => {
     adapterExecute.mockClear();
+    // Finalization writes rows that reference the run and the agent, so they go
+    // first: the foreign keys do not cascade.
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
+    await db.delete(agentTaskSessions);
+    await db.delete(agentRuntimeState);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -98,19 +113,25 @@ describeEmbeddedPostgres("heartbeat external run id persistence", () => {
     });
 
     expect(run).not.toBeNull();
+    const readStoredRun = () =>
+      db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, run!.id))
+        .then((rows) => rows[0] ?? null);
+
+    // Terminal status and the identity are two separate writes, so wait for both
+    // in the same poll instead of reading the row between them.
     await vi.waitFor(
       async () => {
-        const latest = await heartbeat.getRun(run!.id);
-        expect(latest?.status).toBe("succeeded");
+        const stored = await readStoredRun();
+        expect(stored?.status).toBe("succeeded");
+        expect(stored?.externalRunId).toBe(REMOTE_RUN_ID);
       },
       { timeout: 15_000 },
     );
 
-    const stored = await db
-      .select()
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, run!.id))
-      .then((rows) => rows[0] ?? null);
+    const stored = await readStoredRun();
     expect(stored?.externalRunId).toBe(REMOTE_RUN_ID);
   }, 30_000);
 });
