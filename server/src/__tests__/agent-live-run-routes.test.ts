@@ -954,6 +954,69 @@ describe("agent live run routes", () => {
     });
   });
 
+  it.each(["wakeup", "heartbeat/invoke"])("persists the task scope a wake names on %s into the run context snapshot", async (endpoint) => {
+    const scopedIssueId = "99999999-9999-4999-8999-999999999999";
+    mockIssueService.getById.mockResolvedValue({ id: scopedIssueId, companyId: "company-1" });
+
+    const res = await requestApp(await createApp(), (baseUrl) =>
+      request(baseUrl)
+        .post(`/api/agents/${routeAgentId}/${endpoint}?companyId=company-1`)
+        .send({
+          source: "on_demand",
+          triggerDetail: "manual",
+          reason: "task follow-up",
+          issueId: scopedIssueId,
+        }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(202);
+    // A wake that names an issue has to scope the run: the scratch dir, the
+    // task markdown, and the issue-write gate all read contextSnapshot.issueId.
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(routeAgentId, expect.objectContaining({
+      payload: expect.objectContaining({ issueId: scopedIssueId }),
+      contextSnapshot: expect.objectContaining({ issueId: scopedIssueId }),
+    }));
+  });
+
+  it("keeps a wake that names no task unscoped", async () => {
+    const res = await requestApp(await createApp(), (baseUrl) =>
+      request(baseUrl)
+        .post(`/api/agents/${routeAgentId}/wakeup?companyId=company-1`)
+        .send({
+          source: "on_demand",
+          triggerDetail: "manual",
+          reason: "check the new guardrails",
+        }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(202);
+    const options = mockHeartbeatService.wakeup.mock.calls.at(-1)?.[1] as {
+      payload?: Record<string, unknown> | null;
+      contextSnapshot?: Record<string, unknown>;
+    };
+    // No issue named: the run must stay unscoped instead of borrowing an issue
+    // from the free-text reason or from another wake.
+    expect(options.payload ?? null).toBeNull();
+    expect(options.contextSnapshot ?? {}).not.toHaveProperty("issueId");
+    expect(options.contextSnapshot ?? {}).not.toHaveProperty("taskId");
+    expect(options.contextSnapshot ?? {}).not.toHaveProperty("taskKey");
+  });
+
+  it("rejects a wake scoped to a task outside the agent's company", async () => {
+    mockIssueService.getById.mockResolvedValue({
+      id: "99999999-9999-4999-8999-999999999999",
+      companyId: "company-2",
+    });
+    const res = await requestApp(await createApp(), (baseUrl) =>
+      request(baseUrl)
+        .post(`/api/agents/${routeAgentId}/wakeup?companyId=company-1`)
+        .send({ issueId: "99999999-9999-4999-8999-999999999999" }),
+    );
+
+    expect(res.status).toBe(404);
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
   it.each(["wakeup", "heartbeat/invoke"])("lets an operator start an existing agent via %s without creating agents", async (endpoint) => {
     mockAccessService.decide.mockImplementation(async ({ action }) => ({
       allowed: action === "agent:wake", explanation: "Missing permission: agents:create",

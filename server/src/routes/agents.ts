@@ -302,6 +302,27 @@ function readRunIssueId(context: Record<string, unknown> | null) {
   return typeof nestedIssueId === "string" && isUuidLike(nestedIssueId) ? nestedIssueId : null;
 }
 
+const WAKE_SCOPE_KEYS = ["issueId", "taskId", "taskKey"] as const;
+type WakeScopeKey = (typeof WAKE_SCOPE_KEYS)[number];
+
+// Task scope a wake request carries first-class, instead of smuggling it
+// through `payload`. A wake that names an issue must persist that scope into
+// the run's context snapshot: `contextSnapshot.issueId` selects the run's
+// scratch directory and task markdown, and it is what the issue-write gate
+// reads before it accepts a write back to the issue. Only fields the caller
+// actually supplied are returned, so a wake that names nothing stays unscoped
+// on purpose rather than inheriting a stale issue from somewhere else.
+function readRequestedWakeScope(body: unknown): Partial<Record<WakeScopeKey, string>> {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return {};
+  const source = body as Record<string, unknown>;
+  const scope: Partial<Record<WakeScopeKey, string>> = {};
+  for (const key of WAKE_SCOPE_KEYS) {
+    const value = source[key];
+    if (typeof value === "string" && value.trim().length > 0) scope[key] = value.trim();
+  }
+  return scope;
+}
+
 // Confirms a pre-existing `CODEX_HOME_<handle>` secret still names this
 // account's own home before a device login treats the secret's presence as a
 // successful, idempotent login. The secret name alone is not proof of a
@@ -5924,6 +5945,24 @@ export function agentRoutes(
         ),
       );
     }
+    // A wake may name its task scope first-class (`issueId`/`taskId`/`taskKey`)
+    // instead of smuggling it through `payload`. That scope has to reach the
+    // run's context snapshot: `contextSnapshot.issueId` selects the run's
+    // scratch directory and task markdown, and it is what the issue-write gate
+    // reads before it accepts a write back to the issue. Dropping it here is
+    // what turned a board wake *about* an issue into an unscoped run whose
+    // every write to that issue was refused. Failed-run retries keep the scope
+    // derived from the selected run, so they never merge caller scope.
+    const requestedScope = req.body.failedRunId ? {} : readRequestedWakeScope(req.body);
+    if (requestedScope.issueId) {
+      const scopedIssue = await issueService(db).getById(requestedScope.issueId);
+      if (!scopedIssue || scopedIssue.companyId !== agent.companyId) {
+        throw notFound("Task not found");
+      }
+    }
+    if (Object.keys(requestedScope).length > 0) {
+      wakePayload = { ...(wakePayload ?? {}), ...requestedScope };
+    }
     const run = await heartbeat.wakeup(id, {
       failedRunId: req.body.failedRunId ?? null,
       ...(req.actor.type === "board" && !req.body.failedRunId ? { manualUserWake: true } : {}),
@@ -5938,6 +5977,7 @@ export function agentRoutes(
       requestedByActorId: req.actor.type === "agent" ? req.actor.agentId ?? null : req.actor.userId ?? null,
       contextSnapshot: {
         ...retryConversationContext,
+        ...requestedScope,
         triggeredBy: req.actor.type,
         originIdentityContextId: req.actor.identityContextId ?? null,
         responsibleUserId: req.actor.type === "agent" ? req.actor.onBehalfOfUserId ?? null : req.actor.userId ?? null,
@@ -6049,6 +6089,17 @@ export function agentRoutes(
       responsibleUserId: req.actor.type === "agent" ? req.actor.onBehalfOfUserId ?? null : req.actor.userId ?? null,
       actorId: req.actor.type === "agent" ? req.actor.agentId : req.actor.userId,
     };
+    // Same first-class task scope the modern /wakeup route accepts, so a board
+    // wake typed on an issue is persisted as a scoped run instead of one whose
+    // writes back to that issue are refused (see readRequestedWakeScope).
+    const requestedScope = readRequestedWakeScope(req.body);
+    if (requestedScope.issueId) {
+      const scopedIssue = await issueService(db).getById(requestedScope.issueId);
+      if (!scopedIssue || scopedIssue.companyId !== agent.companyId) {
+        throw notFound("Task not found");
+      }
+    }
+    Object.assign(contextSnapshot, requestedScope);
     if (body.forceFreshSession === true) {
       contextSnapshot.forceFreshSession = true;
     }
@@ -6075,6 +6126,9 @@ export function agentRoutes(
       wakeOpts.payload = req.actor.type === "agent"
         ? { ...body.payload, commentId: undefined, wakeCommentId: undefined, wakeCommentIds: undefined }
         : body.payload as Record<string, unknown>;
+    }
+    if (Object.keys(requestedScope).length > 0) {
+      wakeOpts.payload = { ...(wakeOpts.payload ?? {}), ...requestedScope };
     }
     if (typeof body.idempotencyKey === "string" && body.idempotencyKey.length > 0) {
       wakeOpts.idempotencyKey = body.idempotencyKey;
