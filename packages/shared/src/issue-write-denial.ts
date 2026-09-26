@@ -229,7 +229,7 @@ export function describeIssueWriteDenial(
         code,
         status: 429,
         tone: "cap",
-        // No parentheses: surfaces render the boundary inside its own parens.
+        // No parentheses: surfaces render the boundary inside their own parens.
         boundary: `Per-run cross-issue cap of ${cap} writes`,
         title: "This run has spent its cross-issue write budget",
         description:
