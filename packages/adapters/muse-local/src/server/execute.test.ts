@@ -189,6 +189,22 @@ describe("muse_local execute", () => {
     expect(await fs.readFile(path.join(existing, "SKILL.md"), "utf8")).toBe("user-owned");
   });
 
+  it("removes already-staged skills when a later skill fails to stage", async () => {
+    const root = await makeTempRoot();
+    const skills = await makeSkill(root);
+    const broken = { key: "broken", runtimeName: "broken", source: path.join(root, "runtime-skills", "does-not-exist"), required: false };
+    mocks.runProcessMock.mockResolvedValue(await okRun());
+    await expect(execute(makeCtx(root, {
+      config: {
+        cwd: root,
+        paperclipRuntimeSkills: [...skills.paperclipRuntimeSkills, broken],
+        paperclipSkillSync: { desiredSkills: ["paperclip", "broken"] },
+      },
+    }))).rejects.toThrow();
+    expect(mocks.runProcessMock).not.toHaveBeenCalled();
+    expect(await pathExists(path.join(root, ".agents"))).toBe(false);
+  });
+
   it("continues when the instructions file is unreadable", async () => {
     const root = await makeTempRoot();
     const logs: string[] = [];

@@ -101,36 +101,41 @@ async function stageMuseSkills(input: {
   const desired = new Set(input.desiredSkillNames);
   const selected = input.skillEntries.filter((entry) => desired.has(entry.key));
   let count = 0;
-  if (selected.length > 0) {
-    const agentsDir = path.join(input.cwd, ".agents");
-    const skillsRoot = path.join(agentsDir, "skills");
-    if (!(await pathExists(agentsDir))) {
-      await fs.mkdir(agentsDir, { recursive: true });
-      created.push(agentsDir);
+  const cleanup = async () => {
+    for (const entry of [...created].reverse()) {
+      await fs.rm(entry, { recursive: true, force: true }).catch(() => undefined);
     }
-    if (!(await pathExists(skillsRoot))) {
-      await fs.mkdir(skillsRoot, { recursive: true });
-      created.push(skillsRoot);
-    }
-    for (const skill of selected) {
-      const target = path.join(skillsRoot, skill.runtimeName);
-      if (await pathExists(target)) {
-        await input.onLog("stdout", `[paperclip] Muse skill target already exists at ${target}; leaving it unchanged.\n`);
-        continue;
-      }
-      await materializePaperclipSkillCopy(skill.source, target);
-      created.push(target);
-      count += 1;
-    }
-  }
-  return {
-    count,
-    cleanup: async () => {
-      for (const entry of [...created].reverse()) {
-        await fs.rm(entry, { recursive: true, force: true }).catch(() => undefined);
-      }
-    },
   };
+  try {
+    if (selected.length > 0) {
+      const agentsDir = path.join(input.cwd, ".agents");
+      const skillsRoot = path.join(agentsDir, "skills");
+      if (!(await pathExists(agentsDir))) {
+        await fs.mkdir(agentsDir, { recursive: true });
+        created.push(agentsDir);
+      }
+      if (!(await pathExists(skillsRoot))) {
+        await fs.mkdir(skillsRoot, { recursive: true });
+        created.push(skillsRoot);
+      }
+      for (const skill of selected) {
+        const target = path.join(skillsRoot, skill.runtimeName);
+        if (await pathExists(target)) {
+          await input.onLog("stdout", `[paperclip] Muse skill target already exists at ${target}; leaving it unchanged.\n`);
+          continue;
+        }
+        created.push(target);
+        await materializePaperclipSkillCopy(skill.source, target);
+        count += 1;
+      }
+    }
+  } catch (error) {
+    // Never leave partially staged skills behind: a later run would treat
+    // them as user-owned and skip (and never remove) them.
+    await cleanup();
+    throw error;
+  }
+  return { count, cleanup };
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
@@ -169,10 +174,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const skillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredSkillNames = resolveLegacyPaperclipDesiredSkillNames(config, skillEntries);
-  const stagedSkills = await stageMuseSkills({ cwd, skillEntries, desiredSkillNames, onLog });
   const promptDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-muse-prompt-"));
+  let stagedSkills: { count: number; cleanup: () => Promise<void> } = { count: 0, cleanup: async () => {} };
 
   try {
+    stagedSkills = await stageMuseSkills({ cwd, skillEntries, desiredSkillNames, onLog });
     const envConfig = parseObject(config.env);
     const env: Record<string, string> = { ...buildPaperclipEnv(agent), ...buildRuntimeToolsEnv(ctx.runtimeTools) };
     env.PAPERCLIP_RUN_ID = runId;

@@ -189,8 +189,7 @@ its own line after `confirm this code matches:`.
 
 - Muse keys are stored only as Paperclip secrets or AI connection secrets (or the
   0600 company-home file in phase 3). They never go into
-  config JSON, logs, transcripts, thrown errors, or run results. Add `LLM|…`
-  to `server/src/middleware/redact-sensitive.ts` patterns.
+  config JSON, logs, transcripts, thrown errors, or run results. (`server/src/middleware/redact-sensitive.ts` redacts by key name, not value pattern, for every provider, so no `LLM|` value pattern is added; keys are kept out of logs and results by construction and by test.)
 - The parser rejects any URL that isn't `https://auth.meta.com/oauth/device/`,
   so a tampered CLI cannot send the operator to a phishing page.
 - The scratch login home is deleted after promotion whether it succeeds or not.
