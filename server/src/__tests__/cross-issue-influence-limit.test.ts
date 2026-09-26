@@ -10,27 +10,44 @@ import {
 function counterDb(
   initialCount = 0,
   runOverrides: Record<string, unknown> | null = {},
+  issueOverrides: Record<string, unknown> | null = null,
 ) {
   let observedCount = initialCount;
   const inserted: Array<Record<string, unknown>> = [];
   const tx = {
     select: (selection: Record<string, unknown>) => ({
-      from: () => ({
+      from: (table: unknown) => ({
         where: () => {
           if (Object.keys(selection).includes("count")) {
             return {
               then: (resolve: (rows: unknown[]) => unknown) => resolve([{ count: observedCount }]),
             };
           }
+          // The run query and the issue query both end in `for("update")`, so a
+          // lock test could not tell them apart. Distinguish on the columns
+          // selected: the run row has contextSnapshot, the issue row does not.
+          if ("contextSnapshot" in selection) {
+            return {
+              for: () => ({
+                then: (resolve: (rows: unknown[]) => unknown) => resolve(runOverrides === null ? [] : [{
+                  id: "11111111-1111-4111-8111-111111111111",
+                  companyId: "22222222-2222-4222-8222-222222222222",
+                  agentId: "33333333-3333-4333-8333-333333333333",
+                  responsibleUserId: "user-1",
+                  contextSnapshot: { issueId: "44444444-4444-4444-8444-444444444444" },
+                  ...runOverrides,
+                }]),
+              }),
+            };
+          }
           return {
             for: () => ({
-              then: (resolve: (rows: unknown[]) => unknown) => resolve(runOverrides === null ? [] : [{
-                id: "11111111-1111-4111-8111-111111111111",
+              then: (resolve: (rows: unknown[]) => unknown) => resolve(issueOverrides === null ? [] : [{
+                id: "55555555-5555-4555-8555-555555555555",
                 companyId: "22222222-2222-4222-8222-222222222222",
-                agentId: "33333333-3333-4333-8333-333333333333",
-                responsibleUserId: "user-1",
-                contextSnapshot: { issueId: "44444444-4444-4444-8444-444444444444" },
-                ...runOverrides,
+                checkoutRunId: null,
+                executionRunId: null,
+                ...issueOverrides,
               }]),
             }),
           };
@@ -162,6 +179,39 @@ describe("cross-issue influence limit rollout", () => {
     expect(fake.inserted).toEqual([]);
   });
 
+  it("attributes a run that holds the target checkout lock when the run has no context issue", async () => {
+    const fake = counterDb(0, { contextSnapshot: {} }, {
+      checkoutRunId: "11111111-1111-4111-8111-111111111111",
+    });
+
+    await expect(observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      kind: "comment",
+    })).resolves.toBeNull();
+    expect(fake.inserted).toEqual([]);
+  });
+
+  it("fails closed with the unattributed-run code when the target lock belongs to another run", async () => {
+    const fake = counterDb(0, { contextSnapshot: {} }, {
+      checkoutRunId: "99999999-9999-4999-8999-999999999999",
+    });
+
+    await expect(observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      kind: "comment",
+    })).rejects.toMatchObject({
+      status: 403,
+      details: { code: "cross_issue_influence_unattributed_run" },
+    });
+    expect(fake.inserted).toEqual([]);
+  });
+
   it.each([
     ["missing", null],
     ["wrong-agent", { agentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }],
@@ -209,7 +259,7 @@ describe("cross-issue influence limit rollout", () => {
       kind: "update",
     })).rejects.toMatchObject({
       status: 403,
-      details: { code: "cross_issue_influence_run_context_required" },
+      details: { code: "cross_issue_influence_unattributed_run" },
     });
     expect(fake.inserted).toEqual([]);
   });

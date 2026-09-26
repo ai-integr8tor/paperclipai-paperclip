@@ -1,6 +1,6 @@
 import { and, count, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, heartbeatRuns } from "@paperclipai/db";
+import { activityLog, heartbeatRuns, issues } from "@paperclipai/db";
 import { isUuidLike, issueWriteDenialResponse } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -34,11 +34,65 @@ export function crossIssueInfluenceRunContextError() {
   return forbidden(body.error, body.details);
 }
 
+export function crossIssueInfluenceUnattributedRunError() {
+  // Distinct from the malformed/unknown-run case above: the run here resolved
+  // fine, it simply is not bound to the target task. The remedy is therefore
+  // different -- check the task out -- and merging the two copies would tell a
+  // caller to start a new run for a run that is already correct.
+  const { body } = issueWriteDenialResponse("cross_issue_influence_unattributed_run");
+  return forbidden(body.error, body.details);
+}
+
 function readRunSourceIssueId(contextSnapshot: unknown) {
   if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return null;
   const context = contextSnapshot as Record<string, unknown>;
   for (const candidate of [context.issueId, context.taskId]) {
     if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+  }
+  return null;
+}
+
+/**
+ * Fallback attribution for runs whose contextSnapshot carries no issue id.
+ *
+ * `assertCheckoutOwner` already treats `issues.checkoutRunId`/`executionRunId`
+ * as the authoritative binding between a run and an issue, and `svc.checkout`
+ * writes only those columns. Reading the same columns here keeps the two
+ * subsystems from disagreeing about what binds a run to an issue: checkout
+ * admits the run, the influence guard must not then deny it. The target issue
+ * row is already loaded by the caller, so this costs one indexed lookup on a row
+ * the surrounding transaction has already locked.
+ *
+ * Scope is the target issue only. A run holding a lock on some *other* issue is
+ * not bound to this write, so it falls through to the caller's fail-closed
+ * refusal rather than being charged to an unrelated row.
+ */
+async function readIssueLockAttribution(
+  tx: Tx,
+  input: {
+    companyId: string;
+    targetIssueId: string;
+    runId: string;
+  },
+): Promise<string | null> {
+  if (!isUuidLike(input.targetIssueId)) return null;
+
+  // The run's lock on the target row itself, scoped by company so a target id
+  // from another company can never satisfy the binding. The row lock is what
+  // makes the read safe against a concurrent checkout flipping the binding.
+  const rows = await tx
+    .select({
+      id: issues.id,
+      checkoutRunId: issues.checkoutRunId,
+      executionRunId: issues.executionRunId,
+    })
+    .from(issues)
+    .where(and(eq(issues.id, input.targetIssueId), eq(issues.companyId, input.companyId)))
+    .for("update");
+  const row = rows[0];
+  if (!row) return null;
+  if (row.checkoutRunId === input.runId || row.executionRunId === input.runId) {
+    return row.id;
   }
   return null;
 }
@@ -109,8 +163,14 @@ export async function observeCrossIssueInfluence(
       throw crossIssueInfluenceRunContextError();
     }
 
-    const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
-    if (!sourceIssueId) throw crossIssueInfluenceRunContextError();
+    const sourceIssueId =
+      readRunSourceIssueId(run.contextSnapshot) ??
+      (await readIssueLockAttribution(tx, {
+        companyId: input.companyId,
+        targetIssueId: input.targetIssueId,
+        runId: input.runId,
+      }));
+    if (!sourceIssueId) throw crossIssueInfluenceUnattributedRunError();
     if (
       sourceIssueId === input.targetIssueId ||
       (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
