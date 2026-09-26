@@ -59,6 +59,13 @@ RUN npm uninstall -g @anthropic-ai/claude-code @openai/codex opencode-ai \
       @moonshot-ai/kimi-code@2.0.2 \
     && npm cache clean --force
 
+# Muse Code ships as a launcher script plus a native binary installed next to
+# it (no npm package). Runs set MUSE_NO_AUTO_UPDATE=1, so the root-owned
+# install never needs to self-update.
+RUN curl -fsSL https://api.meta.ai/muse-launcher.sh -o /usr/local/bin/muse \
+    && chmod 0755 /usr/local/bin/muse \
+    && MUSE_LAUNCHER_INSTALL=1 /usr/local/bin/muse
+
 # Hermes requires Python >=3.11,<3.14; the image's default Python is newer.
 # Use the distro interpreter in a dedicated environment without changing PATH
 # or keeping an older Hermes CLI. Everything is installed before sandbox boot.
@@ -113,7 +120,7 @@ RUN set -eu; \
     printf '%s\n' 'export PATH=/opt/paperclip-runner/provider-pack/node_modules/.bin:$PATH' \
       > /etc/profile.d/01-paperclip-runner-provider-pack.sh; \
     chmod 0644 /etc/profile.d/01-paperclip-runner-provider-pack.sh; \
-    for command_name in acpx claude-agent-acp codex-acp claude codex grok gemini kimi opencode cursor-agent agent hermes gh paperclip-runnerd; do \
+    for command_name in acpx claude-agent-acp codex-acp claude codex grok gemini kimi muse opencode cursor-agent agent hermes gh paperclip-runnerd; do \
       command -v "$command_name" >/dev/null || { echo "FATAL: $command_name not on PATH after build" >&2; exit 1; }; \
     done; \
     metadata="$(paperclip-runnerd --build-metadata)"; \
