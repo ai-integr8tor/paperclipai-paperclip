@@ -4,8 +4,15 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import { withWorkspaceRestore } from "@paperclipai/adapter-utils/workspace-restore-result";
 import {
   adapterExecutionTargetIsRemote,
+  adapterExecutionTargetRemoteCwd,
+  adapterExecutionTargetSessionIdentity,
+  adapterExecutionTargetSessionMatches,
+  describeAdapterExecutionTarget,
+  overrideAdapterExecutionTargetRemoteCwd,
+  prepareAdapterExecutionTargetRuntime,
   ensureAdapterExecutionTargetCommandResolvable,
   ensureAdapterExecutionTargetRuntimeCommandInstalled,
   readAdapterExecutionTarget,
@@ -144,9 +151,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     executionTarget: ctx.executionTarget,
     legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
   });
-  if (adapterExecutionTargetIsRemote(executionTarget)) {
-    throw new Error("muse_local supports local execution only in this release");
-  }
+  const executionTargetIsRemote = adapterExecutionTargetIsRemote(executionTarget);
 
   const promptTemplate = asString(
     config.promptTemplate,
@@ -171,13 +176,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const effectiveWorkspaceCwd = useConfiguredInsteadOfAgentHome ? "" : workspaceCwd;
   const cwd = effectiveWorkspaceCwd || configuredCwd || process.cwd();
   await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
+  let effectiveExecutionCwd = adapterExecutionTargetRemoteCwd(executionTarget, cwd);
 
   const skillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredSkillNames = resolveLegacyPaperclipDesiredSkillNames(config, skillEntries);
   const promptDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-muse-prompt-"));
   let stagedSkills: { count: number; cleanup: () => Promise<void> } = { count: 0, cleanup: async () => {} };
 
-  try {
+  let restoreRemoteWorkspace: (() => Promise<void>) | null = null;
+
+  const executeTurn = async (): Promise<AdapterExecutionResult> => {
     stagedSkills = await stageMuseSkills({ cwd, skillEntries, desiredSkillNames, onLog });
     const envConfig = parseObject(config.env);
     const env: Record<string, string> = { ...buildPaperclipEnv(agent), ...buildRuntimeToolsEnv(ctx.runtimeTools) };
@@ -209,14 +217,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       workspaceRepoRef,
       workspaceHints,
       agentHome,
-      executionTargetIsRemote: false,
-      executionCwd: cwd,
+      executionTargetIsRemote,
+      executionCwd: effectiveExecutionCwd,
     });
     if (authToken) env.PAPERCLIP_API_KEY = authToken;
 
-    const dataHome = resolveMuseDataHome(process.env, agent.companyId, agent.id);
-    await fs.mkdir(dataHome, { recursive: true, mode: 0o700 });
-    env.XDG_DATA_HOME = dataHome;
+    if (!executionTargetIsRemote) {
+      const dataHome = resolveMuseDataHome(process.env, agent.companyId, agent.id);
+      await fs.mkdir(dataHome, { recursive: true, mode: 0o700 });
+      env.XDG_DATA_HOME = dataHome;
+    }
     // Do not set TBH_CREDENTIAL_BACKEND here: forcing the file backend hides a
     // macOS keychain `muse login`. META_API_KEY needs no backend at all.
     env.MUSE_NO_AUTO_UPDATE = "1";
@@ -234,6 +244,39 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       graceSec,
       onLog,
     });
+    if (executionTargetIsRemote) {
+      await onLog("stdout", `[paperclip] Syncing Muse workspace to ${describeAdapterExecutionTarget(executionTarget)}.\n`);
+      // No credential home is shipped: the key travels as META_API_KEY, and the
+      // host's own Muse login never leaves this machine.
+      const prepared = await prepareAdapterExecutionTargetRuntime({
+        runId,
+        target: executionTarget,
+        adapterKey: "muse",
+        workspaceLocalDir: cwd,
+        timeoutSec,
+        installCommand: ctx.runtimeCommandSpec?.installCommand ?? null,
+        detectCommand: ctx.runtimeCommandSpec?.detectCommand ?? command,
+        onProgress: (line) => onLog("stdout", line),
+        onRuntimeProgress: ctx.onRuntimeProgress,
+      });
+      restoreRemoteWorkspace = () => prepared.restoreWorkspace((line) => onLog("stdout", line));
+      effectiveExecutionCwd = prepared.workspaceRemoteDir ?? effectiveExecutionCwd;
+      refreshPaperclipWorkspaceEnvForExecution({
+        env,
+        envConfig,
+        workspaceCwd: effectiveWorkspaceCwd,
+        workspaceSource,
+        workspaceId,
+        workspaceRepoUrl,
+        workspaceRepoRef,
+        workspaceHints,
+        agentHome,
+        executionTargetIsRemote,
+        executionCwd: effectiveExecutionCwd,
+      });
+      env.XDG_DATA_HOME = path.posix.join(effectiveExecutionCwd, ".paperclip-runtime", "muse", "data");
+    }
+    const runtimeExecutionTarget = overrideAdapterExecutionTargetRemoteCwd(executionTarget, effectiveExecutionCwd);
     const effectiveEnv = Object.fromEntries(
       Object.entries({ ...process.env, ...env }).filter((e): e is [string, string] => typeof e[1] === "string"),
     );
@@ -256,11 +299,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const storedSessionCwd = asString(runtimeSessionParams.cwd, "");
     const canResume =
       storedSessionId.length > 0 &&
-      (storedSessionCwd.length === 0 || path.resolve(storedSessionCwd) === path.resolve(cwd));
+      (storedSessionCwd.length === 0 || path.resolve(storedSessionCwd) === path.resolve(effectiveExecutionCwd)) &&
+      adapterExecutionTargetSessionMatches(parseObject(runtimeSessionParams.remoteExecution), runtimeExecutionTarget);
     if (storedSessionId && !canResume) {
       await onLog(
         "stdout",
-        `[paperclip] Muse session "${storedSessionId}" was saved for cwd "${storedSessionCwd}" and will not be resumed in "${cwd}".\n`,
+        `[paperclip] Muse session "${storedSessionId}" was saved for cwd "${storedSessionCwd}" and will not be resumed in "${effectiveExecutionCwd}".\n`,
       );
     }
     const sessionId = canResume ? storedSessionId : randomUUID();
@@ -311,8 +355,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       renderApiAccessNote(env),
       renderedPrompt,
     ]);
+    // Local runs read the prompt from a private file. Remote runs cannot see
+    // that file, so the prompt goes as the positional argument (as grok does).
     const promptFile = path.join(promptDir, "prompt.md");
-    await fs.writeFile(promptFile, prompt, { mode: 0o600 });
+    if (!executionTargetIsRemote) await fs.writeFile(promptFile, prompt, { mode: 0o600 });
 
     const extraArgs = (() => {
       const fromExtra = asStringArray(config.extraArgs);
@@ -324,24 +370,29 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ...(reasoningEffort ? ["--reasoning-effort", reasoningEffort] : []),
       "--approval-mode", "never",
       "--trust-workspace",
-      "--workspace", cwd,
+      "--workspace", effectiveExecutionCwd,
       "--session-id", sessionId,
-      "--prompt-file", promptFile,
+      ...(executionTargetIsRemote ? [] : ["--prompt-file", promptFile]),
       ...extraArgs,
+      ...(executionTargetIsRemote ? [prompt] : []),
     ];
 
     if (onMeta) {
       await onMeta({
         adapterType: "muse_local",
         command: resolvedCommand,
-        cwd,
+        cwd: effectiveExecutionCwd,
         commandNotes: [
-          "Prompt is passed to Muse via --prompt-file in headless mode.",
+          executionTargetIsRemote
+            ? "Prompt is passed to Muse as the positional argument on the remote target."
+            : "Prompt is passed to Muse via --prompt-file in headless mode.",
           "Added --approval-mode never and --trust-workspace for unattended execution (Muse sandbox stays on).",
           ...(instructionsPrefix ? [`Prepended agent instructions from ${instructionsFilePath}.`] : []),
           ...(stagedSkills.count > 0 ? [`Staged ${stagedSkills.count} Paperclip skill(s) into .agents/skills.`] : []),
         ],
-        commandArgs: args,
+        commandArgs: executionTargetIsRemote
+          ? args.map((value, index) => (index === args.length - 1 ? `<prompt ${prompt.length} chars>` : value))
+          : args,
         env: loggedEnv,
         prompt,
         promptMetrics: { promptChars: prompt.length },
@@ -349,7 +400,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
     }
 
-    const proc = await runAdapterExecutionTargetProcess(runId, executionTarget, command, args, {
+    const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
       cwd,
       env,
       timeoutSec,
@@ -382,7 +433,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       sessionId: resolvedSessionId,
       sessionParams: {
         sessionId: resolvedSessionId,
-        cwd,
+        cwd: effectiveExecutionCwd,
+        ...(executionTargetIsRemote ? { remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget) } : {}),
         ...(workspaceId ? { workspaceId } : {}),
         ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
         ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
@@ -400,6 +452,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       },
       summary: parsed.summary,
     };
+  };
+
+  try {
+    return await withWorkspaceRestore(executeTurn, async () => { await restoreRemoteWorkspace?.(); });
   } finally {
     await fs.rm(promptDir, { recursive: true, force: true }).catch(() => undefined);
     await stagedSkills.cleanup();

@@ -7,6 +7,8 @@ import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 
 const mocks = vi.hoisted(() => ({
   isRemote: false,
+  restoreMock: vi.fn(async () => {}),
+  prepareRuntimeMock: vi.fn(),
   ensureRuntimeInstalledMock: vi.fn(async () => {}),
   ensureCommandMock: vi.fn(async () => {}),
   resolveCommandForLogsMock: vi.fn(async () => "muse"),
@@ -15,9 +17,10 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("@paperclipai/adapter-utils/execution-target", () => ({
   adapterExecutionTargetIsRemote: () => mocks.isRemote,
-  adapterExecutionTargetRemoteCwd: (_t: unknown, cwd: string) => cwd,
+  adapterExecutionTargetRemoteCwd: (_t: unknown, cwd: string) => (mocks.isRemote ? "/remote/ws" : cwd),
+  prepareAdapterExecutionTargetRuntime: (...a: unknown[]) => (mocks.prepareRuntimeMock as (...x: unknown[]) => unknown)(...a),
   overrideAdapterExecutionTargetRemoteCwd: (target: unknown) => target,
-  adapterExecutionTargetSessionIdentity: () => ({ kind: "local" }),
+  adapterExecutionTargetSessionIdentity: () => ({ kind: mocks.isRemote ? "remote" : "local" }),
   adapterExecutionTargetSessionMatches: () => true,
   describeAdapterExecutionTarget: () => (mocks.isRemote ? "remote" : "local"),
   ensureAdapterExecutionTargetCommandResolvable: (...a: unknown[]) => (mocks.ensureCommandMock as (...x: unknown[]) => unknown)(...a),
@@ -72,6 +75,9 @@ describe("muse_local execute", () => {
   beforeEach(async () => {
     mocks.isRemote = false;
     mocks.runProcessMock.mockReset();
+    mocks.restoreMock.mockClear();
+    mocks.prepareRuntimeMock.mockReset();
+    mocks.prepareRuntimeMock.mockImplementation(async () => ({ workspaceRemoteDir: "/remote/ws", assetDirs: {}, restoreWorkspace: mocks.restoreMock }));
     vi.stubEnv("PAPERCLIP_HOME", await makeTempRoot());
     vi.stubEnv("META_API_KEY", "");
   });
@@ -244,9 +250,24 @@ describe("muse_local execute", () => {
     expect(prompt.startsWith("You are a Muse agent.")).toBe(true);
   });
 
-  it("rejects remote execution targets", async () => {
+  it("runs on a remote target with the synced workspace and restores it", async () => {
     const root = await makeTempRoot();
     mocks.isRemote = true;
-    await expect(execute(makeCtx(root))).rejects.toThrow("muse_local supports local execution only in this release");
+    mocks.runProcessMock.mockResolvedValue(await okRun());
+    const result = await execute(makeCtx(root, { config: { cwd: root, paperclipRuntimeSkills: [], env: { META_API_KEY: "LLM|remote-key-000000000000000000000000000000" } } }));
+    expect(mocks.prepareRuntimeMock).toHaveBeenCalledWith(expect.objectContaining({ adapterKey: "muse", workspaceLocalDir: root }));
+    expect((mocks.prepareRuntimeMock.mock.calls[0]![0] as { assets?: unknown }).assets).toBeUndefined();
+    const [, , , args, options] = mocks.runProcessMock.mock.calls[0]!;
+    expect(args[args.indexOf("--workspace") + 1]).toBe("/remote/ws");
+    expect(args).not.toContain("--prompt-file");
+    expect(args.at(-1)).toContain("Paperclip");
+    const env = (options as { env: Record<string, string> }).env;
+    expect(env.XDG_DATA_HOME).toBe("/remote/ws/.paperclip-runtime/muse/data");
+    expect(env.XDG_CONFIG_HOME).toBeUndefined();
+    expect(env.META_API_KEY).toBe("LLM|remote-key-000000000000000000000000000000");
+    expect(mocks.restoreMock).toHaveBeenCalled();
+    expect(result.exitCode).toBe(0);
+    expect(result.sessionParams).toMatchObject({ cwd: "/remote/ws", remoteExecution: { kind: "remote" } });
   });
+
 });

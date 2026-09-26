@@ -5,7 +5,6 @@ import type {
 } from "@paperclipai/adapter-utils";
 import { asNumber, asString, ensurePathInEnv, parseObject } from "@paperclipai/adapter-utils/server-utils";
 import {
-  describeAdapterExecutionTarget,
   ensureAdapterExecutionTargetCommandResolvable,
   ensureAdapterExecutionTargetDirectory,
   resolveAdapterExecutionTargetCwd,
@@ -46,14 +45,6 @@ export async function testEnvironment(ctx: AdapterEnvironmentTestContext): Promi
     testedAt: new Date().toISOString(),
   });
 
-  if (target?.kind === "remote") {
-    checks.push({
-      code: "muse_remote_unsupported",
-      level: "error",
-      message: `muse_local supports local execution only in this release (target: ${ctx.environmentName ?? describeAdapterExecutionTarget(target)}).`,
-    });
-    return result();
-  }
 
   const cwd = resolveAdapterExecutionTargetCwd(target, asString(config.cwd, ""), process.cwd());
   const runId = `muse-envtest-${Date.now()}-${Math.random().toString(16).slice(2)}`;

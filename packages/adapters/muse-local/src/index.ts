@@ -3,6 +3,10 @@ export const label = "Muse Code";
 
 export const DEFAULT_MUSE_LOCAL_MODEL = "muse-spark-1.3";
 
+/** Installs Muse Code in a sandbox with the official launcher (no npm package exists). */
+export const MUSE_SANDBOX_INSTALL_COMMAND =
+  'mkdir -p "$HOME/.local/bin" && curl -fsSL https://api.meta.ai/muse-launcher.sh -o "$HOME/.local/bin/muse" && chmod +x "$HOME/.local/bin/muse" && MUSE_LAUNCHER_INSTALL=1 "$HOME/.local/bin/muse"';
+
 export const models = [
   { id: DEFAULT_MUSE_LOCAL_MODEL, label: "Muse Spark 1.3" },
   { id: "muse-spark-1.3-contributor", label: "Muse Spark 1.3 (contributor)" },
@@ -21,7 +25,7 @@ export const agentConfigurationDoc = `# muse_local agent configuration
 Adapter: muse_local
 
 Use when:
-- You want Paperclip to run Meta's Muse Code CLI locally on the host machine
+- You want Paperclip to run Meta's Muse Code CLI locally, over SSH, or in a sandbox environment
 - You want Muse sessions resumed across heartbeats via \`--session-id\`
 - You want runs billed to a Muse Code subscription (host \`muse login\`) or a Meta API key
 

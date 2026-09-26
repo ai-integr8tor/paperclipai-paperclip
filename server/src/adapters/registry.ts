@@ -94,6 +94,7 @@ import {
 import {
   agentConfigurationDoc as museAgentConfigurationDoc,
   models as museModels,
+  MUSE_SANDBOX_INSTALL_COMMAND,
 } from "@paperclipai/adapter-muse-local";
 import {
   execute as kimiExecute,
@@ -779,7 +780,7 @@ const museLocalAdapter: ServerAdapterModule = {
   getRuntimeCommandSpec: (config) => ({
     command: readConfiguredCommand(config, "muse"),
     detectCommand: readConfiguredCommand(config, "muse"),
-    installCommand: null,
+    installCommand: MUSE_SANDBOX_INSTALL_COMMAND,
   }),
   agentConfigurationDoc: museAgentConfigurationDoc,
 };

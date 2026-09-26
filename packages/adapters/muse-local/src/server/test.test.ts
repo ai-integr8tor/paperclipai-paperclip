@@ -57,9 +57,11 @@ describe("muse_local testEnvironment", () => {
     expect(mocks.runProcessMock).not.toHaveBeenCalled();
   });
 
-  it("reports remote targets as unsupported", async () => {
-    const result = await testEnvironment({ companyId: "c", adapterType: "muse_local", config: { cwd: "/tmp" }, executionTarget: { kind: "remote", transport: "ssh" } } as never);
-    expect(result.checks.map((c) => c.code)).toContain("muse_remote_unsupported");
-    expect(result.status).toBe("fail");
+  it("probes remote targets through the execution target", async () => {
+    mocks.runProcessMock.mockResolvedValue({ exitCode: 0, signal: null, timedOut: false, stdout: helloStdout("hello"), stderr: "" });
+    const target = { kind: "remote", transport: "ssh" };
+    const result = await testEnvironment({ companyId: "c", adapterType: "muse_local", config: { cwd: "/tmp" }, executionTarget: target } as never);
+    expect(mocks.runProcessMock.mock.calls[0]![1]).toBe(target);
+    expect(result.status).toBe("pass");
   });
 });
