@@ -3,7 +3,7 @@ import { deliverConversationComments, isConversation } from "../services/agent-c
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
 import {
   getExecutionBlocker,
-  releaseSettledNoReplayHold,
+  isSettledNoReplayHold,
 } from "../services/execution-blocker.js";
 import { extractIssueReferenceIdentifiers, requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
@@ -4463,11 +4463,14 @@ export function issueRoutes(
    * action this projection returned. The board then saw an issue with no
    * action to resolve and no execution. Surface the referenced record
    * read-only — no new authorization, same read gate as the active action.
+   *
+   * `resolvable` reuses the release helper's own predicate, so the client only
+   * offers a resolution control for a record that helper can actually retire.
    */
   async function referencedRecoveryActionForExecutionBlocker(input: {
     issue: { id: string; companyId: string };
     activeRecoveryAction: Awaited<ReturnType<typeof revalidateActiveSourceRecoveryForRead>>;
-  }) {
+  }): Promise<{ action: ReturnType<typeof issueRecoveryActionReadModel>; resolvable: boolean } | null> {
     const blocker = await getExecutionBlocker(
       db,
       input.issue.companyId,
@@ -4487,7 +4490,11 @@ export function issueRoutes(
         ),
       )
       .limit(1);
-    return row ? issueRecoveryActionReadModel(row) : null;
+    if (!row) return null;
+    return {
+      action: issueRecoveryActionReadModel(row),
+      resolvable: isSettledNoReplayHold(row),
+    };
   }
 
   async function revalidateActiveSourceRecoveryAfterCommittedWrite(
@@ -9147,8 +9154,9 @@ export function issueRoutes(
     });
     res.json({
       active,
-      actions: active ? [active] : referenced ? [referenced] : [],
-      referencedByExecutionBlocker: referenced?.id ?? null,
+      actions: active ? [active] : referenced ? [referenced.action] : [],
+      referencedByExecutionBlocker: referenced?.action.id ?? null,
+      referencedByExecutionBlockerResolvable: referenced?.resolvable ?? false,
     });
   });
 
@@ -9216,10 +9224,6 @@ export function issueRoutes(
       const actionStatus = outcome === "cancelled" ? "cancelled" : "resolved";
       const postCommitActivityPublications: ActivityPublication[] = [];
       const postCommitIssueActions: IssuePostCommitAction[] = [];
-      // A board resolution of the settled no-replay action that still holds this
-      // issue releases that hold, so the ordinary resolution path below must not
-      // ask for execution-reconciliation evidence a second time.
-      let releasedSettledNoReplayHold = false;
       const result = await db.transaction(async (tx) => {
         const lockedIssue = await tx
           .select()
@@ -9276,36 +9280,6 @@ export function issueRoutes(
                   "Verified outcomes must restore this source recovery without replacing another active recovery action.",
                 );
               }
-              const [reopened] = await tx
-                .update(issueRecoveryActions)
-                .set({ status: "active", outcome: null, resolvedAt: null })
-                .where(eq(issueRecoveryActions.id, settled.id))
-                .returning();
-              activeRecoveryAction = issueRecoveryActionReadModel(reopened!);
-            } else if (
-              // A board operator can retire the settled no-replay hold on the exact
-              // action that keeps holding this issue. The hold exists to stop an
-              // automatic replay of an unverified run, and nothing here runs on its
-              // own: the release records the deciding actor, then the ordinary
-              // resolution below resumes the task and wakes its owner after commit.
-              automatic?.replay === "blocked" &&
-              !activeRecoveryAction &&
-              outcome === "restored" &&
-              sourceIssueStatus === "todo" &&
-              req.actor.type === "board" &&
-              (await releaseSettledNoReplayHold(tx as unknown as Db, {
-                companyId: lockedIssue.companyId,
-                issueId: lockedIssue.id,
-                agentId: lockedIssue.assigneeAgentId ?? "",
-                reason: "recovery_action_resolution",
-                actorType: actor.actorType,
-                actorId: actor.actorId,
-              }))
-            ) {
-              releasedSettledNoReplayHold = true;
-              // Reopen the record inside this transaction so the ordinary
-              // resolution path writes this decision onto the same action instead
-              // of leaving the released hold as the last word on the issue.
               const [reopened] = await tx
                 .update(issueRecoveryActions)
                 .set({ status: "active", outcome: null, resolvedAt: null })
@@ -9394,7 +9368,6 @@ export function issueRoutes(
         }
 
         if (
-          !releasedSettledNoReplayHold &&
           sourceIssueStatus === "todo" &&
           requiresExecutionReconciliation(activeRecoveryAction.cause)
         ) {

@@ -575,11 +575,16 @@ export interface IssueRecoveryAction {
  * references such a record, `actions` carries that record and
  * `referencedByExecutionBlocker` names its id, so a client can show the
  * operator what is holding the issue and resolve it.
+ *
+ * `referencedByExecutionBlockerResolvable` says whether that record can be
+ * retired by a board resolution. An unsafe workspace archive stays a hard
+ * hold, so a client must not offer a control that would only appear to work.
  */
 export interface IssueRecoveryActionsResponse {
   active: IssueRecoveryAction | null;
   actions: IssueRecoveryAction[];
   referencedByExecutionBlocker: string | null;
+  referencedByExecutionBlockerResolvable: boolean;
 }
 
 export type SuccessfulRunHandoffStateKind = "required" | "resolved" | "escalated";

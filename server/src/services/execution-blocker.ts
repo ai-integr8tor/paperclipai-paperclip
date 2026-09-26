@@ -23,7 +23,7 @@ export function executionBlockerPredicate() {
 const SETTLED_NO_REPLAY_HOLD_RELEASED_AT = "settledNoReplayHoldReleasedAt";
 
 /** A settled hold that only refuses automatic replay, with its bookkeeping intact. */
-function isSettledNoReplayHold(action: typeof issueRecoveryActions.$inferSelect): boolean {
+export function isSettledNoReplayHold(action: typeof issueRecoveryActions.$inferSelect): boolean {
   if (action.status !== "resolved" && action.status !== "cancelled") return false;
   const evidence = (action.evidence ?? {}) as Record<string, unknown>;
   // An unsafe workspace archive stays a hard hold: no wake may start on it.
