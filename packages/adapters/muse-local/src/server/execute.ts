@@ -10,6 +10,10 @@ import {
   adapterExecutionTargetRemoteCwd,
   adapterExecutionTargetSessionIdentity,
   adapterExecutionTargetSessionMatches,
+  adapterExecutionTargetDuplexObservabilityRecorder,
+  adapterExecutionTargetEnablesSandboxDuplexBridge,
+  adapterExecutionTargetUsesPaperclipBridge,
+  startAdapterExecutionTargetPaperclipBridge,
   describeAdapterExecutionTarget,
   overrideAdapterExecutionTargetRemoteCwd,
   prepareAdapterExecutionTargetRuntime,
@@ -59,8 +63,12 @@ function hasNonEmptyEnvValue(env: Record<string, string | undefined>, key: strin
   return nonEmpty(env[key]) !== null;
 }
 
-function firstNonEmptyLine(text: string): string {
-  return text.split(/\r?\n/).map((line) => line.trim()).find(Boolean) ?? "";
+// Muse prints informational `muse: ...` lines (workspace root, trust, skills)
+// before anything else; the failure itself is the last line it prints.
+function lastMeaningfulLine(text: string): string {
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const meaningful = lines.filter((line) => !/^muse:\s/.test(line));
+  return meaningful.at(-1) ?? lines.at(-1) ?? "";
 }
 
 /** The per-agent Muse data home (session store). Never the operator's ~/.local/share/muse. */
@@ -185,6 +193,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let stagedSkills: { count: number; cleanup: () => Promise<void> } = { count: 0, cleanup: async () => {} };
 
   let restoreRemoteWorkspace: (() => Promise<void>) | null = null;
+  let paperclipBridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>> = null;
 
   const executeTurn = async (): Promise<AdapterExecutionResult> => {
     stagedSkills = await stageMuseSkills({ cwd, skillEntries, desiredSkillNames, onLog });
@@ -256,6 +265,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       graceSec,
       onLog,
     });
+    let runtimeRootDir: string | undefined;
     if (executionTargetIsRemote) {
       await onLog("stdout", `[paperclip] Syncing Muse workspace to ${describeAdapterExecutionTarget(executionTarget)}.\n`);
       // No credential home is shipped: the key travels as META_API_KEY, and the
@@ -272,6 +282,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         onRuntimeProgress: ctx.onRuntimeProgress,
       });
       restoreRemoteWorkspace = () => prepared.restoreWorkspace((line) => onLog("stdout", line));
+      runtimeRootDir = prepared.runtimeRootDir ?? undefined;
       effectiveExecutionCwd = prepared.workspaceRemoteDir ?? effectiveExecutionCwd;
       refreshPaperclipWorkspaceEnvForExecution({
         env,
@@ -289,6 +300,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       env.XDG_DATA_HOME = path.posix.join(effectiveExecutionCwd, ".paperclip-runtime", "muse", "data");
     }
     const runtimeExecutionTarget = overrideAdapterExecutionTargetRemoteCwd(executionTarget, effectiveExecutionCwd);
+    // A remote agent reaches the Paperclip API through the bridge (the host's
+    // loopback API is not reachable from the remote), as claude_local does.
+    if (executionTargetIsRemote && adapterExecutionTargetUsesPaperclipBridge(runtimeExecutionTarget)) {
+      paperclipBridge = await startAdapterExecutionTargetPaperclipBridge({
+        runId,
+        target: runtimeExecutionTarget,
+        enableSandboxDuplexBridge: adapterExecutionTargetEnablesSandboxDuplexBridge(runtimeExecutionTarget),
+        duplexObservabilityRecorder: adapterExecutionTargetDuplexObservabilityRecorder(runtimeExecutionTarget),
+        runtimeRootDir,
+        adapterKey: "muse",
+        timeoutSec,
+        hostApiToken: env.PAPERCLIP_API_KEY,
+        onLog,
+      });
+      if (paperclipBridge) Object.assign(env, paperclipBridge.env);
+    }
     const effectiveEnv = Object.fromEntries(
       Object.entries({ ...process.env, ...env }).filter((e): e is [string, string] => typeof e[1] === "string"),
     );
@@ -421,10 +448,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       onSpawn,
       onRuntimeProgress: ctx.onRuntimeProgress,
       onLog,
+      runLogTail: paperclipBridge?.runLogTail,
+      settleRunDisposition: paperclipBridge?.settleRunDisposition,
     });
     const parsed = parseMuseJsonl(proc.stdout);
     const failed = proc.timedOut || (proc.exitCode ?? 0) !== 0 || (parsed.terminal !== null && parsed.terminal !== "completed");
-    const rawError = parsed.reason || firstNonEmptyLine(proc.stderr) || `Muse exited with code ${proc.exitCode ?? -1}`;
+    const rawError = parsed.reason || lastMeaningfulLine(proc.stderr) || `Muse exited with code ${proc.exitCode ?? -1}`;
     const authFailure = failed && !proc.timedOut && isMuseAuthError(`${rawError}\n${proc.stderr}`);
     const errorMessage = proc.timedOut
       ? `Timed out after ${timeoutSec}s`
@@ -470,6 +499,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   try {
     return await withWorkspaceRestore(executeTurn, async () => { await restoreRemoteWorkspace?.(); });
   } finally {
+    const bridge = paperclipBridge as Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>>;
+    if (bridge) await bridge.stop().catch(() => undefined);
     await fs.rm(promptDir, { recursive: true, force: true }).catch(() => undefined);
     await stagedSkills.cleanup();
   }

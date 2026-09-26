@@ -8,6 +8,8 @@ import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 const mocks = vi.hoisted(() => ({
   isRemote: false,
   restoreMock: vi.fn(async () => {}),
+  bridgeStopMock: vi.fn(async () => {}),
+  startBridgeMock: vi.fn(),
   prepareRuntimeMock: vi.fn(),
   ensureRuntimeInstalledMock: vi.fn(async () => {}),
   ensureCommandMock: vi.fn(async () => {}),
@@ -19,6 +21,10 @@ vi.mock("@paperclipai/adapter-utils/execution-target", () => ({
   adapterExecutionTargetIsRemote: () => mocks.isRemote,
   adapterExecutionTargetRemoteCwd: (_t: unknown, cwd: string) => (mocks.isRemote ? "/remote/ws" : cwd),
   prepareAdapterExecutionTargetRuntime: (...a: unknown[]) => (mocks.prepareRuntimeMock as (...x: unknown[]) => unknown)(...a),
+  adapterExecutionTargetUsesPaperclipBridge: () => mocks.isRemote,
+  adapterExecutionTargetEnablesSandboxDuplexBridge: () => false,
+  adapterExecutionTargetDuplexObservabilityRecorder: () => undefined,
+  startAdapterExecutionTargetPaperclipBridge: (...a: unknown[]) => (mocks.startBridgeMock as (...x: unknown[]) => unknown)(...a),
   overrideAdapterExecutionTargetRemoteCwd: (target: unknown) => target,
   adapterExecutionTargetSessionIdentity: () => ({ kind: mocks.isRemote ? "remote" : "local" }),
   adapterExecutionTargetSessionMatches: () => true,
@@ -78,7 +84,10 @@ describe("muse_local execute", () => {
     mocks.runProcessMock.mockReset();
     mocks.restoreMock.mockClear();
     mocks.prepareRuntimeMock.mockReset();
-    mocks.prepareRuntimeMock.mockImplementation(async () => ({ workspaceRemoteDir: "/remote/ws", assetDirs: {}, restoreWorkspace: mocks.restoreMock }));
+    mocks.prepareRuntimeMock.mockImplementation(async () => ({ workspaceRemoteDir: "/remote/ws", runtimeRootDir: "/remote/ws/.paperclip-runtime", assetDirs: {}, restoreWorkspace: mocks.restoreMock }));
+    mocks.bridgeStopMock.mockClear();
+    mocks.startBridgeMock.mockReset();
+    mocks.startBridgeMock.mockImplementation(async () => ({ env: { PAPERCLIP_API_URL: "http://127.0.0.1:43123", PAPERCLIP_API_KEY: "bridge-token" }, stop: mocks.bridgeStopMock }));
     vi.stubEnv("PAPERCLIP_HOME", await makeTempRoot());
     vi.stubEnv("META_API_KEY", "");
   });
@@ -161,6 +170,16 @@ describe("muse_local execute", () => {
     const result = await execute(makeCtx(root));
     expect(result.errorCode).toBe("muse_auth_required");
     expect(result.errorMessage).toMatch(/muse login|META_API_KEY/);
+  });
+
+  it("reports the real failure from stderr, not Muse's informational preamble", async () => {
+    const root = await makeTempRoot();
+    mocks.runProcessMock.mockResolvedValue({
+      exitCode: 1, signal: null, timedOut: false, stdout: "",
+      stderr: "muse: workspace root: /x (explicit)\nmuse: workspace trust: trusted source=run-flag\nreceived SIGTERM; flushed session logs\n",
+    });
+    const result = await execute(makeCtx(root));
+    expect(result.errorMessage).toBe("received SIGTERM; flushed session logs");
   });
 
   it("reports api billing when META_API_KEY is bound", async () => {
@@ -300,6 +319,12 @@ describe("muse_local execute", () => {
     expect(env.XDG_DATA_HOME).toBe("/remote/ws/.paperclip-runtime/muse/data");
     expect(env.XDG_CONFIG_HOME).toBeUndefined();
     expect(env.META_API_KEY).toBe("LLM|remote-key-000000000000000000000000000000");
+    // The remote agent reaches the Paperclip API through the bridge, with the
+    // run's own token handed to the bridge (found in the live SSH smoke).
+    expect(mocks.startBridgeMock).toHaveBeenCalledWith(expect.objectContaining({ adapterKey: "muse", hostApiToken: "run-token" }));
+    expect(env.PAPERCLIP_API_URL).toBe("http://127.0.0.1:43123");
+    expect(env.PAPERCLIP_API_KEY).toBe("bridge-token");
+    expect(mocks.bridgeStopMock).toHaveBeenCalled();
     expect(mocks.restoreMock).toHaveBeenCalled();
     expect(result.exitCode).toBe(0);
     expect(result.sessionParams).toMatchObject({ cwd: "/remote/ws", remoteExecution: { kind: "remote" } });
