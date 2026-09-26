@@ -11762,7 +11762,7 @@ export function issueService(db: Db) {
           // A LIVE holder keeps its issue, even when the holder is a sibling run
           // of this same agent. Releasing hands the holder's in-flight work to
           // anyone, and the widening that allowed it was never part of the
-          // TES-114 fix (whose failure was "cannot write", not "cannot release").
+          // original same-agent write fix (whose failure was "cannot write", not "cannot release").
           // A terminal or missing holder is stale and still releasable.
           if (!stale) {
             throw conflict("Only checkout run can release issue", {

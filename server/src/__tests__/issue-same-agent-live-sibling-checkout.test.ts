@@ -171,7 +171,7 @@ describeEmbeddedPostgres("same-agent live sibling checkout lock", () => {
     return issueId;
   }
 
-  // TES-114 / TES-116: the assignee must be able to write its own issue even
+  // The assignee must be able to write its own issue even
   // when a concurrently live run of the SAME agent holds the checkout.
   it("lets a live sibling run of the same assignee agent PATCH the issue", async () => {
     const seed = await seedCompanyAgentsAndRuns();
@@ -244,7 +244,7 @@ describeEmbeddedPostgres("same-agent live sibling checkout lock", () => {
     expect(res.body.error).toBe("Issue run ownership conflict");
   });
 
-  // TES-118 required test. The case the researcher could not test: a correct
+  // The case a reviewer must not lose: a correct
   // cross-agent lock must still refuse. The actor is NOT the assignee, so the
   // same-agent sibling admission must not apply.
   it("refuses a PATCH from a DIFFERENT agent than the assignee, even when a live same-agent sibling holds the lock", async () => {
@@ -289,7 +289,7 @@ describeEmbeddedPostgres("same-agent live sibling checkout lock", () => {
   // guarantee is pinned to assertCheckoutOwner itself and not only to whichever
   // route guard happens to run first. This is the falsification discriminator:
   // a correct refusal names a different actor than the assignee, while the
-  // TES-114 defect refuses with actor == assignee.
+  // original defect refuses with actor == assignee.
   it("assertCheckoutOwner refuses a non-assignee agent even when a live same-agent sibling holds the lock", async () => {
     const seed = await seedCompanyAgentsAndRuns();
     const issueId = await seedIssue({
