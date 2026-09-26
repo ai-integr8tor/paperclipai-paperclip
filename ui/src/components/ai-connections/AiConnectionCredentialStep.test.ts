@@ -10,9 +10,15 @@ describe("subscription sign-in routing", () => {
     expect(subscriptionLoginAdapterType("meta")).toBe("muse_local");
   });
 
-  it("offers sandbox device login for Muse only once it exists (phase 3)", () => {
-    expect(supportsSandboxDeviceLogin("meta")).toBe(false);
+  it("offers sandbox device login only for providers with a login harness", () => {
+    expect(supportsSandboxDeviceLogin("meta")).toBe(true);
     expect(supportsSandboxDeviceLogin("xai")).toBe(true);
     expect(supportsSandboxDeviceLogin("openai")).toBe(true);
+    expect(supportsSandboxDeviceLogin("anthropic")).toBe(true);
+    expect(supportsSandboxDeviceLogin("openrouter")).toBe(false);
+  });
+
+  it("fails loudly for a provider without a subscription login", () => {
+    expect(() => subscriptionLoginAdapterType("openrouter")).toThrow();
   });
 });

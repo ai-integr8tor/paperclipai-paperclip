@@ -31,12 +31,20 @@ type Props = {
 /** Connections hosts the same provider step as agent setup, with its own save intent. */
 /** The local harness whose sign-in flow authenticates a subscription provider. */
 export function subscriptionLoginAdapterType(provider: AiProvider): "claude_local" | "codex_local" | "grok_local" | "muse_local" {
-  return provider === "anthropic" ? "claude_local" : provider === "xai" ? "grok_local" : provider === "meta" ? "muse_local" : "codex_local";
+  switch (provider) {
+    case "anthropic": return "claude_local";
+    case "openai": return "codex_local";
+    case "xai": return "grok_local";
+    case "meta": return "muse_local";
+    default: throw new Error(`No subscription sign-in for provider ${provider}`);
+  }
 }
 
-/** Muse has no sandbox device-login profile yet, so only its terminal sign-in is offered. */
+/** Providers whose harness has a sandbox device-login profile. New providers default to closed. */
+const SANDBOX_DEVICE_LOGIN_PROVIDERS = new Set<AiProvider>(["anthropic", "openai", "xai", "meta"]);
+
 export function supportsSandboxDeviceLogin(provider: AiProvider): boolean {
-  return provider !== "meta";
+  return SANDBOX_DEVICE_LOGIN_PROVIDERS.has(provider);
 }
 
 export function AiConnectionCredentialStep(props: Props) {
