@@ -211,7 +211,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const dataHome = resolveMuseDataHome(process.env, agent.companyId, agent.id);
     await fs.mkdir(dataHome, { recursive: true, mode: 0o700 });
     env.XDG_DATA_HOME = dataHome;
-    env.TBH_CREDENTIAL_BACKEND = "file";
+    // Do not set TBH_CREDENTIAL_BACKEND here: forcing the file backend hides a
+    // macOS keychain `muse login`. META_API_KEY needs no backend at all.
     env.MUSE_NO_AUTO_UPDATE = "1";
 
     const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(executionTarget, asNumber(config.timeoutSec, 0));

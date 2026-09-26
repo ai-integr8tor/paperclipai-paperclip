@@ -64,7 +64,7 @@ export async function testEnvironment(ctx: AdapterEnvironmentTestContext): Promi
     checks.push({ code: "muse_cwd_invalid", level: "error", message: err instanceof Error ? err.message : "Invalid working directory", detail: cwd });
   }
 
-  const env = { ...normalizeEnv(config.env), TBH_CREDENTIAL_BACKEND: "file", MUSE_NO_AUTO_UPDATE: "1" };
+  const env = { ...normalizeEnv(config.env), MUSE_NO_AUTO_UPDATE: "1" };
   const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
   try {
     await ensureAdapterExecutionTargetCommandResolvable(command, target, cwd, runtimeEnv);

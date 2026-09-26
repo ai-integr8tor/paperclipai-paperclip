@@ -36,6 +36,8 @@ describe("muse_local testEnvironment", () => {
     expect(result.checks.map((c) => c.code)).toContain("muse_hello_probe_passed");
     const args = mocks.runProcessMock.mock.calls[0]![3] as string[];
     expect(args).toEqual(expect.arrayContaining(["exec", "--json", "--no-session-log", "--approval-mode", "never"]));
+    const env = (mocks.runProcessMock.mock.calls[0]![4] as { env: Record<string, string> }).env;
+    expect(env.TBH_CREDENTIAL_BACKEND).toBeUndefined();
   });
 
   it("warns with auth_required when the key is rejected", async () => {

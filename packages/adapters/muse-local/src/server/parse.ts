@@ -10,7 +10,7 @@ export interface ParsedMuseJsonl {
 }
 
 const MUSE_AUTH_ERROR_RE =
-  /API key .* was rejected|No Meta credentials|saved Meta credentials are invalid|run `?muse login`?/i;
+  /API key .* was rejected|No Meta credentials|missing meta credentials|saved Meta credentials are invalid|run `?muse login`?/i;
 
 export function isMuseAuthError(text: string): boolean {
   return MUSE_AUTH_ERROR_RE.test(text);

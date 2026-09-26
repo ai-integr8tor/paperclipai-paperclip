@@ -52,6 +52,8 @@ describe("isMuseAuthError", () => {
     "your API key from META_API_KEY was rejected — update or unset it",
     "No Meta credentials were found. Your message was not sent. Quit Muse Code and run `muse login`.",
     "Your saved Meta credentials are invalid. Your message was not sent.",
+    "missing meta credentials: run `muse login` or set META_API_KEY, or save credentials at /home/user/.config/muse/auth.json",
+    "missing meta credentials",
   ])("detects %s", (text) => expect(isMuseAuthError(text)).toBe(true));
 
   it("ignores unrelated errors", () => expect(isMuseAuthError("model overloaded, retry later")).toBe(false));

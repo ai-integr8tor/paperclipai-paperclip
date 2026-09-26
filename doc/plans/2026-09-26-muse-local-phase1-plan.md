@@ -16,7 +16,7 @@
 - Default command `muse`. Models: `muse-spark-1.3` (default) and `muse-spark-1.3-contributor`.
 - Reasoning efforts: `none | minimal | low | medium | high | xhigh | max | ultra`. Unset means the CLI default (`high`).
 - argv is always `exec --json --model <m> [--reasoning-effort <e>] --approval-mode never --trust-workspace --workspace <cwd> --session-id <uuid> --prompt-file <file> [extraArgs]`.
-- Child env always has `XDG_DATA_HOME=<instanceRoot>/companies/<companyId>/muse-data/<agentId>`, `TBH_CREDENTIAL_BACKEND=file` and `MUSE_NO_AUTO_UPDATE=1`. Never set `XDG_CONFIG_HOME` in Phase 1.
+- Child env always has `XDG_DATA_HOME=<instanceRoot>/companies/<companyId>/muse-data/<agentId>` and `MUSE_NO_AUTO_UPDATE=1`. It never has `TBH_CREDENTIAL_BACKEND` (ruled during Task 8: it hides a keychain login). Never set `XDG_CONFIG_HOME` in Phase 1.
 - Skills are staged into `<cwd>/.agents/skills/<runtimeName>` and removed after the run. Pre-existing targets are never touched.
 - Result billing: `provider: "meta"`, `biller: "muse"`, `billingType: "subscription"` unless `META_API_KEY` is set (then `"api"`), `costUsd: null`, `usageBasis: "per_run"`, and usage is all zeros (Muse JSONL carries no token usage).
 - Auth failure sets `errorCode: "muse_auth_required"`. It matches `/API key .* was rejected|No Meta credentials|saved Meta credentials are invalid|run `?muse login`?/i`.

@@ -160,8 +160,10 @@ its own line after `confirm this code matches:`.
   afterwards. Muse discovers `.agents/skills` and `.claude/skills` in trusted
   workspaces (verified).
 - Env: `XDG_DATA_HOME` = `<instance>/companies/<companyId>/muse-data/<agentId>`
-  (session store, so resume survives heartbeats), `TBH_CREDENTIAL_BACKEND=file`,
-  and `MUSE_NO_AUTO_UPDATE=1`. `XDG_CONFIG_HOME` is left alone, so a host `muse login`
+  (session store, so resume survives heartbeats),
+  and `MUSE_NO_AUTO_UPDATE=1`. Runs must NOT set `TBH_CREDENTIAL_BACKEND=file`
+  (verified: it hides a macOS keychain `muse login` and the run fails with
+  "missing meta credentials"). That variable is for login only. `XDG_CONFIG_HOME` is left alone, so a host `muse login`
   still works when no `META_API_KEY` is provided.
 - JSONL (fixtures `doc/plans/2026-09-26-muse-exec-{basic,tool,badkey}.jsonl`):
   the session id is `stream.id`, and the model is `payload.model_id` on

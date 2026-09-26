@@ -100,7 +100,8 @@ describe("muse_local execute", () => {
     expect(args.slice(-2)).toEqual(["--max-model-steps", "40"]);
     const env = (options as { env: Record<string, string> }).env;
     expect(env.XDG_DATA_HOME).toBe(resolveMuseDataHome(process.env, "company-1", "agent-1"));
-    expect(env.TBH_CREDENTIAL_BACKEND).toBe("file");
+    // Forcing the file backend hides a macOS keychain `muse login` (verified live).
+    expect(env.TBH_CREDENTIAL_BACKEND).toBeUndefined();
     expect(env.MUSE_NO_AUTO_UPDATE).toBe("1");
     expect(env.XDG_CONFIG_HOME).toBeUndefined();
 
