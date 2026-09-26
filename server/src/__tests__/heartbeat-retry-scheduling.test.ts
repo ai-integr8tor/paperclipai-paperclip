@@ -17,6 +17,7 @@ import {
   executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueComments,
   issueRelations,
   issues,
   projects,
@@ -62,6 +63,7 @@ import {
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
   MAX_TURN_CONTINUATION_RETRY_REASON,
   MAX_TURN_CONTINUATION_WAKE_REASON,
+  buildPaperclipWakePayload,
   heartbeatService,
 } from "../services/heartbeat.ts";
 
@@ -386,6 +388,156 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         { timeout: 5_000, interval: 50 },
       )
       .toEqual({ status: "idle", errorReason: null });
+  });
+
+  it("holds automatic wakes for an agent's quota retry while preserving their issue context", async () => {
+    const companyId = randomUUID(), agentId = randomUUID(), failedRunId = randomUUID();
+    const rootIssueId = randomUUID(), otherIssueId = randomUUID(), commentId = randomUUID();
+    const now = new Date();
+    const resetAt = new Date(now.getTime() + 60 * 60_000);
+    await seedRetryFixture({
+      runId: failedRunId, companyId, agentId, now,
+      adapterType: PROVIDER_QUOTA_TEST_ADAPTER,
+      errorCode: "provider_quota", errorFamily: "provider_quota",
+      retryNotBefore: resetAt.toISOString(),
+    });
+    await db.insert(issues).values([
+      { id: rootIssueId, companyId, title: "Quota retry owner", status: "in_progress", assigneeAgentId: agentId },
+      { id: otherIssueId, companyId, title: "Another assigned issue", status: "todo", assigneeAgentId: agentId },
+    ]);
+    await db.insert(issueComments).values({
+      id: commentId, companyId, issueId: otherIssueId,
+      authorType: "user", authorUserId: "local-board", body: "Please check this task.",
+    });
+    await db.update(heartbeatRuns).set({
+      contextSnapshot: { issueId: rootIssueId, wakeReason: "issue_assigned" },
+    }).where(eq(heartbeatRuns.id, failedRunId));
+    const scheduled = await heartbeat.scheduleBoundedRetry(failedRunId, { now, random: () => 0 });
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled" || !scheduled.run) throw new Error("Expected quota retry");
+    const retryId = scheduled.run.id;
+
+    for (const wake of [
+      { issueId: otherIssueId, reason: "issue_commented", commentIds: [commentId], source: "automation" as const },
+      { issueId: otherIssueId, reason: "issue_assigned", commentIds: [], source: "assignment" as const },
+      { issueId: rootIssueId, reason: "issue_blockers_resolved", commentIds: [], source: "automation" as const },
+    ]) {
+      const result = await heartbeat.wakeup(agentId, {
+        source: wake.source, triggerDetail: "system", reason: wake.reason,
+        payload: { issueId: wake.issueId, ...(wake.commentIds.length ? { commentId } : {}) },
+        contextSnapshot: { issueId: wake.issueId, wakeReason: wake.reason, wakeCommentIds: wake.commentIds },
+        requestedByActorType: "system", requestedByActorId: "test-scheduler",
+      });
+      expect(result?.id).toBe(retryId);
+    }
+    const idleWake = await heartbeat.wakeup(agentId, {
+      source: "on_demand", triggerDetail: "manual", reason: "idle_seat_waker",
+      requestedByActorType: "system", requestedByActorId: "idle-seat-waker",
+    });
+    expect(idleWake?.id).toBe(retryId);
+
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(2);
+    const heldRetry = runs.find((run) => run.id === retryId)!;
+    expect(heldRetry.status).toBe("scheduled_retry");
+    expect(heldRetry.scheduledRetryAt?.toISOString()).toBe(resetAt.toISOString());
+    const heldWakes = (heldRetry.contextSnapshot as Record<string, unknown>).providerQuotaHeldWakes;
+    expect(heldWakes).toMatchObject([
+      { issueId: otherIssueId, reason: "issue_commented" },
+      { issueId: otherIssueId, reason: "issue_assigned" },
+      { issueId: rootIssueId, reason: "issue_blockers_resolved" },
+      { issueId: null, reason: "idle_seat_waker" },
+    ]);
+    const payload = await buildPaperclipWakePayload({
+      db, companyId, agentId, runId: retryId,
+      contextSnapshot: heldRetry.contextSnapshot as Record<string, unknown>,
+    });
+    expect(payload?.providerQuotaHeldWakes).toMatchObject([
+      { issueId: otherIssueId, issueTitle: "Another assigned issue", reason: "issue_commented",
+        commentIds: [commentId], commentPreviews: [{ id: commentId, body: "Please check this task." }] },
+      { issueId: otherIssueId, issueTitle: "Another assigned issue", reason: "issue_assigned", commentIds: [] },
+      { issueId: rootIssueId, issueTitle: "Quota retry owner", reason: "issue_blockers_resolved", commentIds: [] },
+      { issueId: null, reason: "idle_seat_waker", commentIds: [] },
+    ]);
+
+    expect(await heartbeat.promoteDueScheduledRetries(new Date(resetAt.getTime() - 1)))
+      .toEqual({ promoted: 0, runIds: [] });
+    const [beforeReset] = await db.select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns).where(eq(heartbeatRuns.id, retryId));
+    expect(beforeReset?.status).toBe("scheduled_retry");
+
+    await db.update(agents).set({ runtimeConfig: { heartbeat: {
+      wakeOnDemand: true, maxConcurrentRuns: 1, maxDailyRuns: 0,
+    } } }).where(eq(agents.id, agentId));
+    await heartbeat.wakeup(agentId, {
+      source: "on_demand", triggerDetail: "manual", reason: "manual",
+      manualUserWake: true, payload: { issueId: rootIssueId },
+      contextSnapshot: { issueId: rootIssueId },
+      requestedByActorType: "user", requestedByActorId: "local-board",
+    });
+    const [afterSkippedManual] = await db.select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns).where(eq(heartbeatRuns.id, retryId));
+    expect(afterSkippedManual?.status).toBe("scheduled_retry");
+    await db.update(agents).set({ runtimeConfig: { heartbeat: {
+      wakeOnDemand: true, maxConcurrentRuns: 1,
+    } } }).where(eq(agents.id, agentId));
+
+    const manual = await heartbeat.wakeup(agentId, {
+      source: "on_demand", triggerDetail: "manual", reason: "manual",
+      manualUserWake: true,
+      payload: { issueId: rootIssueId }, contextSnapshot: { issueId: rootIssueId },
+      requestedByActorType: "user", requestedByActorId: "local-board",
+    });
+    expect(manual?.id).toBeTruthy();
+    expect(manual?.id).not.toBe(retryId);
+    const [supersededRetry] = await db.select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns).where(eq(heartbeatRuns.id, retryId));
+    expect(supersededRetry?.status).toBe("cancelled");
+    expect((manual?.contextSnapshot as Record<string, unknown>).providerQuotaHeldWakes)
+      .toMatchObject(heldWakes);
+  });
+
+  it("promotes a held retry only at its reset and replays other-issue wakes when its owner cannot run", async () => {
+    const companyId = randomUUID(), agentId = randomUUID(), failedRunId = randomUUID();
+    const ownerId = randomUUID(), otherId = randomUUID(), now = new Date();
+    const resetAt = new Date(now.getTime() + 60 * 60_000);
+    await seedRetryFixture({ runId: failedRunId, companyId, agentId, now,
+      adapterType: PROVIDER_QUOTA_TEST_ADAPTER, errorCode: "provider_quota",
+      errorFamily: "provider_quota", retryNotBefore: resetAt.toISOString() });
+    await db.insert(issues).values([
+      { id: ownerId, companyId, title: "Retry owner", status: "in_progress", assigneeAgentId: agentId },
+      { id: otherId, companyId, title: "Held assignment", status: "todo", assigneeAgentId: agentId },
+    ]);
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: ownerId, wakeReason: "issue_assigned" } })
+      .where(eq(heartbeatRuns.id, failedRunId));
+    const scheduled = await heartbeat.scheduleBoundedRetry(failedRunId, { now, random: () => 0 });
+    if (scheduled.outcome !== "scheduled" || !scheduled.run) throw new Error("Expected quota retry");
+    const retryId = scheduled.run.id;
+    await heartbeat.wakeup(agentId, { source: "assignment", triggerDetail: "system",
+      reason: "issue_assigned", payload: { issueId: otherId },
+      contextSnapshot: { issueId: otherId, wakeReason: "issue_assigned" },
+      requestedByActorType: "system", requestedByActorId: "test-scheduler" });
+    expect(await heartbeat.promoteDueScheduledRetries(new Date(resetAt.getTime() - 1)))
+      .toEqual({ promoted: 0, runIds: [] });
+    expect(await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId))).toHaveLength(2);
+
+    // The due retry's owner became ineligible. Its other-issue receipt must
+    // still enter ordinary admission once the quota hold has expired.
+    await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, ownerId));
+    await Promise.all([
+      heartbeat.promoteDueScheduledRetries(resetAt),
+      heartbeat.promoteDueScheduledRetries(resetAt),
+    ]);
+    const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, retryId));
+    expect(retry.status).toBe("cancelled");
+    expect((retry.contextSnapshot as Record<string, unknown>).providerQuotaHeldWakesReplayedAt).toBeTruthy();
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs.filter((run) => run.id !== failedRunId && run.id !== retryId &&
+      (run.contextSnapshot as Record<string, unknown>).issueId === otherId)).toHaveLength(1);
+    await heartbeat.promoteDueScheduledRetries(resetAt);
+    const afterRepeat = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(afterRepeat.length).toBe(runs.length);
   });
 
   async function seedMaxTurnFixture(input?: {
