@@ -900,6 +900,21 @@ describe("AgentConfigForm environment selector", () => {
     expect(existing.onSave).not.toHaveBeenCalled();
   });
 
+  it("names the detected server model as the Claude default", async () => {
+    mockAgentsApi.detectModel.mockResolvedValue({
+      model: "claude-opus-5-5",
+      provider: "anthropic",
+      source: "env:ANTHROPIC_MODEL",
+    });
+    const environments = [makeEnvironment({ id: "local-1", name: "Local", driver: "local" })];
+    const existing = await renderForm(environments, { adapterType: "claude_local", adapterConfig: {} });
+    roots.push(existing.root);
+    await flushReact();
+    expect(existing.container.textContent).toContain("Default (claude-opus-5-5)");
+    expect(existing.container.textContent).not.toContain("Default (claude-opus-5)");
+    expect(existing.onSave).not.toHaveBeenCalled();
+  });
+
   it("keeps secret access out of the main Configuration content", async () => {
     const result = await renderForm([
       makeEnvironment({ id: "local-1", name: "Local", driver: "local" }),

@@ -1739,7 +1739,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                 }}
                 open={modelOpen}
                 onOpenChange={setModelOpen}
-                defaultLabel={adapterType === "claude_local" ? `Default (${DEFAULT_CLAUDE_LOCAL_MODEL})` : undefined}
+                defaultLabel={adapterType === "claude_local" ? `Default (${detectedModel ?? DEFAULT_CLAUDE_LOCAL_MODEL})` : undefined}
                 allowDefault={adapterType !== "opencode_local" && adapterType !== "pi_local" && adapterType !== "paperclip_runner"}
                 required={adapterType === "opencode_local" || adapterType === "pi_local"}
                 groupByProvider={adapterType === "opencode_local" || adapterType === "pi_local"}
