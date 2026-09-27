@@ -76,6 +76,7 @@ import { accessService } from "../services/access.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { toolAccessPolicyService } from "../services/tool-access-policy.js";
 import { secretService } from "../services/secrets.js";
+import { localEncryptedProvider } from "../secrets/local-encrypted-provider.js";
 import {
   canonicalToolArguments,
   signToolArguments,
@@ -11714,6 +11715,43 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(connection.credentialRefs.map((credentialRef) => credentialRef.secretId)).toEqual([ref.secretId]);
     const legacyRows = await db.select().from(companySecrets).where(eq(companySecrets.id, legacy.id));
     expect(legacyRows.map((row) => row.status)).toEqual(kept ? ["active"] : []);
+  });
+
+  it("rolls back a legacy personal credential replacement when revoking the old secret fails, so a retry repairs it", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    mockToolsList([{ name: "search_memories", annotations: { readOnlyHint: true } }]);
+    const actor = { actorType: "user" as const, actorId: "legacy-retry-owner" };
+    const connected = await service.connectGalleryApp(company.id, {
+      galleryKey: "mem0", grantKind: "user", credentialValues: { "credentials.authorization": "old-key" },
+    }, actor);
+    const legacy = await secretService(db).create(company.id, {
+      provider: "local_encrypted", name: `Legacy personal ${randomUUID()}`,
+      key: `tool_app.${randomUUID()}.credentials_authorization`, value: "old-key",
+    });
+    const { grants } = await service.listConnectionGrants(connected.connectionId, company.id);
+    const [grantRef] = grants[0]!.credentialSecretRefs;
+    await db.update(connectionGrants).set({ credentialSecretRefs: [{ ...grantRef!, secretId: legacy.id }] })
+      .where(eq(connectionGrants.id, grants[0]!.id));
+    const [row] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    await db.update(toolConnections).set({
+      credentialRefs: row!.credentialRefs.map((ref) => ({ ...ref, secretId: legacy.id })),
+    }).where(eq(toolConnections.id, connected.connectionId));
+    const grantSecretId = async () =>
+      (await service.listConnectionGrants(connected.connectionId, company.id)).grants[0]!.credentialSecretRefs[0]!.secretId;
+
+    vi.spyOn(localEncryptedProvider, "deleteOrArchive").mockRejectedValueOnce(new Error("provider unavailable"));
+    await expect(service.reconnectGalleryApp(connected.connectionId, company.id,
+      { credentialValues: { "credentials.authorization": "new-key" } }, actor)).rejects.toThrow("provider unavailable");
+    expect(await grantSecretId()).toBe(legacy.id);
+    const [legacyAfterFailure] = await db.select().from(companySecrets).where(eq(companySecrets.id, legacy.id));
+    expect(legacyAfterFailure?.status).toBe("active");
+
+    await service.reconnectGalleryApp(connected.connectionId, company.id,
+      { credentialValues: { "credentials.authorization": "new-key" } }, actor);
+    const [repaired] = await db.select().from(companySecrets).where(eq(companySecrets.id, await grantSecretId()));
+    expect(repaired).toMatchObject({ scope: "user", ownerUserId: actor.actorId });
+    expect(await db.select().from(companySecrets).where(eq(companySecrets.id, legacy.id))).toHaveLength(0);
   });
 
   it("keeps rejected Mem0 API keys on the key-entry path rather than switching to OAuth", async () => {

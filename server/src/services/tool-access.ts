@@ -14090,6 +14090,14 @@ export function toolAccessService(
       }
     }
 
+    const revokedSecretIds = await replacedSecretsToRevoke(connection, replacedSecretIds, {
+      grantId: personalIdentity?.grant?.id ?? null,
+      keptSecretIds: [
+        ...credentialRefs.map((ref) => ref.secretId),
+        ...connection.credentialSecretRefs.map((ref) => ref.secretId),
+        ...credentialSecretRefs.map((ref) => ref.secretId),
+      ],
+    });
     const updated = await db.transaction(async (tx) => {
       const updatedAt = new Date();
       if (personalIdentity) {
@@ -14132,13 +14140,16 @@ export function toolAccessService(
         })
         .where(eq(toolConnections.id, connection.id))
         .returning();
+      // Revoke in the same transaction as the ref swap. A failure rolls both
+      // back, so a retry still finds the legacy ref and replaces it again.
+      const vault = secretService(tx as unknown as Db);
+      for (const secretId of revokedSecretIds) await vault.remove(secretId);
       return nextConnection;
     });
     await syncCredentialBindings(
       updated,
       personalIdentity ? credentialSecretRefs : [],
     );
-    await removeReplacedConnectionSecrets(updated, replacedSecretIds);
     const health = await checkConnectionHealth(updated.id, actor);
     const refresh = await refreshCatalog(updated.id, actor, {
       enableAllByDefault: true,
@@ -14161,43 +14172,35 @@ export function toolAccessService(
   }
 
   /**
-   * Revoke credentials a reconnect replaced, after the new refs are committed.
-   * `classifyConnectionSecrets` only looks at other consumers, so first keep
-   * any secret this connection still references through its own refs or any
-   * of its grants. Cleanup is best effort: the reconnect already succeeded,
-   * and a value left behind was never resolvable for the personal grant.
+   * The replaced secrets a reconnect may revoke. `classifyConnectionSecrets`
+   * only looks at other consumers, so first keep any secret this connection
+   * will still reference: the refs being committed and its other grants' refs.
    */
-  async function removeReplacedConnectionSecrets(
+  async function replacedSecretsToRevoke(
     connection: typeof toolConnections.$inferSelect,
     secretIds: string[],
-  ) {
-    if (secretIds.length === 0) return;
-    try {
-      const grantRows = await db
-        .select({ refs: connectionGrants.credentialSecretRefs })
-        .from(connectionGrants)
-        .where(
-          and(
-            eq(connectionGrants.companyId, connection.companyId),
-            eq(connectionGrants.connectionId, connection.id),
-          ),
-        );
-      const stillReferenced = new Set([
-        ...connection.credentialRefs.map((ref) => ref.secretId),
-        ...connection.credentialSecretRefs.map((ref) => ref.secretId),
-        ...grantRows.flatMap((row) => (row.refs ?? []).map((ref) => ref.secretId)),
-      ]);
-      const { owned } = await classifyConnectionSecrets(
-        connection,
-        secretIds.filter((id) => !stillReferenced.has(id)),
+    kept: { grantId: string | null; keptSecretIds: string[] },
+  ): Promise<string[]> {
+    if (secretIds.length === 0) return [];
+    const otherGrants = await db
+      .select({ refs: connectionGrants.credentialSecretRefs })
+      .from(connectionGrants)
+      .where(
+        and(
+          eq(connectionGrants.companyId, connection.companyId),
+          eq(connectionGrants.connectionId, connection.id),
+          kept.grantId ? ne(connectionGrants.id, kept.grantId) : undefined,
+        ),
       );
-      for (const secretId of owned) await secrets.remove(secretId);
-    } catch (error) {
-      logger.warn(
-        { err: error, companyId: connection.companyId, connectionId: connection.id },
-        "tool connection reconnect could not revoke a replaced credential",
-      );
-    }
+    const stillReferenced = new Set([
+      ...kept.keptSecretIds,
+      ...otherGrants.flatMap((row) => (row.refs ?? []).map((ref) => ref.secretId)),
+    ]);
+    const { owned } = await classifyConnectionSecrets(
+      connection,
+      secretIds.filter((id) => !stillReferenced.has(id)),
+    );
+    return owned;
   }
 
   async function startOAuth(
