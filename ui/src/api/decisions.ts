@@ -1,4 +1,4 @@
-import type { DecisionInput, DecisionOption } from "@paperclipai/shared";
+import type { DecisionBrief, DecisionInput, DecisionOption } from "@paperclipai/shared";
 import { api } from "./client";
 
 /**
@@ -35,6 +35,7 @@ export interface Decision {
   ruleKey: string | null;
   title: string;
   body: string;
+  brief?: DecisionBrief | null;
   options: DecisionOption[];
   inputs: DecisionInput[] | null;
   status: DecisionStatus;

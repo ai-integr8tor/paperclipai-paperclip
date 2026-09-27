@@ -11,6 +11,7 @@ import {
   companies,
   companyMemberships,
   createDb,
+  decisionBundles,
   decisionEffectExecutions,
   decisionRetention,
   decisions,
@@ -72,7 +73,7 @@ describePg("decisionService", () => {
     delete process.env.PAPERCLIP_DECISIONS_SWEEP_BATCH_SIZE;
     delete process.env.PAPERCLIP_DECISIONS_RECOVERY_GRACE_MS;
     delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
-    await db.delete(decisionEffectExecutions); await db.delete(decisionTargetIssues); await db.delete(decisions); await db.delete(decisionRetention); await db.delete(activityLog);
+    await db.delete(decisionEffectExecutions); await db.delete(decisionTargetIssues); await db.delete(decisions); await db.delete(decisionBundles); await db.delete(decisionRetention); await db.delete(activityLog);
     await db.delete(issueComments); await db.delete(issueRelations); await db.delete(heartbeatRuns); await db.delete(issues); await db.delete(agents); await db.delete(companyMemberships); await db.delete(authUsers); await db.delete(companies);
   });
   afterAll(async () => tempDb?.cleanup());
@@ -656,5 +657,40 @@ describePg("decisionService", () => {
 
     expect(result).toMatchObject({ status: "decided", chosenOptionId: "dismissed" });
     expect(wakes).toEqual([{ companyId, agentId, issueId: originIssueId, decisionId: created.id, outcome: "decided" }]);
+  });
+
+  const decisionBrief = {
+    version: 1 as const,
+    whatIsHappening: "Cleaning up the launch tree the CTO opened.",
+    whyStopped: "Reassigning changes ownership.",
+    whatWeNeed: "Confirm the comment.",
+  };
+
+  it("persists and returns a decision brief", async () => {
+    const created = await createCommentDecision("lenient", { brief: decisionBrief });
+    expect(created.brief).toEqual(decisionBrief);
+    const outcome = await service().outcome(created.id);
+    expect(outcome.brief).toEqual(decisionBrief);
+  });
+
+  it("persists briefs on bundled decisions", async () => {
+    const bundle = await service().createBundle({
+      companyId, actor: agentActor(), agentId, runId, title: "Bundle", summary: "S",
+      decisions: [{ title: "One?", body: "B", brief: decisionBrief,
+        options: [{ id: "yes", label: "Yes", effects: [{ type: "comment_on_issue", targetIssueId, staleness: "lenient", bodyMarkdown: "hi" }] }] }],
+    });
+    expect(bundle.decisions[0].brief).toEqual(decisionBrief);
+  });
+
+  it("requires a brief when the company flag is on", async () => {
+    await db.update(companies).set({ requireDecisionBrief: true }).where(eq(companies.id, companyId));
+    await expect(createCommentDecision()).rejects.toMatchObject({ status: 422 });
+  });
+
+  it("returns an existing idempotent decision without re-checking the brief flag", async () => {
+    const first = await createCommentDecision("lenient", { idempotencyKey: "brief-retry" });
+    await db.update(companies).set({ requireDecisionBrief: true }).where(eq(companies.id, companyId));
+    const retry = await createCommentDecision("lenient", { idempotencyKey: "brief-retry" });
+    expect(retry.id).toBe(first.id);
   });
 });

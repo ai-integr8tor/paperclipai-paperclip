@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import {
   createDecisionArchiveProposalSchema,
+  decisionBriefSchema,
   decisionInputsSchema,
   decisionOptionsSchema,
   type AttentionArchiveManifestEntry,
@@ -22,6 +23,7 @@ import { forbidden, unprocessable } from "../errors.js";
 const createSchema = z.object({
   title: z.string().trim().min(1).max(500),
   body: z.string().max(100_000),
+  brief: decisionBriefSchema.nullable().optional(),
   ruleKey: z.string().trim().max(240).nullable().optional(),
   options: decisionOptionsSchema,
   inputs: decisionInputsSchema.nullable().optional(),

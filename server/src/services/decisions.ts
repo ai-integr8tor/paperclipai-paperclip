@@ -3,11 +3,12 @@ import { and, asc, count, desc, eq, gt, gte, inArray, lte, or, sql } from "drizz
 import type { Db } from "@paperclipai/db";
 import { companyMemberships, decisionBundles, decisionEffectExecutions, decisionRetention, decisions, decisionTargetIssues, heartbeatRuns, issueRelations, issues } from "@paperclipai/db";
 import { ATTENTION_SOURCE_KINDS, decisionEffectTargetIssueIds } from "@paperclipai/shared";
-import type { AttentionArchiveManifestEntry, DecisionEffect, DecisionInput, DecisionOption, DecisionStatsCounts, DecisionStatsResponse } from "@paperclipai/shared";
+import type { AttentionArchiveManifestEntry, DecisionBrief, DecisionEffect, DecisionInput, DecisionOption, DecisionStatsCounts, DecisionStatsResponse } from "@paperclipai/shared";
 import { conflict, forbidden, notFound, tooManyRequests, unprocessable } from "../errors.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
 import { logActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 import { signDecisionSpec, verifyDecisionSpec } from "./decision-signing.js";
+import { decisionBriefGuard } from "./decision-brief.js";
 import {
   issueService,
   type IssuePostCommitAction,
@@ -121,7 +122,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
   const authz = authorizationService(db);
   let targetSweepCursor: string | null = null;
   type CreateInput = { companyId: string; actor: AuthorizationActor; agentId: string; runId: string; bundleId?: string | null;
-    ruleKey?: string | null; title: string; body: string; options: DecisionOption[]; inputs?: DecisionInput[] | null; expiresAt?: Date | null;
+    ruleKey?: string | null; title: string; body: string; brief?: DecisionBrief | null; options: DecisionOption[]; inputs?: DecisionInput[] | null; expiresAt?: Date | null;
     idempotencyKey?: string | null; continuationPolicy?: "none" | "wake_origin_agent"; metadata?: Record<string, unknown> };
   type CreateInputWithSnapshots = CreateInput & { additionalTargetSnapshots?: Record<string, Snapshot> };
 
@@ -210,6 +211,11 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
         return existing;
       }
     }
+    await decisionBriefGuard(dbOrTx).assertAllowed({
+      companyId: input.companyId,
+      brief: input.brief ?? null,
+      humanFacing: true,
+    });
     const open = await dbOrTx.select({ value: count() }).from(decisions).where(and(eq(decisions.companyId, input.companyId), eq(decisions.originAgentId, input.agentId), eq(decisions.status, "open")));
     const cap = Number(process.env.PAPERCLIP_DECISIONS_OPEN_CAP ?? 50);
     if (Number(open[0]?.value ?? 0) >= cap) throw tooManyRequests("Open decision cap reached");
@@ -225,7 +231,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
     const id = randomUUID();
     const [created] = await dbOrTx.insert(decisions).values({ id, companyId: input.companyId, bundleId: input.bundleId ?? null,
       originAgentId: input.agentId, originIssueId: provenance.issueId, originRunId: input.runId, ruleKey: input.ruleKey ?? null,
-      title: input.title, body: input.body, options: input.options, inputs: input.inputs ?? null, expiresAt,
+      title: input.title, body: input.body, brief: input.brief ?? null, options: input.options, inputs: input.inputs ?? null, expiresAt,
       idempotencyKey: input.idempotencyKey ?? null, signedSpec: signDecisionSpec(spec({ id, options: input.options, targetSnapshots })),
       targetSnapshots, continuationPolicy: input.continuationPolicy ?? "none", metadata: input.metadata ?? {} }).onConflictDoNothing().returning();
     if (!created) {
