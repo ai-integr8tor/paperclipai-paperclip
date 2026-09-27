@@ -140,11 +140,10 @@ for (const { pickerName, triggerName, query, selectionName } of [
     expect(geometry.inputTop).toBeGreaterThanOrEqual(visibleTop);
     expect(geometry.inputBottom).toBeLessThanOrEqual(visibleBottom);
     expect(geometry.portalledOutsideDialog).toBe(true);
-    // The sheet spans the viewport minus its side gutters. A containing block on the
+    // The sheet spans the viewport minus its 16px side gutters. A containing block on the
     // popper wrapper (transform or will-change) collapses it to a sliver instead.
-    expect(geometry.pickerLeft).toBeGreaterThanOrEqual(0);
-    expect(geometry.pickerRight).toBeLessThanOrEqual(viewport.width);
-    expect(geometry.pickerRight - geometry.pickerLeft).toBeGreaterThan(viewport.width / 2);
+    expect(Math.abs(geometry.pickerLeft - 16)).toBeLessThanOrEqual(1);
+    expect(Math.abs(geometry.pickerRight - (viewport.width - 16))).toBeLessThanOrEqual(1);
 
     const searchInput = picker.locator("input");
     await searchInput.fill(query);
