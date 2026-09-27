@@ -143,7 +143,9 @@ runs with `/api/v1/runs` after mapping them to the API base.
 This mode does not start Hermes. It creates runs with `POST /v1/runs`, streams
 Hermes events with SSE, polls run status as a fallback, and stops timed-out or
 Paperclip-stopped runs with `POST /v1/runs/{run_id}/stop`. A Paperclip Stop is
-acknowledged only after Hermes reports a terminal status.
+acknowledged only after Hermes reports a cancelled status; the stop request and
+its status check share one 10-second budget. If the run completes or fails
+while the Stop is in flight, that real outcome is reported instead.
 
 `dispatchRetryAttempts` (default `1`, max `3`) resends the same
 `POST /v1/runs`, with the same `Idempotency-Key` and body, after a 429, 5xx, or

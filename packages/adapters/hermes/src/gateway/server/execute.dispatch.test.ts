@@ -62,8 +62,16 @@ type CreateStep = () => Response | Promise<Response>;
 
 type GatewayPlan = {
   create: CreateStep;
-  status?: Record<string, unknown> | ((stops: number) => Record<string, unknown>);
+  status?: Record<string, unknown> | ((stops: number) => Record<string, unknown> | Response);
+  stop?: (init: RequestInit | undefined) => Response | Promise<Response>;
 };
+
+/** A request the gateway accepts but never answers; only the caller's signal ends it. */
+function hangUntilAborted(init: RequestInit | undefined): Promise<Response> {
+  return new Promise((_resolve, reject) => {
+    init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+  });
+}
 
 /** Records every create and stop call so "exactly one run" is observable. */
 function stubGateway(plan: GatewayPlan) {
@@ -78,10 +86,11 @@ function stubGateway(plan: GatewayPlan) {
     }
     if (/\/v1\/runs\/[^/]+\/stop$/.test(url) && init?.method === "POST") {
       stops += 1;
-      return jsonResponse(200, { ok: true });
+      return plan.stop ? plan.stop(init) : jsonResponse(200, { ok: true });
     }
     if (/\/v1\/runs\/[^/]+$/.test(url)) {
       const status = typeof plan.status === "function" ? plan.status(stops) : plan.status;
+      if (status instanceof Response) return status;
       return jsonResponse(200, status ?? { status: "completed", result: { text: "OK" } });
     }
     return new Response("", { status: 404 });
@@ -371,5 +380,90 @@ describe("execute cancellation", () => {
     expect(gateway.creates).toHaveLength(1);
     expect(cancellation(result)?.state).toBe("acknowledged");
     expect(result.executionRecovery).toEqual({ kind: "bootstrap", providerWorkStarted: false });
+  });
+
+  it("bounds a /stop request that Hermes accepts but never answers", async () => {
+    const abort = new AbortController();
+    const { ctx } = makeHarness(
+      { dispatchRetryAttempts: 3, timeoutSec: 0 },
+      { signal: abort.signal, onCancellationReady: async () => undefined },
+    );
+    const gateway = stubGateway({
+      create: () => jsonResponse(202, { run_id: "run-mute", status: "started" }),
+      status: { status: "running" },
+      stop: hangUntilAborted,
+    });
+    setTimeout(() => abort.abort(), 300);
+
+    const result = await runToCompletion(execute(ctx), 15_000);
+
+    expect(gateway.stops).toBe(1);
+    expect(result.resultJson?.stop_requested).toBe(false);
+    expect(cancellation(result)?.state).toBe("requested");
+  });
+
+  it("keeps verifying the Stop after a transient status failure", async () => {
+    const abort = new AbortController();
+    const { ctx } = makeHarness(
+      { dispatchRetryAttempts: 3 },
+      { signal: abort.signal, onCancellationReady: async () => undefined },
+    );
+    let polls = 0;
+    const gateway = stubGateway({
+      create: () => jsonResponse(202, { run_id: "run-flaky", status: "started" }),
+      status: (stops) => {
+        if (stops === 0) return { status: "running" };
+        polls += 1;
+        return polls === 1 ? jsonResponse(503, { error: "unavailable" }) : { status: "cancelled" };
+      },
+    });
+    setTimeout(() => abort.abort(), 300);
+
+    const result = await runToCompletion(execute(ctx));
+
+    expect(gateway.stops).toBe(1);
+    expect(polls).toBeGreaterThanOrEqual(2);
+    expect(cancellation(result)?.state).toBe("acknowledged");
+  });
+
+  it("keeps the real outcome when the run completes while the Stop is in flight", async () => {
+    const abort = new AbortController();
+    const { ctx } = makeHarness(
+      { dispatchRetryAttempts: 3 },
+      { signal: abort.signal, onCancellationReady: async () => undefined },
+    );
+    const gateway = stubGateway({
+      create: () => jsonResponse(202, { run_id: "run-done", status: "started" }),
+      status: (stops) => (stops > 0 ? { status: "completed", result: { text: "finished" } } : { status: "running" }),
+    });
+    setTimeout(() => abort.abort(), 300);
+
+    const result = await runToCompletion(execute(ctx));
+
+    expect(gateway.stops).toBe(1);
+    expect(result.errorCode).not.toBe("hermes_gateway_cancelled");
+    expect(result.exitCode).toBe(0);
+    expect(cancellation(result)).toBeUndefined();
+    expect(result.resultJson?.stop_requested).toBe(true);
+    expect(dispatchEvidence(result)).toBeDefined();
+  });
+
+  it("keeps a failure outcome when the run fails while the Stop is in flight", async () => {
+    const abort = new AbortController();
+    const { ctx } = makeHarness(
+      { dispatchRetryAttempts: 3 },
+      { signal: abort.signal, onCancellationReady: async () => undefined },
+    );
+    stubGateway({
+      create: () => jsonResponse(202, { run_id: "run-failed", status: "started" }),
+      status: (stops) => (stops > 0 ? { status: "failed", error: "boom" } : { status: "running" }),
+    });
+    setTimeout(() => abort.abort(), 300);
+
+    const result = await runToCompletion(execute(ctx));
+
+    expect(result.errorCode).not.toBe("hermes_gateway_cancelled");
+    expect(result.exitCode).not.toBe(0);
+    expect(cancellation(result)).toBeUndefined();
   });
 });

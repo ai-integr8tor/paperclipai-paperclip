@@ -754,48 +754,88 @@ export function mapFinalResultForTest(input: {
   };
 }
 
+/** Aborts after `ms`. Timer-based so every gateway call made during a Stop stays bounded. */
+function deadlineSignal(ms: number): { signal: AbortSignal; clear: () => void } {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error(`deadline of ${ms}ms exceeded`)), Math.max(0, ms));
+  return { signal: controller.signal, clear: () => clearTimeout(timer) };
+}
+
 async function stopRun(input: {
   ctx: AdapterExecutionContext;
   baseUrl: URL;
   headers: Record<string, string>;
   runId: string;
+  deadlineAt: number;
   redactText?: TextRedactor;
 }): Promise<Record<string, unknown> | null> {
+  const bound = deadlineSignal(input.deadlineAt - Date.now());
   try {
     const stopped = await fetchJson(apiUrl(input.baseUrl, `/v1/runs/${encodeURIComponent(input.runId)}/stop`), {
       method: "POST",
       headers: input.headers,
+      signal: bound.signal,
     });
     await input.ctx.onLog("stdout", `[hermes-gateway] stop requested for run ${input.runId}\n`);
     return asRecord(stopped);
   } catch (err) {
     await input.ctx.onLog("stderr", `[hermes-gateway] stop request failed: ${redactErrorMessage(err, input.redactText)}\n`);
     return null;
+  } finally {
+    bound.clear();
   }
 }
 
+/**
+ * Polls until a terminal status or the deadline. A failed GET is not a verdict:
+ * Hermes may still report the terminal status before the deadline.
+ */
 async function fetchFinalStatus(input: {
   baseUrl: URL;
   headers: Record<string, string>;
   runId: string;
-  deadlineMs: number;
+  deadlineAt: number;
 }): Promise<Record<string, unknown> | null> {
-  const deadline = Date.now() + input.deadlineMs;
-  while (Date.now() < deadline) {
+  while (Date.now() < input.deadlineAt) {
+    const bound = deadlineSignal(input.deadlineAt - Date.now());
     try {
       const status = await fetchJson(apiUrl(input.baseUrl, `/v1/runs/${encodeURIComponent(input.runId)}`), {
         method: "GET",
         headers: input.headers,
+        signal: bound.signal,
       });
-      const record = asRecord(status);
       const normalized = extractStatus(status);
-      if (normalized && TERMINAL_STATUSES.has(normalized)) return record;
+      if (normalized && TERMINAL_STATUSES.has(normalized)) return asRecord(status);
     } catch {
-      return null;
+      // Transient: keep polling until the deadline.
+    } finally {
+      bound.clear();
     }
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await delay(Math.min(500, Math.max(0, input.deadlineAt - Date.now())));
   }
   return null;
+}
+
+/**
+ * Sends /stop and waits for the terminal receipt under one shared budget, so a
+ * gateway that accepts the connection but never answers cannot hold the run open.
+ */
+async function stopAndVerify(input: {
+  ctx: AdapterExecutionContext;
+  baseUrl: URL;
+  headers: Record<string, string>;
+  runId: string;
+  redactText?: TextRedactor;
+}): Promise<{ stopResponse: Record<string, unknown> | null; finalStatus: Record<string, unknown> | null }> {
+  const deadlineAt = Date.now() + STOP_GRACE_MS;
+  const stopResponse = await stopRun({ ...input, deadlineAt });
+  const finalStatus = await fetchFinalStatus({
+    baseUrl: input.baseUrl,
+    headers: input.headers,
+    runId: input.runId,
+    deadlineAt,
+  });
+  return { stopResponse, finalStatus };
 }
 
 function redactErrorMessage(err: unknown, redactText: TextRedactor = sanitizeSensitiveText): string {
@@ -1180,10 +1220,32 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // Propagate the Stop to the same native run, then require a terminal status
     // as the receipt: a stop request that was merely sent proves nothing.
     await ctx.onLog("stdout", `[hermes-gateway] paperclip cancellation, stopping hermes_run=${runId} paperclip_run=${ctx.runId}\n`);
-    const stopResponse = await stopRun({ ctx, baseUrl, headers: eventHeaders, runId, redactText });
-    const finalStatus = await fetchFinalStatus({ baseUrl, headers: eventHeaders, runId, deadlineMs: STOP_GRACE_MS });
+    const { stopResponse, finalStatus } = await stopAndVerify({ ctx, baseUrl, headers: eventHeaders, runId, redactText });
     const finalNormalized = extractStatus(finalStatus);
-    const acknowledged = Boolean(finalNormalized && TERMINAL_STATUSES.has(finalNormalized));
+    if (finalNormalized && TERMINAL_STATUSES.has(finalNormalized) && !CANCELLED_STATUSES.has(finalNormalized)) {
+      // The run finished on its own while the Stop was in flight: keep its real
+      // outcome instead of recording a success or failure as a cancellation.
+      await ctx.onLog(
+        "stdout",
+        `[hermes-gateway] run finished before stop took effect hermes_run=${runId} final_status=${finalNormalized}\n`,
+      );
+      const finishedResult = mapFinalResultForTest({
+        terminal: { runId, status: finalNormalized, payload: finalStatus, output: extractOutput(finalStatus) },
+        outputChunks: state.outputChunks,
+        sessionKey,
+        strategy,
+        redactText,
+      });
+      return {
+        ...finishedResult,
+        resultJson: {
+          ...(finishedResult.resultJson ?? {}),
+          stop_requested: stopResponse !== null,
+          hermesDispatch: dispatchEvidence,
+        },
+      };
+    }
+    const acknowledged = Boolean(finalNormalized && CANCELLED_STATUSES.has(finalNormalized));
     await ctx.onLog(
       acknowledged ? "stdout" : "stderr",
       `[hermes-gateway] stop ${acknowledged ? "confirmed" : "NOT confirmed"} hermes_run=${runId} final_status=${finalNormalized ?? "unknown"}\n`,
@@ -1205,8 +1267,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
 
   if (outcome === "timeout") {
-    await stopRun({ ctx, baseUrl, headers: eventHeaders, runId, redactText });
-    const finalStatus = await fetchFinalStatus({ baseUrl, headers: eventHeaders, runId, deadlineMs: STOP_GRACE_MS });
+    const { finalStatus } = await stopAndVerify({ ctx, baseUrl, headers: eventHeaders, runId, redactText });
     return {
       exitCode: 1,
       signal: null,
