@@ -11667,10 +11667,11 @@ describeEmbeddedPostgres("tool access service", () => {
   });
 
   it.each([
-    { sharedWith: "nothing", kept: false },
-    { sharedWith: "the organization slot", kept: true },
-    { sharedWith: "a managed-agent profile", kept: true },
-  ])("replaces a legacy company-scoped personal credential on reconnect when the old secret is shared with $sharedWith", async ({ sharedWith, kept }) => {
+    { oldSecret: "is used only by the personal grant", kept: false },
+    { oldSecret: "is also in the organization slot", kept: true },
+    { oldSecret: "is also used by a managed-agent profile", kept: true },
+    { oldSecret: "is stored outside Paperclip", kept: true },
+  ])("replaces a legacy company-scoped personal credential on reconnect when the old secret $oldSecret", async ({ oldSecret, kept }) => {
     const company = await createCompany(db);
     const service = createTestToolAccessService(db);
     mockToolsList([{ name: "search_memories", annotations: { readOnlyHint: true } }]);
@@ -11690,9 +11691,13 @@ describeEmbeddedPostgres("tool access service", () => {
     const [row] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
     await db.update(toolConnections).set({
       credentialRefs: row!.credentialRefs.map((ref) => ({ ...ref, secretId: legacy.id })),
-      credentialSecretRefs: sharedWith === "the organization slot" ? [{ ...grantRef!, secretId: legacy.id }] : [],
+      credentialSecretRefs: oldSecret === "is also in the organization slot" ? [{ ...grantRef!, secretId: legacy.id }] : [],
     }).where(eq(toolConnections.id, connected.connectionId));
-    if (sharedWith === "a managed-agent profile") {
+    if (oldSecret === "is stored outside Paperclip") {
+      // A provider delete cannot roll back with the ref swap, so reconnect keeps it.
+      await db.update(companySecrets).set({ provider: "aws_secrets_manager" }).where(eq(companySecrets.id, legacy.id));
+    }
+    if (oldSecret === "is also used by a managed-agent profile") {
       await db.insert(managedAgentProfiles).values({
         companyId: company.id, profileKey: `legacy-${randomUUID()}`, displayName: "Legacy profile",
         anthropicAgentId: "agent", agentVersion: "1", environmentId: "env", apiKeySecretId: legacy.id,

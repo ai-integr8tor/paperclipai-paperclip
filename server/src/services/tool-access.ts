@@ -14175,6 +14175,9 @@ export function toolAccessService(
    * The replaced secrets a reconnect may revoke. `classifyConnectionSecrets`
    * only looks at other consumers, so first keep any secret this connection
    * will still reference: the refs being committed and its other grants' refs.
+   * Only `local_encrypted` values qualify: reconnect revokes inside its ref-swap
+   * transaction, and only a value stored in Paperclip's database rolls back
+   * with it. Connection-owned secrets are always created that way.
    */
   async function replacedSecretsToRevoke(
     connection: typeof toolConnections.$inferSelect,
@@ -14200,7 +14203,18 @@ export function toolAccessService(
       connection,
       secretIds.filter((id) => !stillReferenced.has(id)),
     );
-    return owned;
+    if (owned.length === 0) return [];
+    const localRows = await db
+      .select({ id: companySecrets.id })
+      .from(companySecrets)
+      .where(
+        and(
+          eq(companySecrets.companyId, connection.companyId),
+          inArray(companySecrets.id, owned),
+          eq(companySecrets.provider, "local_encrypted"),
+        ),
+      );
+    return localRows.map((row) => row.id);
   }
 
   async function startOAuth(
