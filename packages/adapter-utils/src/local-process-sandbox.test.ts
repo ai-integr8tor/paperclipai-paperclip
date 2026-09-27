@@ -17,6 +17,7 @@ import {
   type SandboxNetworkProxyStopped,
   type SandboxNetworkTunnelClosed,
 } from "./local-process-sandbox.js";
+import { createSandboxNetworkEventChannel } from "./sandbox-network-event-channel.js";
 import { runChildProcess } from "./server-utils.js";
 
 const cleanup: string[] = [];
@@ -385,6 +386,7 @@ describe("local process sandbox", () => {
       allowCount: 1,
       denyCount: 2,
       sinkErrorCount: 0,
+      droppedEventCount: 0,
     }]);
   });
 
@@ -842,6 +844,7 @@ describe("local process sandbox", () => {
       allowCount: 0,
       denyCount: 0,
       sinkErrorCount: 0,
+      droppedEventCount: 0,
     }]);
   });
 
@@ -898,6 +901,124 @@ describe("local process sandbox", () => {
     expect(stopped[0].sinkErrorCount).toBe(events.length - 1);
     expect(stopped[0].sinkErrorCount).toBeGreaterThanOrEqual(1);
   });
+
+  it.runIf(process.platform === "linux")("bounds the write queue and still delivers the closing record with a drop count", async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-network-queue-"));
+    cleanup.push(workspace);
+    const events: SandboxNetworkEvent[] = [];
+    const target = await buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath,
+      args: ["-e", "process.exit(0)"],
+      cwd: workspace,
+      options: {
+        workspaceDir: workspace,
+        networkScope: "allowlist",
+        networkAllowlist: ["api.openai.com"],
+        // A sink that accepts writes and never settles them: the shape of a saturated or wedged
+        // store, which is the only shape under which the backlog matters. Arrival is one socket write
+        // per denial and the drain is one transaction at a time, so an unbounded queue grows without
+        // limit and — worse — starves `proxy.stopped`, the record carrying the only authoritative
+        // totals, behind it.
+        onNetworkDecision: (event) => {
+          events.push(event);
+          return new Promise<void>(() => {});
+        },
+      },
+    });
+    const socketPath = proxySocketPath(target.args);
+    // Comfortably past SINK_MAX_OUTSTANDING_WRITES (256) so the cap is exercised rather than approached.
+    const denialCount = 320;
+
+    try {
+      for (let index = 0; index < denialCount; index += 1) {
+        await connectThroughProxy(socketPath, `denied-${index}.example:443`);
+      }
+    } finally {
+      await target.cleanup?.();
+    }
+
+    const stopped = stoppedEvents(events);
+    // The observer is called in-process, so this asserts the cap does not suppress the closing record
+    // itself — not that it persisted. Persistence past a backlog is the chained-channel property, and
+    // it is the next test that measures it.
+    expect(stopped).toHaveLength(1);
+    // The aggregate is intact even though individual records were dropped — counted before the cap.
+    expect(stopped[0].denyCount).toBe(denialCount);
+    expect(stopped[0].allowCount).toBe(0);
+    // A reader can quantify its own undercount instead of silently having one.
+    expect(stopped[0].droppedEventCount).toBeGreaterThan(0);
+    const delivered = decisionEvents(events);
+    expect(delivered.length + stopped[0].droppedEventCount).toBe(denialCount);
+    // Bounded heap, not just a bounded counter: the events handed to the sink never exceeded the cap.
+    expect(delivered.length).toBeLessThanOrEqual(256);
+    // A wedged sink is not an error-reporting sink: nothing rejected, which is exactly why
+    // sinkErrorCount cannot cover this loss and a separate counter has to.
+    expect(stopped[0].sinkErrorCount).toBe(0);
+  }, 30_000);
+
+  it.runIf(process.platform === "linux")("persists the closing record through the real channel under a flood", async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-network-flood-"));
+    cleanup.push(workspace);
+    // Every event the host store actually received, in the order it received it.
+    const persisted: string[] = [];
+    // The production wiring, not a stand-in: one chained write at a time, each costing a few
+    // milliseconds the way a store transaction does. This is where `proxy.stopped` was starved — it
+    // queues behind the backlog, so an unbounded backlog means the totals never land and a reader
+    // cannot tell a truncated stream from a finished one.
+    const channel = createSandboxNetworkEventChannel({
+      identity: { runId: "run-1", agentId: "agent-1", companyId: "company-1" },
+      onEvent: async (event) => {
+        await new Promise<void>((resolve) => { setTimeout(resolve, 3); });
+        persisted.push(event.eventType);
+      },
+    });
+    // Writes handed to the channel but not yet settled — the queue the cap bounds. Measured, because
+    // the cap bounds *depth* and not throughput: slots free as writes settle, so more events legally
+    // pass through over a run than the queue ever holds at once.
+    let outstanding = 0;
+    let maxOutstanding = 0;
+    const target = await buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath,
+      args: ["-e", "process.exit(0)"],
+      cwd: workspace,
+      options: {
+        workspaceDir: workspace,
+        networkScope: "allowlist",
+        networkAllowlist: ["api.openai.com"],
+        onNetworkDecision: (event) => {
+          // A dropped event never reaches here: the sink applies the cap before calling the observer.
+          const result = channel(event);
+          outstanding += 1;
+          maxOutstanding = Math.max(maxOutstanding, outstanding);
+          void Promise.resolve(result).then(
+            () => { outstanding -= 1; },
+            () => { outstanding -= 1; },
+          );
+          return result;
+        },
+      },
+    });
+    const socketPath = proxySocketPath(target.args);
+    const denialCount = 320;
+
+    try {
+      for (let index = 0; index < denialCount; index += 1) {
+        await connectThroughProxy(socketPath, `denied-${index}.example:443`);
+      }
+    } finally {
+      await target.cleanup?.();
+    }
+
+    // The end-of-stream marker reached the store, and it is last — which is the whole reason a reader
+    // can treat its absence as abnormal termination rather than as a slow sink.
+    expect(persisted.at(-1)).toBe("sandbox.network.proxy.stopped");
+    expect(persisted[0]).toBe("sandbox.network.proxy.started");
+    expect(persisted.filter((eventType) => eventType === "sandbox.network.decision").length)
+      .toBeGreaterThan(0);
+    // The queue in front of the one-at-a-time drain never grew past the cap, so the marker was never
+    // more than that many writes from the front. This is the assertion that fails without the cap.
+    expect(maxOutstanding).toBeLessThanOrEqual(256);
+  }, 30_000);
 
   it.runIf(process.platform === "linux")("bounds and scrubs an oversized non-numeric CONNECT port", async () => {
     const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-network-port-"));

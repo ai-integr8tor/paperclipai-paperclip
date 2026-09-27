@@ -32,6 +32,17 @@ import type { AdapterExecutionContext, AdapterRuntimeEvent } from "./types.js";
  * `proxy.stopped` — the end-of-stream marker — could land before the events it closes. The chain is
  * FIFO and survives a failed write: one broken call must not reorder everything after it.
  *
+ * The chain carries a second guarantee that is not about ordering and is easy to optimise away: it
+ * holds **at most one outstanding store write per sandbox**, so a confined run's egress stream costs
+ * one pool connection no matter how fast the child issues requests. Parallelising these writes would
+ * lose the ordering *and* let one flooding run exhaust the pool for every other run in the host
+ * process. Both guarantees come from the same `then`; the cost of an event is accepted on that basis
+ * (TEA-189 J2), so keep it.
+ *
+ * The queue in front of the chain is bounded by the sink, not here — see
+ * `SINK_MAX_OUTSTANDING_WRITES` and `proxy.stopped.droppedEventCount`. An unbounded queue against a
+ * one-at-a-time drain is how the end-of-stream marker gets starved.
+ *
  * ## Failure accounting
  *
  * The returned promise is handed back to the proxy's sink, which counts its rejection into
@@ -48,6 +59,11 @@ export interface SandboxNetworkEventChannelOptions {
   /**
    * Used once, to report that no run-event channel exists — never to carry an event. Writing the
    * events here instead would restore both the forgery and the suppression path above.
+   *
+   * This warning is a courtesy to whoever reads the log, and **not** a control: it goes out on the
+   * child's own log stream, so the confined process can forge it or bury it with exactly the trick
+   * C-1 removes from the event path. The control for a missing channel is the absent
+   * `proxy.started` that downstream liveness keys on — never this line.
    */
   onLog?: AdapterExecutionContext["onLog"];
 }
@@ -101,6 +117,9 @@ export function createSandboxNetworkEventChannel(
       // layer's judgement over the whole stream, not a property of one record.
       level: "info",
       message: describeEvent(event),
+      // Identity spreads *last*, and that order is load-bearing: a future event field named `runId`,
+      // `agentId` or `companyId` must not be able to displace the host-stamped identity on a security
+      // record. Reversing these two spreads would let the emitter overwrite who the event is about.
       payload: { ...event, ...identity },
     };
     const write = chain.then(() => onEvent(runtimeEvent));

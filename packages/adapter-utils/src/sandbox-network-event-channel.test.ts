@@ -220,6 +220,7 @@ describe("sandbox network event channel", () => {
         allowCount: 1,
         denyCount: 2,
         sinkErrorCount: 0,
+        droppedEventCount: 0,
       },
     ];
 

@@ -39,6 +39,10 @@ export interface LocalProcessSandboxPathAlias {
  * {@link SandboxNetworkDecision.targetSanitized} array. That is a removal, so it bumps — a reader
  * still asking for the old booleans gets `undefined`, which is falsy, which would have read as
  * "nothing was sanitized" on exactly the events that were.
+ *
+ * {@link SandboxNetworkProxyStopped.droppedEventCount} arrived after that and did *not* bump: it is
+ * an addition, and a reader that ignores it reads every other field correctly. Its own absence is
+ * still informative — see that field.
  */
 export const SANDBOX_NETWORK_EVENT_SCHEMA_VERSION = 2;
 
@@ -162,6 +166,15 @@ export interface SandboxNetworkProxyStopped extends SandboxNetworkEventEnvelope 
    * a failing sink cannot report its own failure in real time.
    */
   sinkErrorCount: number;
+  /**
+   * Events the sink refused to hand the observer because {@link SINK_MAX_OUTSTANDING_WRITES} writes
+   * were already outstanding. Non-zero means individual records are missing from the stream — but
+   * `allowCount` and `denyCount` are counted before the cap applies, so the totals on this event stay
+   * authoritative and a reader can quantify its own undercount instead of silently having one.
+   *
+   * `sinkErrorCount` cannot cover this: a write that was never issued never rejects.
+   */
+  droppedEventCount: number;
 }
 
 /**
@@ -568,7 +581,12 @@ type SandboxNetworkEventInput = SandboxNetworkEvent extends infer Event
 
 interface SandboxNetworkEventSink {
   emit: (event: SandboxNetworkEventInput) => void;
-  counters: () => { allowCount: number; denyCount: number; sinkErrorCount: number };
+  counters: () => {
+    allowCount: number;
+    denyCount: number;
+    sinkErrorCount: number;
+    droppedEventCount: number;
+  };
   /**
    * Settles once every observer write issued so far has settled, or once the budget expires.
    * Teardown calls this before reading the counters, so `sinkErrorCount` is the real tally rather
@@ -582,6 +600,39 @@ interface SandboxNetworkEventSink {
  * not hold it open: it is an observability dependency and never a gate on the sandbox shutting down.
  */
 const SINK_DRAIN_TIMEOUT_MS = 1_000;
+
+/**
+ * Ceiling on observer writes in flight at once. Arrival is the confined process's rate — a denied
+ * CONNECT costs it one socket write and no round trip — while the drain is one store transaction at a
+ * time, so the queue between them is the asymmetry. Unbounded, that queue is a heap growth path in the
+ * process hosting every run, and worse: teardown's drain budget expires, `proxy.stopped` queues behind
+ * the remaining backlog, and the one record carrying the authoritative allow/deny/sinkError totals
+ * never persists. A reader then cannot tell "stream ended" from "stream truncated".
+ *
+ * Chosen to bound heap rather than to tune throughput: an event serializes to a few hundred bytes, so
+ * this is tens of kilobytes per sandbox, and a healthy sink never reaches it because the chain drains
+ * far faster than a run generates requests. A run that does reach it is a flood, which is itself the
+ * finding — recorded as `droppedEventCount` on `proxy.stopped` rather than inferred from a gap.
+ *
+ * Lifecycle events bypass the cap: see {@link UNDROPPABLE_SANDBOX_NETWORK_EVENTS}.
+ */
+const SINK_MAX_OUTSTANDING_WRITES = 256;
+
+/**
+ * The two events that bracket the stream are never dropped, whatever the backlog.
+ *
+ * `proxy.started` and `proxy.stopped` are what let a reader interpret everything between them:
+ * `started` distinguishes "no egress attempted" from "proxy never ran", and `stopped` carries the
+ * totals and is the end-of-stream marker. Dropping either converts a bounded, quantified loss into an
+ * unreadable stream. Reserving capacity for them is also what makes the cap sufficient rather than
+ * merely bounded — it is why `proxy.stopped` clears teardown's first drain instead of queueing behind
+ * a backlog. The alternative, emitting `proxy.stopped` ahead of the queue, would trade away the FIFO
+ * ordering the whole chain exists to provide.
+ */
+const UNDROPPABLE_SANDBOX_NETWORK_EVENTS: ReadonlySet<string> = new Set([
+  "sandbox.network.proxy.started",
+  "sandbox.network.proxy.stopped",
+]);
 
 function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
   return (
@@ -627,14 +678,25 @@ function createNetworkEventSink(
   let allowCount = 0;
   let denyCount = 0;
   let sinkErrorCount = 0;
+  let droppedEventCount = 0;
   const inflight = new Set<Promise<void>>();
   return {
     emit: (event) => {
+      // Counted before the cap, and deliberately: an event the cap drops still happened, so the
+      // totals reported at teardown stay correct while `droppedEventCount` says how many individual
+      // records are missing. Losing the aggregate as well would make the drop undetectable.
       if (event.event === "sandbox.network.decision") {
         if (event.decision === "allow") allowCount += 1;
         else denyCount += 1;
       }
       if (!onNetworkDecision) return;
+      if (
+        inflight.size >= SINK_MAX_OUTSTANDING_WRITES &&
+        !UNDROPPABLE_SANDBOX_NETWORK_EVENTS.has(event.event)
+      ) {
+        droppedEventCount += 1;
+        return;
+      }
       let result: unknown;
       try {
         // Envelope is stamped here and only here. An emit site cannot forget the version, and a
@@ -665,7 +727,7 @@ function createNetworkEventSink(
         inflight.delete(settled);
       });
     },
-    counters: () => ({ allowCount, denyCount, sinkErrorCount }),
+    counters: () => ({ allowCount, denyCount, sinkErrorCount, droppedEventCount }),
     drain: async () => {
       const outstanding = Array.from(inflight);
       if (outstanding.length === 0) return;
