@@ -3364,8 +3364,13 @@ export function agentRoutes(
         const result = await testManagedEnvironment(adapterType, { companyId, adapterType, config: managed.config, executionTarget: target.executionTarget, environmentName: target.environmentName }, binding);
         const failing = result.checks.filter(check => check.level === "error" || check.code === ADAPTER_AUTH_MISSING_CHECK_CODE);
         if (result.status === "fail" || failing.some(check => check.code === ADAPTER_AUTH_MISSING_CHECK_CODE)) {
-          const connectionFailure = failing.some(check => check.code === ADAPTER_AUTH_MISSING_CHECK_CODE || check.code.startsWith("ai_connection_"));
+          // The wording follows the first failing check. testManagedEnvironment
+          // appends its own rollup code behind the real cause, and that trailing
+          // code must not restate a settled verdict. Missing adapter auth is the
+          // one exception: it names the connection even when a descriptive check
+          // precedes it.
           const cause = failing[0];
+          const connectionFailure = failing.some(check => check.code === ADAPTER_AUTH_MISSING_CHECK_CODE) || Boolean(cause?.code.startsWith("ai_connection_"));
           const detail = cause ? ` ${cause.code}: ${cause.message.trim().replace(/\.$/, "")}.` : "";
           throw unprocessable(
             connectionFailure
