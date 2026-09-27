@@ -34,8 +34,27 @@ export interface LocalProcessSandboxPathAlias {
  * live while every decision line silently failed its reader's field access — deny alerting goes
  * quiet, and that is byte-indistinguishable from a quiet, healthy fleet. A version on the line lets
  * a reader alert on "I cannot read this" instead of skipping it.
+ *
+ * `2` replaced the `hostnameSanitized` / `portSanitized` booleans with the single
+ * {@link SandboxNetworkDecision.targetSanitized} array. That is a removal, so it bumps — a reader
+ * still asking for the old booleans gets `undefined`, which is falsy, which would have read as
+ * "nothing was sanitized" on exactly the events that were.
  */
-export const SANDBOX_NETWORK_EVENT_SCHEMA_VERSION = 1;
+export const SANDBOX_NETWORK_EVENT_SCHEMA_VERSION = 2;
+
+/**
+ * Component of the request target that {@link boundAndScrubEventField} altered on its way onto an
+ * event. A closed literal set on purpose: the flag exists to cap log amplification, so no member of
+ * it may be derived from request bytes.
+ *
+ * A single boolean was the obvious shape and is the wrong one. Downstream alerting partitions events
+ * into "the hostname is a real name, key on it" and "the hostname is mangled, count it instead"; a
+ * flag that answers "was *anything* sanitized" cannot express that, and collapsing to it routes a
+ * port-only or scheme-only sanitization into the mangled-hostname bucket — which carries no hostname
+ * keys by design, so a probe across many valid hostnames stops being distinguishable from one host.
+ * The target is attacker-chosen, so that would hand the attacker the partition that classifies them.
+ */
+export type SandboxNetworkTargetField = "hostname" | "port" | "scheme";
 
 /** Fields stamped on every `sandbox.network.*` event by the sink, never by an emit site. */
 export interface SandboxNetworkEventEnvelope {
@@ -69,8 +88,9 @@ export interface SandboxNetworkDecision extends SandboxNetworkEventEnvelope {
    * Hostname normalized by the same helper the policy check uses, so the event and the decision
    * cannot disagree. Null only when the request URL could not be parsed at all.
    *
-   * Byte-equal to the string the policy check compared whenever `hostnameSanitized` is false. When
-   * that flag is true this is a bounded, charset-scrubbed rendering of that input instead.
+   * Byte-equal to the string the policy check compared whenever `targetSanitized` omits
+   * `"hostname"`. When it contains `"hostname"` this is a bounded, charset-scrubbed rendering of that
+   * input instead, and is not a name — it must not be used as an aggregation key.
    */
   hostname: string | null;
   /**
@@ -81,13 +101,26 @@ export interface SandboxNetworkDecision extends SandboxNetworkEventEnvelope {
   port: string | null;
   /** Literal "CONNECT" on the tunnel path; the client's method on the plain HTTP path. */
   method: string | null;
-  /** Null on the CONNECT path: the proxy does not terminate TLS and must not infer a scheme. */
+  /**
+   * Null on the CONNECT path: the proxy does not terminate TLS and must not infer a scheme. On the
+   * HTTP path, bounded to {@link EVENT_SCHEME_MAX_BYTES}. The WHATWG parser already constrains the
+   * charset, so no path, query, credential or fragment byte can reach here — but it does not
+   * constrain the *length*, so a 16 KB scheme parses and would otherwise land in the audit trail once
+   * per request with no throttle. Charset-clean is not the same guarantee as bounded.
+   */
   scheme: string | null;
-  /** True when `hostname` was truncated or charset-scrubbed, so a reader never trusts a mangled name. */
-  hostnameSanitized: boolean;
-  /** True when `port` was truncated or charset-scrubbed. Only reachable on the malformed branch. */
-  portSanitized: boolean;
-  /** True when `method` was truncated or charset-scrubbed. See the scrub note on {@link describeEventMethod}. */
+  /**
+   * Which components of the target {@link boundAndScrubEventField} altered, in a fixed order; `[]`
+   * when the target is verbatim. Affirmatively `[]` rather than omitted, so a reviewer can tell
+   * "verbatim" from "emitted by a build that did not report this".
+   */
+  targetSanitized: readonly SandboxNetworkTargetField[];
+  /**
+   * True when `method` was truncated or charset-scrubbed. See the scrub note on
+   * {@link describeEventMethod}. Stays a separate boolean rather than joining `targetSanitized`: the
+   * method is not part of the target, and folding it in would make "the target is trustworthy" false
+   * for a reason that says nothing about the target.
+   */
   methodSanitized: boolean;
   /** Correlates a CONNECT decision with its `sandbox.network.tunnel.closed` event. Null off that path. */
   tunnelId: string | null;
@@ -145,8 +178,14 @@ export interface SandboxNetworkTunnelClosed extends SandboxNetworkEventEnvelope 
   /** Bytes the upstream returned. */
   bytesIn: number;
   durationMs: number;
-  /** Mirrors the decision event's flag for the same field. A tunnel only opens on a numeric port. */
-  portSanitized: boolean;
+  /**
+   * Mirrors the decision event's field, carried forward from the CONNECT that opened this tunnel so
+   * the two records cannot disagree. A tunnel only opens on a hostname that matched a rule and a port
+   * that passed the range check, so in practice this is `[]`; it is still emitted, because a reader
+   * must not have to know that invariant to trust `hostname` as a key. `"scheme"` cannot appear — the
+   * proxy tunnels CONNECT opaquely and never infers one.
+   */
+  targetSanitized: readonly SandboxNetworkTargetField[];
   /**
    * True when teardown flushed this tunnel because it was still open, rather than the client closing
    * it. Absence of a `tunnel.closed` has no complement the way a missing `proxy.stopped` does — it
@@ -216,7 +255,7 @@ interface LiveTunnel {
   openedAt: number;
   hostname: string | null;
   port: string | null;
-  portSanitized: boolean;
+  targetSanitized: readonly SandboxNetworkTargetField[];
 }
 
 const SYSTEM_READ_PATHS = [
@@ -360,6 +399,14 @@ const EVENT_HOSTNAME_DISALLOWED = /[^a-z0-9.\-:]/g;
  */
 const EVENT_PORT_MAX_BYTES = 8;
 const EVENT_PORT_DISALLOWED = /[^0-9]/g;
+/**
+ * The longest scheme anyone routes through a proxy is five bytes (`https`); 16 is generous and still
+ * a bound. The WHATWG parser accepts a scheme of any length, so this cap — not the charset — is what
+ * stops a 16 KB one being written to the audit trail once per request.
+ */
+const EVENT_SCHEME_MAX_BYTES = 16;
+/** The WHATWG scheme charset. Re-asserted locally so the bound does not depend on the parser's. */
+const EVENT_SCHEME_DISALLOWED = /[^a-zA-Z0-9+.\-]/g;
 /** Comfortably past the longest verb in llhttp's table (`UNSUBSCRIBE`), short enough to stay a bound. */
 const EVENT_METHOD_MAX_BYTES = 24;
 /** `-` is permitted for `M-SEARCH`. Nothing else: a method is a token, never free text. */
@@ -389,35 +436,50 @@ function boundAndScrubEventField(raw: string, maxBytes: number, disallowed: RegE
   return { value: scrubbed, sanitized };
 }
 
-interface EventHostname {
+interface EventTargetDescription {
   hostname: string | null;
-  hostnameSanitized: boolean;
-}
-
-/** Normalizes with the policy helper first, so an unsanitized hostname is byte-equal to the compared one. */
-function describeEventHostname(rawHostname: string | null): EventHostname {
-  if (!rawHostname) return { hostname: null, hostnameSanitized: false };
-  const bounded = boundAndScrubEventField(
-    normalizeNetworkHostname(rawHostname),
-    EVENT_HOSTNAME_MAX_BYTES,
-    EVENT_HOSTNAME_DISALLOWED,
-  );
-  return { hostname: bounded.value, hostnameSanitized: bounded.sanitized };
-}
-
-interface EventPort {
   port: string | null;
-  portSanitized: boolean;
+  scheme: string | null;
+  targetSanitized: readonly SandboxNetworkTargetField[];
 }
 
 /**
- * The malformed-`CONNECT` branch reaches this having failed `/^\d+$/` by definition, so `port` there
- * is up to `maxHeaderSize` (16 KB) of attacker-chosen request-line bytes at request rate.
+ * Bounds every component of the request target and reports which ones it had to alter.
+ *
+ * One function rather than one per field, so the flag and the values are produced together: a fourth
+ * target component added later cannot reach an event unbounded by being forgotten at an emit site,
+ * because there is no emit site that assembles these itself.
+ *
+ * Each component needs this for a different reason. `hostname` is normalized by the policy helper
+ * first, so an unsanitized one is byte-equal to the string the decision compared. `port` on the
+ * malformed-`CONNECT` branch has failed `/^\d+$/` by definition, so it is up to `maxHeaderSize`
+ * (16 KB) of attacker-chosen request-line bytes. `scheme` comes from a parser that constrains its
+ * charset but not its length, so it is charset-clean and still unbounded.
  */
-function describeEventPort(rawPort: string | null): EventPort {
-  if (!rawPort) return { port: null, portSanitized: false };
-  const bounded = boundAndScrubEventField(rawPort, EVENT_PORT_MAX_BYTES, EVENT_PORT_DISALLOWED);
-  return { port: bounded.value, portSanitized: bounded.sanitized };
+function describeEventTarget(raw: {
+  hostname: string | null;
+  port: string | null;
+  scheme: string | null;
+}): EventTargetDescription {
+  // Appended in the declared order of SandboxNetworkTargetField, which is what makes the emitted
+  // array sorted without a sort — two events sanitized the same way compare byte-for-byte.
+  const targetSanitized: SandboxNetworkTargetField[] = [];
+  const hostname = raw.hostname
+    ? boundAndScrubEventField(normalizeNetworkHostname(raw.hostname), EVENT_HOSTNAME_MAX_BYTES, EVENT_HOSTNAME_DISALLOWED)
+    : null;
+  if (hostname?.sanitized) targetSanitized.push("hostname");
+  const port = raw.port ? boundAndScrubEventField(raw.port, EVENT_PORT_MAX_BYTES, EVENT_PORT_DISALLOWED) : null;
+  if (port?.sanitized) targetSanitized.push("port");
+  const scheme = raw.scheme
+    ? boundAndScrubEventField(raw.scheme, EVENT_SCHEME_MAX_BYTES, EVENT_SCHEME_DISALLOWED)
+    : null;
+  if (scheme?.sanitized) targetSanitized.push("scheme");
+  return {
+    hostname: hostname?.value ?? null,
+    port: port?.value ?? null,
+    scheme: scheme?.value ?? null,
+    targetSanitized,
+  };
 }
 
 interface EventMethod {
@@ -670,8 +732,7 @@ async function startNetworkAllowlistProxy(
         port: null,
         method,
         scheme: null,
-        hostnameSanitized: false,
-        portSanitized: false,
+        targetSanitized: [],
         methodSanitized,
         tunnelId: null,
       });
@@ -679,11 +740,14 @@ async function startNetworkAllowlistProxy(
       return;
     }
     const targetPort = target.port || (target.protocol === "https:" ? "443" : "80");
-    const { hostname, hostnameSanitized } = describeEventHostname(target.hostname);
-    // WHATWG URL already guarantees a numeric port here; routed through the same helper so the
-    // event record has exactly one bounding path rather than a trusted branch and an untrusted one.
-    const { port, portSanitized } = describeEventPort(targetPort);
-    const scheme = target.protocol.replace(/:$/, "");
+    // WHATWG URL already guarantees a numeric port and a charset-clean scheme here; both are routed
+    // through the same helper anyway, so the event record has exactly one bounding path rather than a
+    // trusted branch and an untrusted one — and the scheme's length was never guaranteed at all.
+    const { hostname, port, scheme, targetSanitized } = describeEventTarget({
+      hostname: target.hostname,
+      port: targetPort,
+      scheme: target.protocol.replace(/:$/, ""),
+    });
     if (target.protocol !== "http:") {
       sink.emit({
         event: "sandbox.network.decision",
@@ -693,8 +757,7 @@ async function startNetworkAllowlistProxy(
         port,
         method,
         scheme,
-        hostnameSanitized,
-        portSanitized,
+        targetSanitized,
         methodSanitized,
         tunnelId: null,
       });
@@ -711,8 +774,7 @@ async function startNetworkAllowlistProxy(
         port,
         method,
         scheme,
-        hostnameSanitized,
-        portSanitized,
+        targetSanitized,
         methodSanitized,
         tunnelId: null,
       });
@@ -727,8 +789,7 @@ async function startNetworkAllowlistProxy(
       port,
       method,
       scheme,
-      hostnameSanitized,
-      portSanitized,
+      targetSanitized,
       methodSanitized,
       tunnelId: null,
     });
@@ -767,7 +828,7 @@ async function startNetworkAllowlistProxy(
       tunnelId: tunnel.tunnelId,
       hostname: tunnel.hostname,
       port: tunnel.port,
-      portSanitized: tunnel.portSanitized,
+      targetSanitized: tunnel.targetSanitized,
       bytesOut,
       bytesIn,
       durationMs: Date.now() - tunnel.openedAt,
@@ -779,14 +840,13 @@ async function startNetworkAllowlistProxy(
     const hostname = separator > 0 ? normalizeNetworkHostname(request.url!.slice(0, separator)) : "";
     const port = separator > 0 ? request.url!.slice(separator + 1) : "443";
     // The proxy tunnels CONNECT opaquely, so the method is always the literal verb and the scheme is
-    // unknowable. Neither is ever inferred, so neither can have been sanitized.
+    // unknowable. Neither is ever inferred, so neither can have been sanitized — a null scheme yields
+    // no "scheme" entry in targetSanitized, which is why that member cannot appear on this path.
     const connectEvent = {
       event: "sandbox.network.decision",
       method: "CONNECT",
       methodSanitized: false,
-      scheme: null,
-      ...describeEventHostname(hostname),
-      ...describeEventPort(port || null),
+      ...describeEventTarget({ hostname, port: port || null, scheme: null }),
     } as const;
     // A hostname-only allowlist entry leaves the port unconstrained, so policy cannot reject an
     // out-of-range one — this test is the only thing between the request line and net.connect, which
@@ -828,7 +888,7 @@ async function startNetworkAllowlistProxy(
       openedAt: Date.now(),
       hostname: connectEvent.hostname,
       port: connectEvent.port,
-      portSanitized: connectEvent.portSanitized,
+      targetSanitized: connectEvent.targetSanitized,
     });
     // The validated number, not a second Number(port): the value that passed the range check is the
     // value that reaches the socket.

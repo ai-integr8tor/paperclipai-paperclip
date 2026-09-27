@@ -330,8 +330,7 @@ describe("local process sandbox", () => {
           port: String(address.port),
           method: "GET",
           scheme: "http",
-          hostnameSanitized: false,
-          portSanitized: false,
+          targetSanitized: [],
           methodSanitized: false,
           tunnelId: null,
         },
@@ -343,8 +342,7 @@ describe("local process sandbox", () => {
           port: "80",
           method: "GET",
           scheme: "http",
-          hostnameSanitized: false,
-          portSanitized: false,
+          targetSanitized: [],
           methodSanitized: false,
           tunnelId: null,
         },
@@ -356,8 +354,7 @@ describe("local process sandbox", () => {
           port: "443",
           method: "CONNECT",
           scheme: null,
-          hostnameSanitized: false,
-          portSanitized: false,
+          targetSanitized: [],
           methodSanitized: false,
           tunnelId: null,
         },
@@ -658,7 +655,7 @@ describe("local process sandbox", () => {
       expect(tunnels[0]).toMatchObject({
         hostname: "127.0.0.1",
         port: String(address.port),
-        portSanitized: false,
+        targetSanitized: [],
         // The client closed this one, so the flag distinguishes it from a tunnel teardown had to flush.
         closedAtTeardown: false,
       });
@@ -762,12 +759,12 @@ describe("local process sandbox", () => {
       expect(decisions).toHaveLength(3);
       // A 4KB request-line hostname is capped at the longest legal DNS name and flagged.
       expect(Buffer.byteLength(decisions[0].hostname ?? "")).toBe(253);
-      expect(decisions[0].hostnameSanitized).toBe(true);
+      expect(decisions[0].targetSanitized).toEqual(["hostname"]);
       // Anything outside [a-z0-9.\-:] is replaced, so a run log reader is never handed control bytes.
       expect(decisions[1].hostname).toBe("under?score.example");
-      expect(decisions[1].hostnameSanitized).toBe(true);
+      expect(decisions[1].targetSanitized).toEqual(["hostname"]);
       // The charset permits ":", or every IPv6 target would be falsely flagged.
-      expect(decisions[2]).toMatchObject({ hostname: "2001:db8::1", hostnameSanitized: false });
+      expect(decisions[2]).toMatchObject({ hostname: "2001:db8::1", targetSanitized: [] });
     } finally {
       await target.cleanup?.();
     }
@@ -803,7 +800,7 @@ describe("local process sandbox", () => {
         reason: "allowlist_match",
         hostname: "::1",
         port: "8443",
-        hostnameSanitized: false,
+        targetSanitized: [],
       });
     } finally {
       await target.cleanup?.();
@@ -931,8 +928,7 @@ describe("local process sandbox", () => {
         decision: "deny",
         reason: "invalid_connect_target",
         hostname: "example.com",
-        hostnameSanitized: false,
-        portSanitized: true,
+        targetSanitized: ["port"],
       });
       // Bounded and charset-clean: the audit trail must not amplify request bytes at request rate.
       expect(decisions[0].port).toBe("????????");
@@ -942,6 +938,68 @@ describe("local process sandbox", () => {
       expect(JSON.parse(serialized)).toEqual(decisions[0]);
       expect(serialized.length).toBeLessThan(400);
       expect(serialized).not.toContain("nnnn");
+    } finally {
+      await target.cleanup?.();
+    }
+  });
+
+  it.runIf(process.platform === "linux")("bounds an oversized scheme and names only the component it sanitized", async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-network-scheme-"));
+    cleanup.push(workspace);
+    const events: SandboxNetworkEvent[] = [];
+    const target = await buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath,
+      args: ["-e", "process.exit(0)"],
+      cwd: workspace,
+      options: {
+        workspaceDir: workspace,
+        networkScope: "allowlist",
+        networkAllowlist: ["api.openai.com"],
+        onNetworkDecision: (event) => events.push(event),
+      },
+    });
+    const socketPath = proxySocketPath(target.args);
+    // The WHATWG parser bounds a scheme's charset but not its length, so this parses cleanly and the
+    // whole 4 KB reaches the event. Charset-clean is not the same guarantee as bounded, which is why
+    // the no-request-content argument for this field did not also make it safe.
+    const oversizedScheme = "a".repeat(4096);
+    const requestUrl = `${oversizedScheme}://host.example/p?q=canary-query`;
+
+    try {
+      const response = await new Promise<{ raw: string }>((resolve, reject) => {
+        const socket = net.createConnection(socketPath, () => {
+          socket.end(`GET ${requestUrl} HTTP/1.1\r\nHost: host.example\r\n\r\n`);
+        });
+        let raw = "";
+        socket.setEncoding("utf8");
+        socket.on("data", (chunk) => { raw += chunk; });
+        socket.on("end", () => resolve({ raw }));
+        socket.on("error", reject);
+      });
+      // Egress behaviour is unchanged: a non-http scheme still gets the same https_requires_connect
+      // rejection it got before the field was bounded.
+      expect(response.raw).toContain("HTTP/1.1 400 Bad Request\r\n");
+      expect(response.raw).toContain(
+        '{"error":{"code":"https_requires_connect","message":"HTTPS targets must use CONNECT through the Paperclip sandbox proxy."}}\n',
+      );
+
+      const decisions = decisionEvents(events);
+      expect(decisions).toHaveLength(1);
+      // The assertion that matters is "hostname" being absent: downstream alerting keys its
+      // real-name/mangled-name partition on that member, so a flag that merely said "something was
+      // sanitized" would route a valid hostname into the bucket that carries no hostname keys.
+      expect(decisions[0].targetSanitized).toEqual(["scheme"]);
+      expect(decisions[0].targetSanitized).not.toContain("hostname");
+      expect(decisions[0].hostname).toBe("host.example");
+      expect(Buffer.byteLength(decisions[0].scheme ?? "")).toBeLessThanOrEqual(16);
+      expect(decisions[0].scheme).toBe("a".repeat(16));
+      // Bounded, and still carrying no request content — the parser's charset keeps the query out and
+      // the cap keeps the amplification out.
+      const serialized = JSON.stringify(decisions[0]);
+      expect(JSON.parse(serialized)).toEqual(decisions[0]);
+      expect(serialized.length).toBeLessThan(400);
+      expect(serialized).not.toContain("canary-query");
+      expect(serialized).not.toContain("aaaaaaaaaaaaaaaaa");
     } finally {
       await target.cleanup?.();
     }
