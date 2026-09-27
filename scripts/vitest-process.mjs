@@ -4,11 +4,13 @@ import { fileURLToPath } from "node:url";
 
 // The root workspace declares Vitest as a development dependency. Resolve its
 // installed CLI rather than spawning pnpm's platform-specific command shim.
-const vitestCli = path.join(
-  path.dirname(fileURLToPath(import.meta.resolve("vitest/package.json"))),
-  "vitest.mjs",
-);
+function installedVitestCli() {
+  return path.join(
+    path.dirname(fileURLToPath(import.meta.resolve("vitest/package.json"))),
+    "vitest.mjs",
+  );
+}
 
-export function spawnVitest(args, options) {
-  return spawnSync(process.execPath, [vitestCli, ...args], options);
+export function spawnVitest(args, options, cliPath = installedVitestCli()) {
+  return spawnSync(process.execPath, [cliPath, ...args], options);
 }
