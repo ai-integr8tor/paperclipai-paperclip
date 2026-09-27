@@ -14009,19 +14009,32 @@ export function toolAccessService(
     const credentialRefs: McpConnectionCredentialRef[] = [
       ...(connection.credentialRefs ?? []),
     ];
+    const replacedSecretIds: string[] = [];
 
     for (const field of providedFields) {
       const value = input.credentialValues[field.configPath]!.trim();
-      const existing = credentialSecretRefs.find(
+      const existingIndex = credentialSecretRefs.findIndex(
         (ref) => ref.configPath === field.configPath,
       );
+      const existing = existingIndex >= 0 ? credentialSecretRefs[existingIndex] : undefined;
       if (existing) {
-        await secrets.rotate(
-          existing.secretId,
-          { value },
-          actorForSecret(actor),
-        );
-        continue;
+        // Builds before personal key setup minted user-owned values attached a
+        // company-scoped secret to the user grant. The gateway never resolves
+        // that pairing, so rotating it in place would leave the connection
+        // broken. Replace it with a user-owned value instead.
+        const legacyPersonalValue =
+          personalIdentity &&
+          !(await isUserOwnedSecret(companyId, existing.secretId, personalIdentity.subjectUserId));
+        if (!legacyPersonalValue) {
+          await secrets.rotate(
+            existing.secretId,
+            { value },
+            actorForSecret(actor),
+          );
+          continue;
+        }
+        credentialSecretRefs.splice(existingIndex, 1);
+        replacedSecretIds.push(existing.secretId);
       }
       const metadata = {
         name: `${connection.name} ${field.label} ${randomUUID().slice(0, 8)}`,
@@ -14110,11 +14123,57 @@ export function toolAccessService(
       updated,
       personalIdentity ? credentialSecretRefs : [],
     );
+    await removeReplacedConnectionSecrets(updated, replacedSecretIds);
     const health = await checkConnectionHealth(updated.id, actor);
     const refresh = await refreshCatalog(updated.id, actor, {
       enableAllByDefault: true,
     });
     return { ...health, connection: refresh.connection };
+  }
+
+  /** True when `secretId` is a user-scoped value owned by `userId`. */
+  async function isUserOwnedSecret(companyId: string, secretId: string, userId: string) {
+    const [secret] = await db
+      .select({
+        scope: companySecrets.scope,
+        ownerUserId: companySecrets.ownerUserId,
+        userSecretDefinitionId: companySecrets.userSecretDefinitionId,
+      })
+      .from(companySecrets)
+      .where(and(eq(companySecrets.id, secretId), eq(companySecrets.companyId, companyId)))
+      .limit(1);
+    return secret?.scope === "user" && secret.ownerUserId === userId && secret.userSecretDefinitionId !== null;
+  }
+
+  /**
+   * Revoke credentials a reconnect replaced. `classifyConnectionSecrets` only
+   * looks at other consumers, so first keep any secret this connection still
+   * references through its own refs or another of its grants.
+   */
+  async function removeReplacedConnectionSecrets(
+    connection: typeof toolConnections.$inferSelect,
+    secretIds: string[],
+  ) {
+    if (secretIds.length === 0) return;
+    const grantRows = await db
+      .select({ refs: connectionGrants.credentialSecretRefs })
+      .from(connectionGrants)
+      .where(
+        and(
+          eq(connectionGrants.companyId, connection.companyId),
+          eq(connectionGrants.connectionId, connection.id),
+        ),
+      );
+    const stillReferenced = new Set([
+      ...connection.credentialRefs.map((ref) => ref.secretId),
+      ...connection.credentialSecretRefs.map((ref) => ref.secretId),
+      ...grantRows.flatMap((row) => (row.refs ?? []).map((ref) => ref.secretId)),
+    ]);
+    const { owned } = await classifyConnectionSecrets(
+      connection,
+      secretIds.filter((id) => !stillReferenced.has(id)),
+    );
+    for (const secretId of owned) await secrets.remove(secretId);
   }
 
   async function startOAuth(
