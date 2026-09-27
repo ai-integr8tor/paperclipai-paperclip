@@ -4,6 +4,7 @@ import { and, desc, eq, gte, inArray, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
+  companyMemberships,
   toolConnectionInstalls,
   agentConfigRevisions,
   agentApiKeys,
@@ -1083,6 +1084,13 @@ export function agentService(db: Db) {
         await tx.delete(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, id));
         await tx.delete(agentApiKeys).where(eq(agentApiKeys.agentId, id));
         await tx.delete(agentRuntimeState).where(eq(agentRuntimeState.agentId, id));
+        await tx.delete(companyMemberships).where(
+          and(
+            eq(companyMemberships.companyId, existing.companyId),
+            eq(companyMemberships.principalType, "agent"),
+            eq(companyMemberships.principalId, id),
+          ),
+        );
         const deleted = await tx
           .delete(agents)
           .where(eq(agents.id, id))
