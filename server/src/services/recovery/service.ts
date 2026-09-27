@@ -1133,7 +1133,7 @@ export function recoveryService(
   ) {
     if (!blockedTransitionAt) return false;
     const row = await db
-      .select({ actorType: activityLog.actorType, agentId: activityLog.agentId })
+      .select({ actorType: activityLog.actorType, agentId: activityLog.agentId, details: activityLog.details })
       .from(activityLog)
       .where(
         and(
@@ -1142,13 +1142,18 @@ export function recoveryService(
           eq(activityLog.entityId, issueId),
           eq(activityLog.action, "issue.updated"),
           gte(activityLog.createdAt, new Date(blockedTransitionAt.getTime() - 5_000)),
-          sql`${activityLog.details} ->> 'status' = 'blocked'`,
         ),
       )
       .orderBy(desc(activityLog.createdAt))
       .limit(1)
       .then((rows) => rows[0] ?? null);
-    return row?.actorType === "agent" && row.agentId === agentId;
+    // Only the self-block itself counts. Any later issue update (for example a
+    // board edit of the blocker set) re-enables the backstop for this cycle.
+    return (
+      row?.actorType === "agent" &&
+      row.agentId === agentId &&
+      (row.details as Record<string, unknown> | null)?.status === "blocked"
+    );
   }
 
   async function hasPendingWakeInteraction(companyId: string, issueId: string) {
