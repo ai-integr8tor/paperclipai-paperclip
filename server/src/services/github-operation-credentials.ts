@@ -146,6 +146,10 @@ export async function resolveGitHubOperationCredentials(
         agentId: input.agentId,
         heartbeatRunId: input.runId,
         allowStandingDelegation: false,
+        // company_default must not export the company default person's token
+        // through a company-wide install. An install targeted at this agent
+        // is a stable grant and survives a new identityContextId.
+        allowAgentInstallGrant: context?.cause === "company_default",
         responsibleUserId:
           context?.cause === "company_default"
             ? null

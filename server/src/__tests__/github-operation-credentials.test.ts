@@ -117,6 +117,7 @@ const support = await getEmbeddedPostgresTestSupport();
       input: Awaited<ReturnType<typeof seed>>,
       user: string,
       dedicated = false,
+      installTarget: "agent" | "company" = "agent",
     ) {
       const applicationId = randomUUID(),
         connectionId = randomUUID(),
@@ -144,8 +145,8 @@ const support = await getEmbeddedPostgresTestSupport();
       await db.insert(toolConnectionInstalls).values({
         companyId: input.companyId,
         connectionId,
-        targetType: "agent",
-        targetId: input.agentId,
+        targetType: installTarget,
+        targetId: installTarget === "company" ? input.companyId : input.agentId,
       });
       if (!dedicated)
         await db.insert(userSecretDefinitions).values({
@@ -594,16 +595,141 @@ const support = await getEmbeddedPostgresTestSupport();
         env: {},
       });
     });
-    it("does not resolve the company default person's GitHub", async () => {
+    it("does not resolve a company-wide install for a company-default identity", async () => {
       const input = await seed();
-      await grant(input, "A");
+      await grant(input, "A", false, "company");
       await db
         .update(runIdentityContexts)
         .set({ cause: "company_default" })
         .where(eq(runIdentityContexts.runId, input.runId));
-      expect((await resolveGitHubOperationCredentials(db, input)).env).toEqual(
-        {},
-      );
+      expect(await resolveGitHubOperationCredentials(db, input)).toMatchObject({
+        status: "unavailable",
+        source: "personal",
+        env: {},
+      });
+    });
+    it("QG-GITHUB-AGENT-GRANT-STICKS: Ready catalog and agent install stay on the same grant", async () => {
+      // Defect class: the Board found a sticky-grant failure before CI.
+      // A Ready catalog is an enabled GitHub connection with status "active".
+      // An agent-targeted install must resolve status=available on that same
+      // grant after a fresh company_default identity. This case is not skipped.
+      const input = await seed();
+      const installed = await grant(input, "A");
+      await db
+        .update(runIdentityContexts)
+        .set({ cause: "company_default" })
+        .where(eq(runIdentityContexts.runId, input.runId));
+      const first = await resolveGitHubOperationCredentials(db, input);
+      expect(first).toMatchObject({
+        status: "available",
+        source: "personal",
+        login: "A",
+        grantId: installed.id,
+        connectionId: installed.connectionId,
+      });
+      expect(first.env).not.toEqual({});
+
+      const otherAgentId = randomUUID();
+      const otherRunId = randomUUID();
+      await db.insert(agents).values({
+        id: otherAgentId,
+        companyId: input.companyId,
+        name: "Other",
+        role: "engineer",
+        adapterType: "codex_local",
+      });
+      await db.insert(heartbeatRuns).values({
+        id: otherRunId,
+        companyId: input.companyId,
+        agentId: otherAgentId,
+        status: "running",
+        contextSnapshot: { issueId: input.issueId },
+      });
+      await initializeRunIdentity(db, {
+        companyId: input.companyId,
+        runId: otherRunId,
+        responsibleUserId: "A",
+        cause: "company_default",
+      });
+      expect(
+        await resolveGitHubOperationCredentials(db, {
+          companyId: input.companyId,
+          agentId: otherAgentId,
+          runId: otherRunId,
+        }),
+      ).toMatchObject({ status: "absent", env: {} });
+
+      const secondRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: secondRunId,
+        companyId: input.companyId,
+        agentId: input.agentId,
+        status: "running",
+        contextSnapshot: { issueId: input.issueId },
+      });
+      await initializeRunIdentity(db, {
+        companyId: input.companyId,
+        runId: secondRunId,
+        responsibleUserId: "A",
+        cause: "company_default",
+      });
+      const second = await resolveGitHubOperationCredentials(db, {
+        companyId: input.companyId,
+        agentId: input.agentId,
+        runId: secondRunId,
+      });
+      expect(second).toMatchObject({
+        status: "available",
+        source: "personal",
+        login: "A",
+        grantId: installed.id,
+        connectionId: installed.connectionId,
+      });
+      expect(second.identityContextId).not.toBe(first.identityContextId);
+
+      await db
+        .update(toolConnections)
+        .set({ enabled: false })
+        .where(eq(toolConnections.id, installed.connectionId));
+      expect(
+        await resolveGitHubOperationCredentials(db, {
+          companyId: input.companyId,
+          agentId: input.agentId,
+          runId: secondRunId,
+        }),
+      ).toMatchObject({ status: "unavailable", env: {} });
+      await db
+        .update(toolConnections)
+        .set({ enabled: true })
+        .where(eq(toolConnections.id, installed.connectionId));
+
+      await db
+        .update(connectionGrants)
+        .set({ status: "revoked" })
+        .where(eq(connectionGrants.id, installed.id));
+      expect(
+        await resolveGitHubOperationCredentials(db, {
+          companyId: input.companyId,
+          agentId: input.agentId,
+          runId: secondRunId,
+        }),
+      ).toMatchObject({ status: "unavailable", env: {} });
+    });
+    it("QG-GITHUB-AGENT-GRANT-STICKS: a missing grant on a Ready catalog fails closed", async () => {
+      const input = await seed();
+      const installed = await grant(input, "A");
+      await db
+        .delete(connectionGrants)
+        .where(eq(connectionGrants.id, installed.id));
+      await db
+        .update(runIdentityContexts)
+        .set({ cause: "company_default" })
+        .where(eq(runIdentityContexts.runId, input.runId));
+      expect(await resolveGitHubOperationCredentials(db, input)).toMatchObject({
+        status: "unavailable",
+        source: "personal",
+        env: {},
+      });
     });
     it.each([false, true])(
       "withholds sponsor and dedicated credentials from every low-trust policy source (dedicated=%s)",

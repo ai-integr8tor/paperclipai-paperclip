@@ -113,7 +113,11 @@ Run details show identity revisions and redacted GitHub results: responsible per
 
 Deploy the schema, server broker, launcher staging, and runtime environment contract together. Already-running processes retain their original environment; only newly dispatched processes receive the broker contract. Run-scoped capabilities remain valid only while their bound run is active.
 
-Focused coverage lives in `run-identity.test.ts`, `github-operation-credentials.test.ts`, and `github-launcher.test.ts`, alongside the native steering, gateway, routine, and callback-bridge suites. Live acceptance additionally requires two authenticated Paperclip users, two authorized GitHub accounts, and a designated disposable repository for push verification. Local commit metadata and mocked API results do not replace that live push test.
+Focused coverage lives in `run-identity.test.ts`, `github-operation-credentials.test.ts`, and `github-launcher.test.ts`, alongside the native steering, gateway, routine, and callback-bridge suites.
+
+### QG-GITHUB-AGENT-GRANT-STICKS
+
+Defect class: the Board found a sticky-grant failure before CI. A Ready catalog is an enabled GitHub connection with status `active`. When that connection is installed on the agent, a fresh `company_default` identity must resolve `status=available` on the same grant. A missing grant, a revoked grant, a disabled connection, or a company-wide install fails closed with `status=unavailable`. The check is the `QG-GITHUB-AGENT-GRANT-STICKS` cases in `github-operation-credentials.test.ts`. Those cases are not skipped and they are not behind a disable flag. They run in the general server test job, which fails the pull request when a case fails. Live acceptance additionally requires two authenticated Paperclip users, two authorized GitHub accounts, and a designated disposable repository for push verification. Local commit metadata and mocked API results do not replace that live push test.
 
 ### Release procedure
 

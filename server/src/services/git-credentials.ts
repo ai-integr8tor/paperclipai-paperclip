@@ -300,6 +300,13 @@ export async function resolveManagedGitHubIdentitySelection(
     responsibleUserId?: string | null;
     agentId?: string | null;
     allowStandingDelegation?: boolean;
+    /**
+     * When a run identity is `company_default`, the responsible person is not
+     * authorization. An install targeted at this agent is. Company-wide
+     * installs stay excluded so one person's GitHub does not become every
+     * agent's credential.
+     */
+    allowAgentInstallGrant?: boolean;
     excludeGrantId?: string;
   },
 ): Promise<{
@@ -360,7 +367,18 @@ export async function resolveManagedGitHubIdentitySelection(
         return grants.filter((grant) => grant.kind === "user" && delegatedIds.has(grant.id));
       })
     : [];
-  const candidates = dedicated.length > 0 ? dedicated : personal.length > 0 ? personal : delegated;
+  // Agent-stable grant (QG-GITHUB-AGENT-GRANT-STICKS): a fresh identity
+  // context may omit the responsible person, but a connection installed on
+  // this agent still resolves. Company-target installs do not.
+  const agentInstalledConnectionIds = new Set(installs
+    .filter((install) => install.targetType === "agent" && install.targetId === context.agentId)
+    .map((install) => install.connectionId));
+  const agentInstallGrants = context.allowAgentInstallGrant && !context.responsibleUserId && context.agentId
+    ? grants.filter((grant) => grant.kind === "user"
+      && grant.status === "active"
+      && agentInstalledConnectionIds.has(grant.connectionId))
+    : [];
+  const candidates = dedicated.length > 0 ? dedicated : personal.length > 0 ? personal : delegated.length > 0 ? delegated : agentInstallGrants;
   const identitySource = dedicated.length > 0 ? "dedicated" as const : "personal" as const;
   // Reconnecting can create another connection/grant for the same GitHub
   // account. Ambiguity is about provider identities, not the number of rows.
@@ -471,6 +489,7 @@ export async function resolveManagedGitHubCredential(
     responsibleUserId?: string | null;
     agentId?: string | null;
     allowStandingDelegation?: boolean;
+    allowAgentInstallGrant?: boolean;
   },
 ): Promise<{ configured: boolean; identitySource?: "personal" | "dedicated"; credential?: GitCredential; error?: string }> {
   const selection = await resolveManagedGitHubIdentitySelection(db, companyId, context);
