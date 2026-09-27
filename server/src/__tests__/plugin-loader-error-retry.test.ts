@@ -221,6 +221,102 @@ describe("pluginLoader.loadAll error retry", () => {
     }
   });
 
+  it("never imports a renamed Kubernetes manifest or starts an unverified plugin in isolation mode", async () => {
+    const root = realpathSync(mkdtempSync(path.join(os.tmpdir(), "renamed-kubernetes-")));
+    vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+    try {
+      const external = path.join(root, "local/@acme/plugin-demo");
+      const marker = path.join(root, "manifest-imported");
+      mkdirSync(path.join(external, "dist"), { recursive: true });
+      writeFileSync(path.join(external, "package.json"), JSON.stringify({
+        name: "@acme/plugin-demo",
+        type: "module",
+        paperclipPlugin: { manifest: "dist/manifest.js", worker: "dist/worker.js" },
+      }));
+      writeFileSync(path.join(external, "dist/manifest.js"),
+        "import { writeFileSync } from 'node:fs'; writeFileSync(" + JSON.stringify(marker) +
+        ", 'executed'); export default " + JSON.stringify({
+          ...createPluginRecord().manifestJson,
+          id: "paperclip.kubernetes-sandbox-provider",
+        }) + ";");
+      writeFileSync(path.join(external, "dist/worker.js"), "export default {};");
+      const npmPackage = path.join(root, "node_modules/@acme/plugin-demo");
+      mkdirSync(path.dirname(npmPackage), { recursive: true });
+      symlinkSync(external, npmPackage);
+
+      const plugin = createPluginRecord({
+        packageName: "@acme/plugin-demo",
+        packagePath: external,
+        status: "ready",
+      });
+      mockRegistry.getById.mockResolvedValue(plugin);
+      const runtime = createRuntimeServices();
+      const startWorker = vi.fn();
+      runtime.workerManager.startWorker = startWorker;
+      const loader = pluginLoader({} as Db, { localPluginDir: path.join(root, "local") }, runtime);
+
+      await expect(loader.installPlugin({ localPath: external })).rejects.toThrow(/verified release-bundled plugin/);
+      await expect(loader.installPlugin({ packageName: "@acme/plugin-demo" })).rejects.toThrow(/verified release-bundled plugin/);
+      await expect(loader.loadManifest(external)).rejects.toThrow(/verified release-bundled plugin/);
+      await expect(loader.upgradePlugin(plugin.id, { localPath: external })).rejects.toThrow(/verified release-bundled plugin/);
+      const localDiscovery = await loader.discoverFromLocalFilesystem(path.join(root, "local"));
+      expect(localDiscovery.discovered).toHaveLength(0);
+      expect(localDiscovery.errors).toHaveLength(1);
+      const npmDiscovery = await loader.discoverFromNpm([path.join(root, "node_modules")]);
+      expect(npmDiscovery.discovered).toHaveLength(0);
+      expect(npmDiscovery.errors).toHaveLength(1);
+      const loaded = await loader.loadSingle(plugin.id);
+      expect(loaded.success).toBe(false);
+      expect(loaded.error).toMatch(/verified release-bundled plugin/);
+      expect(existsSync(marker)).toBe(false);
+      expect(startWorker).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("loads a digest-verified distribution manifest in isolation mode", async () => {
+    const root = realpathSync(mkdtempSync(path.join(os.tmpdir(), "isolated-distribution-")));
+    vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+    try {
+      const packageRoot = path.join(root, "distribution/example");
+      mkdirSync(path.join(packageRoot, "dist"), { recursive: true });
+      const manifest = {
+        ...createPluginRecord().manifestJson,
+        categories: ["automation"],
+        capabilities: ["issues.read"],
+      };
+      writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({
+        name: "@example/broken-plugin",
+        version: "1.0.0",
+        type: "module",
+        paperclipPlugin: { manifest: "dist/manifest.js", worker: "dist/worker.js" },
+      }));
+      writeFileSync(path.join(packageRoot, "dist/manifest.js"), `export default ${JSON.stringify(manifest)};`);
+      writeFileSync(path.join(packageRoot, "dist/worker.js"), "export default {};");
+      writeFileSync(path.join(root, "distribution/catalog.json"), JSON.stringify({
+        schemaVersion: 1,
+        plugins: [{
+          key: "example",
+          pluginKey: manifest.id,
+          version: manifest.version,
+          directory: "example",
+          digest: distributionBundleDigest(packageRoot),
+        }],
+      }));
+      const entries = readDistributionPluginCatalog(root, []);
+      const loader = pluginLoader({} as Db, {
+        trustedDistributionPlugins: entries,
+        assertPackageActivation: distributionPluginActivationGuard(root, entries, ["example"]),
+      });
+      expect(await loader.loadManifest(packageRoot)).toEqual(manifest);
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it.each(["retarget", "remove"] as const)(
     "uses the canonical bundle after a trusted alias is %s before manifest load",
     async (action) => {

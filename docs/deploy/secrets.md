@@ -228,6 +228,10 @@ In isolation mode, the Kubernetes provider must resolve to the exact bundled
 directory. An npm install with the expected package name or plugin key is not
 trusted without artifact verification and is refused before its worker starts;
 a local path override outside the bundled directory is also refused.
+The same pre-import rule applies to every plugin identity: only built-in release
+bundles and digest-verified distribution bundles may load. Other npm packages
+and local plugin paths are refused before a build, executable manifest import,
+or worker start, even if their package name differs from their manifest ID.
 Host workspace provision, cleanup, teardown, and runtime service commands are
 refused in this mode because they would execute as the key-owning service UID.
 Agent-triggered local-stdio MCP connections are also refused, including their

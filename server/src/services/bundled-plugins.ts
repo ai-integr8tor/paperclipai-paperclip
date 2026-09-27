@@ -121,27 +121,39 @@ export function resolveBundledCatalogRoot(
   return override ? override : DEFAULT_BUNDLED_CATALOG_ROOT;
 }
 
-/** Return the canonical path to the release-owned bundle, never a caller's alias. */
-export function trustedBundledKubernetesProviderPath(
+/** Return the canonical path and identity of a release-owned built-in bundle. */
+export function trustedBundledPluginPath(
   packagePath: string,
   env: Record<string, string | undefined> = process.env,
-): string | null {
-  const repoBundle = path.resolve(
+): { packagePath: string; pluginKey: string } | null {
+  const repoRoot = path.resolve(
     path.dirname(fileURLToPath(import.meta.url)),
-    "../../../packages/plugins/sandbox-providers/kubernetes",
+    "../../../packages/plugins",
   );
-  const imageBundle = path.join(resolveBundledCatalogRoot(env), "sandbox-providers/kubernetes");
   try {
     const actual = fs.realpathSync(packagePath);
-    for (const expected of [repoBundle, imageBundle]) {
-      try {
-        if (actual === fs.realpathSync(expected)) return actual;
-      } catch { /* This bundle is absent in the current deployment. */ }
+    for (const entry of BUNDLED_PLUGIN_CATALOG) {
+      for (const root of [repoRoot, resolveBundledCatalogRoot(env)]) {
+        try {
+          if (actual === fs.realpathSync(path.join(root, entry.relativePath))) {
+            return { packagePath: actual, pluginKey: entry.pluginKey };
+          }
+        } catch { /* This bundle is absent in the current deployment. */ }
+      }
     }
   } catch {
     // A removed path must never fall back to npm.
   }
   return null;
+}
+
+/** Return the canonical Kubernetes bundle path, never a caller's alias. */
+export function trustedBundledKubernetesProviderPath(
+  packagePath: string,
+  env: Record<string, string | undefined> = process.env,
+): string | null {
+  const trusted = trustedBundledPluginPath(packagePath, env);
+  return trusted?.pluginKey === "paperclip.kubernetes-sandbox-provider" ? trusted.packagePath : null;
 }
 
 /** Registry metadata is not proof that an npm artifact is the bundled provider. */
