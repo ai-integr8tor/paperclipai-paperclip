@@ -1,4 +1,5 @@
 import { currentContinuationOrigins } from "./execution-continuation.js";
+import { decisionBriefGuard } from "./decision-brief.js";
 import { assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
 import { connectionIntentDeliveries } from "@paperclipai/db";
 import { isDeepStrictEqual } from "node:util";
@@ -3345,6 +3346,14 @@ export function issueThreadInteractionService(
         );
       }
 
+      await decisionBriefGuard(db).assertAllowed({
+        companyId: issue.companyId,
+        brief: normalizedData.brief ?? null,
+        humanFacing:
+          policy.effectiveResolverPolicy === "human_only" ||
+          Boolean(normalizedData.addresseeUserId),
+      });
+
       if (normalizedData.addresseeAgentId) {
         if (normalizedData.addresseeAgentId === actor.agentId) {
           throw unprocessable(
@@ -3526,6 +3535,7 @@ export function issueThreadInteractionService(
               sourceIdentityContextId,
               title: data.title ?? null,
               summary: data.summary ?? null,
+              brief: data.brief ?? null,
               createdByAgentId: actor.agentId ?? null,
               addresseeAgentId: data.addresseeAgentId ?? null,
               addresseeUserId: data.addresseeUserId ?? null,

@@ -41,6 +41,7 @@ import {
   trustAuthorizationPolicySchema,
 } from "./trust-policy.js";
 import { objectWithoutDefaults } from "./partial.js";
+import { decisionBriefSchema } from "./decision-brief.js";
 
 export const issueBlockedInboxStateSchema = z.enum([
   "needs_attention",
@@ -1891,6 +1892,7 @@ const createIssueThreadInteractionCommon = {
   resolverPolicy: issueThreadInteractionResolverPolicySchema.optional(),
   addresseeAgentId: z.string().guid().nullable().optional(),
   addresseeUserId: z.string().trim().min(1).nullable().optional(),
+  brief: decisionBriefSchema.nullable().optional(),
 };
 
 // Validate dual representations on creation, not when reading historical rows.
