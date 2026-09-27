@@ -45,9 +45,13 @@ existing `status = active` checks unchanged.
 For a marker-validated source/holding pair, consolidation always moves:
 
 - formal `approvals` and their `approvalComments`;
-- their `issueApprovals` links; and
-- any issue whose only purpose is the formal approval record, with its issue
-  comments.
+
+During a live execution, a linked execution issue and its `issueApprovals`
+link remain in the source. The link API requires both endpoints to have the
+same company, and moving that issue would violate the live-run invariant.
+The formal approval card remains independently actionable in the holding and
+must state the requested integration and operations in its approval payload.
+The link and its related issue move only during terminal full consolidation.
 
 The implementation must not turn an agent-authored `in_review` issue into an
 approval, and it must not move generic agent stage cards simply because they
@@ -104,8 +108,8 @@ repair only after `consolidated`.
 Core tests must prove:
 
 - active run returns `runtime_deferred`, moves a formal approval and its
-  linked operator issue to the holding, hides the source, and leaves runtime
-  rows in the source;
+  approval comments to the holding, hides the source, and leaves runtime rows
+  and any linked execution issue in the source;
 - generic agent-authored `in_review` cards remain in the hidden source;
 - a terminal source fully consolidates and archives;
 - repeated active-run calls are idempotent;

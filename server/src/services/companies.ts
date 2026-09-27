@@ -248,7 +248,8 @@ export function companyService(db: Db) {
    * Consolidates the one legacy AgentSwarm per-business Paperclip surface into
    * its marked holding. This is intentionally not a generic company merge:
    * both marker checks are required, only the named business may move, and an
-   * active native execution produces a deferred result instead of a mutation.
+   * active native execution keeps its runtime ownership while immediately
+   * projecting formal operator work into the holding.
    */
   async function consolidateLegacyAgentSwarmBusiness(input: {
     sourceCompanyId: string;
@@ -258,7 +259,7 @@ export function companyService(db: Db) {
     actor: CompanyActivityActor;
   }): Promise<
     | { state: "consolidated"; sourceCompanyId: string; targetCompanyId: string; sourceCompanyArchived: true }
-    | { state: "deferred_active_execution"; sourceCompanyId: string; targetCompanyId: string }
+    | { state: "runtime_deferred"; sourceCompanyId: string; targetCompanyId: string }
   > {
     if (input.sourceCompanyId === input.targetCompanyId) {
       throw unprocessable("Legacy company and holding company must be distinct");
@@ -287,7 +288,16 @@ export function companyService(db: Db) {
         inArray(heartbeatRuns.status, ["queued", "running", "scheduled"]),
       )).limit(1);
       if (activeRuns.length > 0) {
-        return { state: "deferred_active_execution" as const, sourceCompanyId: input.sourceCompanyId, targetCompanyId: input.targetCompanyId };
+        // A heartbeat run retains the source company id for its complete
+        // lifecycle. Moving agents, runtime state, or its execution issues
+        // while it is active would make the still-running process write
+        // across companies. Formal Paperclip approvals are independent of
+        // that execution ownership, so surface them in the holding now and
+        // hide the legacy company from operator navigation.
+        await tx.update(approvalComments).set({ companyId: input.targetCompanyId }).where(eq(approvalComments.companyId, input.sourceCompanyId));
+        await tx.update(approvals).set({ companyId: input.targetCompanyId }).where(eq(approvals.companyId, input.sourceCompanyId));
+        await tx.update(companies).set({ operatorVisible: false, updatedAt: new Date() }).where(eq(companies.id, input.sourceCompanyId));
+        return { state: "runtime_deferred" as const, sourceCompanyId: input.sourceCompanyId, targetCompanyId: input.targetCompanyId };
       }
 
       // AgentSwarm's legacy integration emitted its actual run/stage work with
@@ -338,6 +348,18 @@ export function companyService(db: Db) {
         agentId: input.actor.agentId ?? null,
         runId: input.actor.runId ?? null,
         action: "company.legacy_agentswarm_business_consolidated",
+        entityType: "company",
+        entityId: input.sourceCompanyId,
+        details: { businessId: input.businessId, holdingId: input.holdingId },
+      });
+    } else if (result.state === "runtime_deferred") {
+      await logActivity(db, {
+        companyId: input.targetCompanyId,
+        actorType: input.actor.actorType,
+        actorId: input.actor.actorId,
+        agentId: input.actor.agentId ?? null,
+        runId: input.actor.runId ?? null,
+        action: "company.legacy_agentswarm_operator_surface_projected",
         entityType: "company",
         entityId: input.sourceCompanyId,
         details: { businessId: input.businessId, holdingId: input.holdingId },

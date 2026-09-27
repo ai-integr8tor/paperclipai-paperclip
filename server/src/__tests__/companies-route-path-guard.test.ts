@@ -66,9 +66,9 @@ describe("company routes malformed issue path guard", () => {
     });
   });
 
-  it("routes only a marker-scoped consolidation request and returns Paperclip's active-run deferral", async () => {
+  it("routes only a marker-scoped consolidation request and returns Paperclip's runtime deferral", async () => {
     mockCompanyService.consolidateLegacyAgentSwarmBusiness.mockResolvedValue({
-      state: "deferred_active_execution",
+      state: "runtime_deferred",
       sourceCompanyId: "00000000-0000-4000-8000-000000000001",
       targetCompanyId: "00000000-0000-4000-8000-000000000002",
     });
@@ -94,7 +94,7 @@ describe("company routes malformed issue path guard", () => {
       });
 
     expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({ state: "deferred_active_execution" });
+    expect(res.body).toMatchObject({ state: "runtime_deferred" });
     expect(mockCompanyService.consolidateLegacyAgentSwarmBusiness).toHaveBeenCalledWith(expect.objectContaining({
       sourceCompanyId: "00000000-0000-4000-8000-000000000001",
       targetCompanyId: "00000000-0000-4000-8000-000000000002",

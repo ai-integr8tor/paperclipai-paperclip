@@ -21,7 +21,10 @@
 ## Review Focus
 
 - Active source with no formal approval: hide it and return `runtime_deferred` without any unrelated moves.
-- Formal approval linked to an issue: move both link endpoints and comments atomically.
+- Formal approval linked to a live execution issue: move the formal approval
+  and its approval comments only; retain the linked issue and link until the
+  run is terminal, because the link API requires both endpoints to share a
+  company.
 - Repeated active-run reconciliation: no duplicate approval, no re-exposure, no dispatcher call.
 - Hidden source queued/running lifecycle: runtime liveness remains active because company status stays `active`.
 - Wrong source/target markers: no visibility or ownership change.
@@ -61,7 +64,7 @@
 - Consumes: `operatorVisible` from Task 1.
 - Produces: `runtime_deferred` consolidation result.
 
-- [ ] **Step 1: Write failing tests covering an active source with a formal approval, its linked issue/comments, generic agent card, and runtime rows.**
+- [ ] **Step 1: Write failing tests covering an active source with a formal approval and approval comments, generic agent card, and runtime rows.**
 
 - [ ] **Step 2: Run focused company tests and verify the current all-or-nothing deferral fails the assertions.**
 
