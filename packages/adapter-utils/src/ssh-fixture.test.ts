@@ -1,5 +1,5 @@
 import { execFile, spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readlink, rm, stat, symlink, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -634,6 +634,80 @@ describe("ssh env-lab fixture", () => {
     await expect(readFile(path.join(restoreDir, "blob-0.bin"))).resolves.toEqual(
       Buffer.alloc(256 * 1024, 1),
     );
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("keeps relative symlink targets when restoring a directory from ssh", async () => {
+    const rootDir = await createFixtureRootDir();
+    const statePath = path.join(rootDir, "state.json");
+    const localDir = path.join(rootDir, "local-overlay");
+    const restoreDir = path.join(rootDir, "restore-target");
+
+    await mkdir(path.join(localDir, "skills", "demo"), { recursive: true });
+    await mkdir(restoreDir, { recursive: true });
+    await writeFile(path.join(localDir, "CLAUDE.md"), "instructions\n", "utf8");
+    await writeFile(path.join(localDir, "skills", "demo", "SKILL.md"), "demo\n", "utf8");
+    await symlink("CLAUDE.md", path.join(localDir, "AGENTS.md"));
+    await mkdir(path.join(localDir, ".claude"), { recursive: true });
+    await symlink("../skills", path.join(localDir, ".claude", "skills"));
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH restore symlink test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = { ...config, remoteCwd: started.workspaceDir } as const;
+    const remoteDir = path.posix.join(started.workspaceDir, "restore-symlinks");
+
+    await syncDirectoryToSsh({ spec, localDir, remoteDir });
+    await syncDirectoryFromSsh({ spec, remoteDir, localDir: restoreDir });
+
+    // The restore stages the archive in a temporary directory that is removed
+    // afterwards. A relative link must keep its stored target instead of being
+    // resolved against that directory.
+    await expect(readlink(path.join(restoreDir, "AGENTS.md"))).resolves.toBe("CLAUDE.md");
+    await expect(readlink(path.join(restoreDir, ".claude", "skills"))).resolves.toBe("../skills");
+    await expect(readFile(path.join(restoreDir, "AGENTS.md"), "utf8")).resolves.toBe("instructions\n");
+    await expect(
+      readFile(path.join(restoreDir, ".claude", "skills", "demo", "SKILL.md"), "utf8"),
+    ).resolves.toBe("demo\n");
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("keeps committed relative symlinks through the managed runtime restore path", async () => {
+    const rootDir = await createFixtureRootDir();
+    const statePath = path.join(rootDir, "state.json");
+    const localRepo = path.join(rootDir, "local-workspace");
+
+    await mkdir(localRepo, { recursive: true });
+    await git(localRepo, ["init"]);
+    await git(localRepo, ["checkout", "-b", "main"]);
+    await git(localRepo, ["config", "user.name", "Paperclip Test"]);
+    await git(localRepo, ["config", "user.email", "test@paperclip.dev"]);
+    await writeFile(path.join(localRepo, "CLAUDE.md"), "instructions\n", "utf8");
+    await symlink("CLAUDE.md", path.join(localRepo, "AGENTS.md"));
+    await git(localRepo, ["add", "CLAUDE.md", "AGENTS.md"]);
+    await git(localRepo, ["commit", "-m", "initial"]);
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH managed restore symlink test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = { ...config, remoteCwd: started.workspaceDir } as const;
+
+    const prepared = await prepareRemoteManagedRuntime({
+      spec,
+      runId: "run-symlink",
+      adapterKey: "test-adapter",
+      workspaceLocalDir: localRepo,
+    });
+    await runSshCommand(
+      config,
+      `printf "from run\\n" > ${JSON.stringify(path.posix.join(prepared.workspaceRemoteDir, "run.txt"))}`,
+      { timeoutMs: 30_000, maxBuffer: 256 * 1024 },
+    );
+
+    await prepared.restoreWorkspace();
+
+    await expect(readFile(path.join(localRepo, "run.txt"), "utf8")).resolves.toBe("from run\n");
+    await expect(readlink(path.join(localRepo, "AGENTS.md"))).resolves.toBe("CLAUDE.md");
+    await expect(readFile(path.join(localRepo, "AGENTS.md"), "utf8")).resolves.toBe("instructions\n");
+    expect(await git(localRepo, ["status", "--short", "--", "AGENTS.md"])).toBe("");
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("reports exact git-history import percentage from the known bundle size", async () => {
