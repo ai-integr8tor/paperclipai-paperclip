@@ -2441,6 +2441,7 @@ export function createToolGatewayService(
         },
       },
       { agentId: input.session.agentId },
+      { systemGenerated: true },
     );
 
     // Sign the row only while it is still pending. A concurrent matching call can
@@ -5741,6 +5742,7 @@ export function createToolGatewayService(
         },
       },
       { agentId: input.session.agentId },
+      { systemGenerated: true },
     );
     const now = new Date();
     await db

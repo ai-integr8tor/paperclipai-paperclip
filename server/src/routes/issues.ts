@@ -12062,6 +12062,7 @@ export function issueRoutes(
               payload: await buildOnboardingFirstTaskOpeningQuestion(),
             },
             { agentId: issue.assigneeAgentId },
+            { systemGenerated: true },
           );
         } catch (err) {
           logger.warn(

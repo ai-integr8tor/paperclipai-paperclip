@@ -154,6 +154,12 @@ async function assertInteractionRunWriteAllowed(tx: Db, issue: { id: string; com
 type CreateInteractionOptions = {
   /** Keep independently owned pending cards actionable. Internal runtime bridges use this. */
   supersedePendingSiblingInteractions?: boolean;
+  /**
+   * Server-authored card with no agent author to write a decision brief.
+   * Skips the company's requireDecisionBrief enforcement; a supplied brief is
+   * still validated against the company boundary.
+   */
+  systemGenerated?: boolean;
 };
 
 type InteractionWakeup = (
@@ -3346,14 +3352,6 @@ export function issueThreadInteractionService(
         );
       }
 
-      await decisionBriefGuard(db).assertAllowed({
-        companyId: issue.companyId,
-        brief: normalizedData.brief ?? null,
-        humanFacing:
-          policy.effectiveResolverPolicy === "human_only" ||
-          Boolean(normalizedData.addresseeUserId),
-      });
-
       if (normalizedData.addresseeAgentId) {
         if (normalizedData.addresseeAgentId === actor.agentId) {
           throw unprocessable(
@@ -3427,6 +3425,15 @@ export function issueThreadInteractionService(
           return interaction;
         }
       }
+
+      await decisionBriefGuard(db).assertAllowed({
+        companyId: issue.companyId,
+        brief: normalizedData.brief ?? null,
+        humanFacing: options.systemGenerated
+          ? false
+          : policy.effectiveResolverPolicy === "human_only" ||
+            Boolean(normalizedData.addresseeUserId),
+      });
 
       if (data.sourceCommentId) {
         const sourceComment = await db
