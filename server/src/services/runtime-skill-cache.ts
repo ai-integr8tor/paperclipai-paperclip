@@ -93,6 +93,8 @@ async function inventory(directory: string, base = ""): Promise<string[]> {
 async function matches(spec: CacheSpec, entry = spec.entry): Promise<boolean> {
   try {
     await assertDirectories(path.join(entry, "files"), path.dirname(path.dirname(spec.root)));
+    // A publisher that exits between its rename and chmod leaves the entry writable.
+    if ((await fs.lstat(entry)).mode & 0o222) return false;
     const manifest = JSON.parse((await readRegularFile(path.join(entry, "manifest.json"))).toString("utf8"));
     if (manifest.format !== FORMAT || manifest.fingerprint !== spec.fingerprint || !Array.isArray(manifest.files)
       || manifest.files.length !== spec.paths.length) return false;
@@ -165,6 +167,15 @@ async function setTreeMode(directory: string, readonly: boolean): Promise<void> 
   if (readonly) await fs.chmod(directory, 0o555);
 }
 
+// macOS refuses to rename a directory the caller cannot write (its ".." entry changes);
+// Linux does not check. Only the moved directory is unlocked, and it is locked again at its
+// new path; its files/ tree stays read-only.
+async function renameDirectory(from: string, to: string): Promise<void> {
+  await fs.chmod(from, 0o700);
+  await fs.rename(from, to);
+  await fs.chmod(to, 0o555);
+}
+
 async function removeTree(directory: string): Promise<void> {
   await setTreeMode(directory, false);
   await fs.rm(directory, { recursive: true, force: true });
@@ -202,9 +213,9 @@ export async function resolveRuntimeSkillCache(
         if (!await matches(spec, staging)) throw new Error("Runtime skill cache validation failed");
         // Lifecycle mutations can update the DB while this builder owns the filesystem lock.
         if (!await stillInstalled()) throw new Error("Skill was renamed or removed during preparation");
-        await fs.rename(spec.entry, path.join(spec.root, `.invalid-${spec.fingerprint}-${randomUUID()}`))
+        await renameDirectory(spec.entry, path.join(spec.root, `.invalid-${spec.fingerprint}-${randomUUID()}`))
           .catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error; });
-        await fs.rename(staging, spec.entry);
+        await renameDirectory(staging, spec.entry);
         return path.join(spec.entry, "files");
       } finally { await removeTree(staging); }
     });
