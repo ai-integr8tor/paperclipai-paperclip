@@ -362,6 +362,17 @@ describe("sandbox adapter execution targets", () => {
     });
   });
 
+  it("refuses an unconfined local adapter before spawning under a file-backed DB source", async () => {
+    vi.stubEnv("PAPERCLIP_DATABASE_URL_FILE", "/private/database-url");
+    await expect(runAdapterExecutionTargetProcess("run-local", { kind: "local" }, process.execPath, ["-e", "process.exit(0)"], {
+      cwd: process.cwd(),
+      env: { PAPERCLIP_API_KEY: "run-scoped-jwt" },
+      timeoutSec: 5,
+      graceSec: 1,
+      onLog: async () => {},
+    })).rejects.toThrow("require a workspace filesystem sandbox");
+  });
+
   it("preserves stdin when wrapping sandbox adapter commands for run-log streaming", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-run-log-stdin-"));
     cleanupDirs.push(rootDir);

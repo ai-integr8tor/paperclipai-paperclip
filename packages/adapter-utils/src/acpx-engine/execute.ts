@@ -14,6 +14,7 @@ import type {
   UsageSummary,
 } from "@paperclipai/adapter-utils";
 import {
+  assertFileBackedDbAgentExecutionAllowed,
   adapterExecutionTargetSessionIdentity,
   describeAdapterExecutionTarget,
   adapterExecutionTargetDuplexObservabilityRecorder,
@@ -1846,6 +1847,7 @@ async function buildRuntime(input: {
     executionTarget: input.ctx.executionTarget,
     legacyRemoteExecution: input.ctx.executionTransport?.remoteExecution,
   });
+  assertFileBackedDbAgentExecutionAllowed(executionTarget, null, "acpx");
   const remoteExecutionIdentity = adapterExecutionTargetSessionIdentity(executionTarget);
   const effectiveExecutionCwd =
     remoteExecutionIdentity && typeof remoteExecutionIdentity.remoteCwd === "string"
@@ -2639,9 +2641,17 @@ function resolveRuntimeEnv(
     env,
     (options.platform ?? process.platform) === "win32",
   );
-  // Never export the control-plane credential path to an agent, even if a
-  // future launch contribution accidentally supplies it explicitly.
+  // Explicit run contributions must not reintroduce the service credential
+  // path after the inherited environment has been sanitized.
   delete mergedEnv.PAPERCLIP_DATABASE_URL_FILE;
+  if (process.env.PAPERCLIP_DATABASE_URL_FILE?.trim()) {
+    delete mergedEnv.DATABASE_URL;
+    delete mergedEnv.DATABASE_MIGRATION_URL;
+    delete mergedEnv.PAPERCLIP_AGENT_JWT_SECRET;
+    for (const key of Object.keys(mergedEnv)) {
+      if (/^PG[A-Z0-9_]+$/.test(key)) delete mergedEnv[key];
+    }
+  }
   const finalEnv = Object.fromEntries(
     Object.entries(mergedEnv).filter(
       (entry): entry is [string, string] => typeof entry[1] === "string",
