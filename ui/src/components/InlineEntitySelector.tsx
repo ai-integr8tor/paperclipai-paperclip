@@ -3,6 +3,7 @@ import { Check, X } from "lucide-react";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { orderItemsBySelectedAndRecent } from "../lib/recent-selections";
 import { cn } from "../lib/utils";
+import { useMobileEntityPickerViewportStyle } from "../hooks/useMobileEntityPickerViewportStyle";
 
 export interface InlineEntityOption {
   id: string;
@@ -89,6 +90,7 @@ export const InlineEntitySelector = forwardRef<HTMLButtonElement, InlineEntitySe
     const [query, setQuery] = useState("");
     const [highlightedIndex, setHighlightedIndex] = useState(0);
     const mobileSelectorModal = useMobileSelectorModal();
+    const mobileViewportStyle = useMobileEntityPickerViewportStyle();
     const highlightedIndexRef = useRef(0);
     const inputRef = useRef<HTMLInputElement>(null);
     const shouldPreventCloseAutoFocusRef = useRef(false);
@@ -175,7 +177,7 @@ export const InlineEntitySelector = forwardRef<HTMLButtonElement, InlineEntitySe
           collisionPadding={16}
           className="w-(--sz-calc-6) p-1"
           disablePortal={disablePortal && !mobileSelectorModal}
-          style={contentStyle}
+          style={{ ...mobileViewportStyle, ...contentStyle }}
           onOpenAutoFocus={(event) => {
             event.preventDefault();
             inputRef.current?.focus();

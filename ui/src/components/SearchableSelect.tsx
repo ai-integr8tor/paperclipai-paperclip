@@ -12,6 +12,7 @@ import {
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { fuzzyTextMatchesQuery, normalizeSearchText, scoreFuzzyTextFields } from "@/lib/searchable-select";
 import { cn } from "@/lib/utils";
+import { useMobileEntityPickerViewportStyle } from "@/hooks/useMobileEntityPickerViewportStyle";
 
 export interface SearchableSelectOption<TValue extends string = string> {
   key: string;
@@ -114,6 +115,7 @@ export function SearchableSelect<
 }: SearchableSelectProps<TValue, TOption>) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
+  const mobileViewportStyle = useMobileEntityPickerViewportStyle();
   const pointerFocusRef = useRef(false);
   const suppressNextTriggerFocusRef = useRef(false);
 
@@ -230,6 +232,7 @@ export function SearchableSelect<
       <PopoverContent
         data-mobile-entity-picker=""
         aria-label={mobileTitle ?? placeholder}
+        style={mobileViewportStyle}
         align={align}
         collisionPadding={16}
         disablePortal={disablePortal}
