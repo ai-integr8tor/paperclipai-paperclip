@@ -540,6 +540,98 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(afterRepeat.length).toBe(runs.length);
   });
 
+  it("settles held wakes whose replay admission is refused instead of re-selecting the retry", async () => {
+    const companyId = randomUUID(), agentId = randomUUID(), failedRunId = randomUUID();
+    const ownerId = randomUUID(), otherId = randomUUID(), now = new Date();
+    const resetAt = new Date(now.getTime() + 60 * 60_000);
+    await seedRetryFixture({ runId: failedRunId, companyId, agentId, now,
+      adapterType: PROVIDER_QUOTA_TEST_ADAPTER, errorCode: "provider_quota",
+      errorFamily: "provider_quota", retryNotBefore: resetAt.toISOString() });
+    await db.insert(issues).values([
+      { id: ownerId, companyId, title: "Retry owner", status: "in_progress", assigneeAgentId: agentId },
+      { id: otherId, companyId, title: "Held assignment", status: "todo", assigneeAgentId: agentId },
+    ]);
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: ownerId, wakeReason: "issue_assigned" } })
+      .where(eq(heartbeatRuns.id, failedRunId));
+    const scheduled = await heartbeat.scheduleBoundedRetry(failedRunId, { now, random: () => 0 });
+    if (scheduled.outcome !== "scheduled" || !scheduled.run) throw new Error("Expected quota retry");
+    const retryId = scheduled.run.id;
+    const held = await heartbeat.wakeup(agentId, { source: "assignment", triggerDetail: "system",
+      reason: "issue_assigned", payload: { issueId: otherId },
+      contextSnapshot: { issueId: otherId, wakeReason: "issue_assigned" },
+      requestedByActorType: "system", requestedByActorId: "test-scheduler" });
+    expect(held?.id).toBe(retryId);
+
+    // At the reset the owner is ineligible and the agent is paused, so every
+    // replay is refused by ordinary admission.
+    await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, ownerId));
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+    await heartbeat.promoteDueScheduledRetries(resetAt);
+    const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, retryId));
+    expect(retry.status).toBe("cancelled");
+    const context = retry.contextSnapshot as Record<string, unknown>;
+    expect(context.providerQuotaHeldWakesReplayedAt).toBeTruthy();
+    expect(context.providerQuotaHeldWakesReplayAdmitted).toBe(0);
+    expect(context.providerQuotaHeldWakesReplayRefused).toBe(1);
+    const replayRows = async () => db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.agentId, agentId),
+      sql`${agentWakeupRequests.idempotencyKey} like 'provider-quota-replay:%'`,
+    ));
+    const afterFirst = await replayRows();
+    expect(afterFirst.every((row) => row.status === "skipped")).toBe(true);
+    expect(afterFirst.length).toBeLessThanOrEqual(1);
+
+    // Later sweeps must not select the settled retry again or write more
+    // skipped receipts, and resuming the agent must not resurrect the wake.
+    await heartbeat.promoteDueScheduledRetries(new Date(resetAt.getTime() + 60_000));
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, agentId));
+    await heartbeat.promoteDueScheduledRetries(new Date(resetAt.getTime() + 120_000));
+    expect((await replayRows()).length).toBe(afterFirst.length);
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(2);
+  });
+
+  it("caps the held-wake context stored on a quota retry while keeping every receipt", async () => {
+    const companyId = randomUUID(), agentId = randomUUID(), failedRunId = randomUUID();
+    const ownerId = randomUUID(), now = new Date();
+    const resetAt = new Date(now.getTime() + 60 * 60_000);
+    await seedRetryFixture({ runId: failedRunId, companyId, agentId, now,
+      adapterType: PROVIDER_QUOTA_TEST_ADAPTER, errorCode: "provider_quota",
+      errorFamily: "provider_quota", retryNotBefore: resetAt.toISOString() });
+    const otherIds = Array.from({ length: 53 }, () => randomUUID());
+    await db.insert(issues).values([
+      { id: ownerId, companyId, title: "Retry owner", status: "in_progress", assigneeAgentId: agentId },
+      ...otherIds.map((id, index) => ({ id, companyId, title: `Held ${index}`, status: "todo", assigneeAgentId: agentId })),
+    ]);
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: ownerId, wakeReason: "issue_assigned" } })
+      .where(eq(heartbeatRuns.id, failedRunId));
+    const scheduled = await heartbeat.scheduleBoundedRetry(failedRunId, { now, random: () => 0 });
+    if (scheduled.outcome !== "scheduled" || !scheduled.run) throw new Error("Expected quota retry");
+    const retryId = scheduled.run.id;
+    for (const id of otherIds) {
+      const result = await heartbeat.wakeup(agentId, { source: "assignment", triggerDetail: "system",
+        reason: "issue_assigned", payload: { issueId: id },
+        contextSnapshot: { issueId: id, wakeReason: "issue_assigned" },
+        requestedByActorType: "system", requestedByActorId: "test-scheduler" });
+      expect(result?.id).toBe(retryId);
+    }
+    const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, retryId));
+    const context = retry.contextSnapshot as Record<string, unknown>;
+    expect((context.providerQuotaHeldWakes as unknown[]).length).toBe(50);
+    expect(context.providerQuotaHeldWakesOverflowCount).toBe(3);
+    const receipts = await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.runId, retryId), eq(agentWakeupRequests.status, "coalesced"),
+      sql`${agentWakeupRequests.payload} ? 'providerQuotaHoldUntil'`,
+    ));
+    expect(receipts).toHaveLength(53);
+    const payload = await buildPaperclipWakePayload({
+      db, companyId, agentId, runId: retryId, contextSnapshot: context,
+    });
+    expect(payload?.providerQuotaHeldWakeCount).toBe(53);
+    expect(payload?.providerQuotaHeldWakesTruncated).toBe(true);
+    expect(payload?.providerQuotaHeldWakes).toHaveLength(20);
+  });
+
   async function seedMaxTurnFixture(input?: {
     companyId?: string;
     agentId?: string;

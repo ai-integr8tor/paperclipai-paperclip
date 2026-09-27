@@ -756,6 +756,10 @@ const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
 const MAX_INLINE_WAKE_ISSUE_DESCRIPTION_CHARS = 12_000;
 const MAX_INLINE_PROVIDER_QUOTA_WAKES = 20;
 const MAX_INLINE_PROVIDER_QUOTA_COMMENT_CHARS = 300;
+// Held-wake context stored on a quota retry is capped; every held wake still
+// keeps its own durable coalesced receipt, which is what replay reads.
+const MAX_STORED_PROVIDER_QUOTA_WAKES = 50;
+const MAX_PROVIDER_QUOTA_REPLAY_ATTEMPTS = 3;
 const MAX_AGENT_SESSION_MESSAGE_CHARS = 12_000;
 const execFile = promisify(execFileCallback);
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = [
@@ -7662,6 +7666,7 @@ export async function buildPaperclipWakePayload(input: {
   const issueId = readNonEmptyString(input.contextSnapshot.issueId);
   const heldWakeRows = Array.isArray(input.contextSnapshot.providerQuotaHeldWakes)
     ? input.contextSnapshot.providerQuotaHeldWakes : [];
+  const heldWakeOverflowCount = Math.max(0, Number(input.contextSnapshot.providerQuotaHeldWakesOverflowCount ?? 0) || 0);
   const conversationMode = input.contextSnapshot.conversationMode === true;
   const continuationSummary = conversationMode ? null : input.continuationSummary ?? null;
   const agentMessage = parseObject(
@@ -8082,8 +8087,8 @@ export async function buildPaperclipWakePayload(input: {
   const payload = {
     reason: readNonEmptyString(input.contextSnapshot.wakeReason),
     providerQuotaHeldWakes,
-    providerQuotaHeldWakeCount: heldWakeRows.length,
-    providerQuotaHeldWakesTruncated: heldWakeRows.length > MAX_INLINE_PROVIDER_QUOTA_WAKES,
+    providerQuotaHeldWakeCount: heldWakeRows.length + heldWakeOverflowCount,
+    providerQuotaHeldWakesTruncated: heldWakeRows.length > MAX_INLINE_PROVIDER_QUOTA_WAKES || heldWakeOverflowCount > 0,
     executionContinuation: input.contextSnapshot.executionContinuation ?? null,
     attachmentOmissions,
     externalChatProvider,
@@ -16393,18 +16398,22 @@ export function heartbeatService(
     });
   }
 
-  async function promoteDueScheduledRetries(now = new Date()) {
-    const cutoff = await getWorktreeExecutionCutoff();
-    const result = await runDispatch.promoteDueScheduledRetries({
-      now,
-      cutoff,
-    });
-    applyRunDispatchPostCommitEffects(result.postCommitEffects);
-    // A retry can fail its owner-issue gate at the reset time. Its held wakes
-    // may belong to other issues, so replay their durable receipts through
-    // normal admission after the hold ends. Lock the cancelled retry to keep
-    // concurrent sweeps from replaying it twice. The replay receipt covers a
-    // crash between wake admission and writing the completion marker.
+  // A retry can fail its owner-issue gate at the reset time. Its held wakes
+  // may belong to other issues, so replay their durable receipts through
+  // normal admission after the hold ends. Lock the cancelled retry to keep
+  // concurrent sweeps from replaying it twice. The replay receipt (idempotency
+  // key) covers a crash between wake admission and writing the completion marker.
+  //
+  // Admission may refuse a replay (agent paused or terminated, budget block,
+  // wake-on-demand off). That refusal is the same outcome an ordinary wake gets
+  // at that moment and admission records it as a skipped receipt, so it settles
+  // the held wake. Settled receipts of any status are never replayed again, and
+  // the completion marker is always written once every held wake is settled.
+  // An unexpected error only increments an attempt counter outside the rolled-back
+  // transaction; after MAX_PROVIDER_QUOTA_REPLAY_ATTEMPTS the retry is marked
+  // failed, so one bad retry cannot be re-selected forever or crowd out others.
+  async function replayHeldProviderQuotaWakes(now: Date) {
+    if ((await getSchedulingSuppression()).suppressed) return;
     const cancelledQuotaRetries = await db.select().from(heartbeatRuns).where(and(
       eq(heartbeatRuns.status, "cancelled"),
       lte(heartbeatRuns.scheduledRetryAt, now),
@@ -16412,6 +16421,7 @@ export function heartbeatService(
       sql`${heartbeatRuns.contextSnapshot}->>'errorFamily' = 'provider_quota'`,
       sql`jsonb_array_length(coalesce(${heartbeatRuns.contextSnapshot}->'providerQuotaHeldWakes', '[]'::jsonb)) > 0`,
       sql`${heartbeatRuns.contextSnapshot}->>'providerQuotaHeldWakesReplayedAt' is null`,
+      sql`coalesce((${heartbeatRuns.contextSnapshot}->>'providerQuotaHeldWakesReplayAttempts')::int, 0) < ${MAX_PROVIDER_QUOTA_REPLAY_ATTEMPTS}`,
     )).orderBy(asc(heartbeatRuns.scheduledRetryAt)).limit(100);
     for (const retry of cancelledQuotaRetries) {
       try {
@@ -16427,20 +16437,21 @@ export function heartbeatService(
             eq(agentWakeupRequests.status, "coalesced"),
             sql`${agentWakeupRequests.payload} ? 'providerQuotaHoldUntil'`,
           )).orderBy(asc(agentWakeupRequests.requestedAt));
+          let admittedCount = 0;
+          let refusedCount = 0;
           for (const request of heldRequests) {
             const replayKey = `provider-quota-replay:${request.id}`;
             const [existingReplay] = await tx.select({ id: agentWakeupRequests.id })
               .from(agentWakeupRequests).where(and(
                 eq(agentWakeupRequests.companyId, retry.companyId),
                 eq(agentWakeupRequests.idempotencyKey, replayKey),
-                ne(agentWakeupRequests.status, "skipped"),
               )).limit(1);
             if (existingReplay) continue;
             const savedPayload = parseObject(request.payload);
             const replayPayload = { ...savedPayload };
             delete replayPayload[DEFERRED_WAKE_CONTEXT_KEY];
             delete replayPayload.providerQuotaHoldUntil;
-            const admitted = await trackWakeup(retry.agentId, {
+            const replayOptions: WakeupOptions = {
               source: request.source === "assignment" || request.source === "automation" ||
                 request.source === "timer" ? request.source : "on_demand",
               triggerDetail: request.triggerDetail === "callback" ||
@@ -16454,19 +16465,74 @@ export function heartbeatService(
                 ? request.requestedByActorType : undefined,
               requestedByActorId: request.requestedByActorId ?? undefined,
               idempotencyKey: replayKey,
-            });
-            if (!admitted) throw new Error(`Held wake ${request.id} could not be admitted`);
+            };
+            let admitted: Awaited<ReturnType<typeof trackWakeup>> = null;
+            try {
+              admitted = await trackWakeup(retry.agentId, replayOptions);
+            } catch (error) {
+              // A 4xx (for example 409 for a paused or terminated agent) is an
+              // admission refusal, not a transient failure. Record a skipped
+              // receipt under the replay key so the held wake stays settled.
+              if (!(error instanceof HttpError) || error.status >= 500) throw error;
+              await tx.insert(agentWakeupRequests).values({
+                companyId: retry.companyId, agentId: retry.agentId,
+                source: replayOptions.source ?? "on_demand",
+                triggerDetail: replayOptions.triggerDetail ?? "manual",
+                reason: "provider_quota_replay_refused",
+                payload: { ...replayPayload, replayRefused: { status: error.status, message: error.message } },
+                status: "skipped",
+                requestedByActorType: replayOptions.requestedByActorType ?? null,
+                requestedByActorId: replayOptions.requestedByActorId ?? null,
+                idempotencyKey: replayKey,
+                error: error.message,
+                finishedAt: new Date(),
+              });
+            }
+            if (admitted) admittedCount += 1;
+            else refusedCount += 1;
+          }
+          if (refusedCount > 0) {
+            logger.info({ runId: retry.id, agentId: retry.agentId, refusedCount, admittedCount },
+              "held provider quota wakes settled; admission refused some replays");
           }
           await tx.update(heartbeatRuns).set({
-            contextSnapshot: sql`jsonb_set(coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb),
-              '{providerQuotaHeldWakesReplayedAt}', to_jsonb(${new Date().toISOString()}::text))`,
+            contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({
+              providerQuotaHeldWakesReplayedAt: new Date().toISOString(),
+              providerQuotaHeldWakesReplayAdmitted: admittedCount,
+              providerQuotaHeldWakesReplayRefused: refusedCount,
+            })}::jsonb`,
             updatedAt: new Date(),
           }).where(eq(heartbeatRuns.id, retry.id));
         });
       } catch (error) {
         logger.warn({ error, runId: retry.id }, "failed to replay held provider quota wakes");
+        try {
+          const attempts = Number(parseObject(retry.contextSnapshot).providerQuotaHeldWakesReplayAttempts ?? 0) + 1;
+          const patch: Record<string, unknown> = { providerQuotaHeldWakesReplayAttempts: attempts };
+          if (attempts >= MAX_PROVIDER_QUOTA_REPLAY_ATTEMPTS) {
+            patch.providerQuotaHeldWakesReplayedAt = new Date().toISOString();
+            patch.providerQuotaHeldWakesReplayFailed = true;
+            logger.error({ runId: retry.id, attempts }, "giving up on replaying held provider quota wakes");
+          }
+          await db.update(heartbeatRuns).set({
+            contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify(patch)}::jsonb`,
+            updatedAt: new Date(),
+          }).where(and(eq(heartbeatRuns.id, retry.id), eq(heartbeatRuns.status, "cancelled")));
+        } catch (markError) {
+          logger.warn({ error: markError, runId: retry.id }, "failed to record held provider quota replay attempt");
+        }
       }
     }
+  }
+
+  async function promoteDueScheduledRetries(now = new Date()) {
+    const cutoff = await getWorktreeExecutionCutoff();
+    const result = await runDispatch.promoteDueScheduledRetries({
+      now,
+      cutoff,
+    });
+    applyRunDispatchPostCommitEffects(result.postCommitEffects);
+    await replayHeldProviderQuotaWakes(now);
     return { promoted: result.promoted, runIds: result.runIds };
   }
 
@@ -26468,16 +26534,23 @@ export function heartbeatService(
           ? existingContext.providerQuotaHeldWakes : [];
         if (opts.idempotencyKey && heldWakes.some((value) =>
           parseObject(value).idempotencyKey === opts.idempotencyKey)) return retry;
-        const mergedContext = {
-          ...existingContext,
-          providerQuotaHeldWakes: [...heldWakes, {
-            issueId: heldIssueId, source, triggerDetail, reason,
-            contextSnapshot: enrichedContextSnapshot, payload,
-            requestedByActorType: opts.requestedByActorType ?? null,
-            requestedByActorId: opts.requestedByActorId ?? null,
-            idempotencyKey: opts.idempotencyKey ?? null,
-          }],
+        if (opts.idempotencyKey && heldWakes.length >= MAX_STORED_PROVIDER_QUOTA_WAKES) {
+          const [existingReceipt] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
+            .where(and(eq(agentWakeupRequests.companyId, agent.companyId), eq(agentWakeupRequests.runId, retry.id),
+              eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey))).limit(1);
+          if (existingReceipt) return retry;
+        }
+        const heldWake = {
+          issueId: heldIssueId, source, triggerDetail, reason,
+          contextSnapshot: enrichedContextSnapshot, payload,
+          requestedByActorType: opts.requestedByActorType ?? null,
+          requestedByActorId: opts.requestedByActorId ?? null,
+          idempotencyKey: opts.idempotencyKey ?? null,
         };
+        const overflowCount = Number(existingContext.providerQuotaHeldWakesOverflowCount ?? 0) || 0;
+        const mergedContext: Record<string, unknown> = heldWakes.length < MAX_STORED_PROVIDER_QUOTA_WAKES
+          ? { ...existingContext, providerQuotaHeldWakes: [...heldWakes, heldWake] }
+          : { ...existingContext, providerQuotaHeldWakesOverflowCount: overflowCount + 1 };
         if (heldIssueId && readNonEmptyString(existingContext.issueId) === heldIssueId) {
           Object.assign(mergedContext, withQueuedCommentIdsInRunContext(
             mergedContext,
@@ -28161,6 +28234,9 @@ export function heartbeatService(
               }
               const retryContext = parseObject(cancelled.contextSnapshot);
               enrichedContextSnapshot.providerQuotaHeldWakes = retryContext.providerQuotaHeldWakes;
+              if (retryContext.providerQuotaHeldWakesOverflowCount != null) {
+                enrichedContextSnapshot.providerQuotaHeldWakesOverflowCount = retryContext.providerQuotaHeldWakesOverflowCount;
+              }
               Object.assign(enrichedContextSnapshot, withQueuedCommentIdsInRunContext(
                 enrichedContextSnapshot,
                 queuedCommentIdsFromRunContext(retryContext),
