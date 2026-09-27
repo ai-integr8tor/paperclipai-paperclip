@@ -6073,6 +6073,9 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
         status: issues.status,
         assigneeAgentId: issues.assigneeAgentId,
         checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        executionAgentNameKey: issues.executionAgentNameKey,
+        executionLockedAt: issues.executionLockedAt,
       })
       .from(issues)
       .where(eq(issues.id, issueId))
@@ -6081,6 +6084,9 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
       status: "done",
       assigneeAgentId: agentId,
       checkoutRunId: null,
+      executionRunId: failedRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date("2026-06-10T10:00:00.000Z"),
     });
   });
 
@@ -6348,17 +6354,16 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     });
 
     const originalTransaction = db.transaction.bind(db);
-    let transactionCount = 0;
     let terminalized = false;
     const transactionSpy = vi
       .spyOn(db, "transaction")
       .mockImplementation(
         (async (...args: Parameters<typeof originalTransaction>) => {
           const result = await originalTransaction(...args);
-          transactionCount += 1;
-          // The fourth transaction is the guarded primary update. Force the run
-          // terminal before checkout enters its unowned fallback mutation.
-          if (transactionCount === 4) {
+          // The guarded primary update returns null for this already-in-progress
+          // issue. Force the run terminal before checkout enters its unowned
+          // fallback mutation without depending on unrelated transaction counts.
+          if (result === null && !terminalized) {
             terminalized = true;
             await db
               .update(heartbeatRuns)
@@ -6452,17 +6457,16 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     });
 
     const originalTransaction = db.transaction.bind(db);
-    let transactionCount = 0;
     let terminalized = false;
     const transactionSpy = vi
       .spyOn(db, "transaction")
       .mockImplementation(
         (async (...args: Parameters<typeof originalTransaction>) => {
           const result = await originalTransaction(...args);
-          transactionCount += 1;
           // Keep the previous execution run live through stale-lock cleanup and
-          // terminalize both rows only after the guarded primary update misses.
-          if (transactionCount === 4) {
+          // terminalize both rows only after the guarded primary update misses,
+          // without depending on unrelated transaction counts.
+          if (result === null && !terminalized) {
             terminalized = true;
             await db
               .update(heartbeatRuns)

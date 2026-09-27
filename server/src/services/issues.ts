@@ -11657,6 +11657,25 @@ export function issueService(db: Db) {
             agentId,
             checkoutRunId,
             operation: async (tx) => {
+              const lockedIssue = await tx
+                .select({
+                  status: issues.status,
+                  assigneeAgentId: issues.assigneeAgentId,
+                  checkoutRunId: issues.checkoutRunId,
+                })
+                .from(issues)
+                .where(eq(issues.id, id))
+                .then((rows) => rows[0] ?? null);
+              const primaryCheckoutAllowed = Boolean(
+                lockedIssue &&
+                  expectedStatuses.includes(lockedIssue.status) &&
+                  (lockedIssue.assigneeAgentId === null ||
+                    (lockedIssue.assigneeAgentId === agentId &&
+                      (lockedIssue.checkoutRunId === null ||
+                        lockedIssue.checkoutRunId === checkoutRunId))),
+              );
+              if (!primaryCheckoutAllowed) return null;
+
               await clearTerminalRunLocksForCheckout(tx, id);
               return updateIssue(tx);
             },
