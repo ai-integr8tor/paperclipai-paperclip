@@ -524,9 +524,10 @@ test('a base change during success publication overwrites the transient success'
   assert.match(failure, /unavailable or stale/)
 })
 
-test('a rejected first invalidation is retried and cannot preserve prior success', async () => {
+test('a rejected first invalidation is retried before any comparison', async () => {
   const statuses = []
   let statusAttempt = 0
+  let comparisonStarted = false
   let failure
   const github = {
     request: rulesetRequest(strictRuleset({ enforcement: 'disabled' })),
@@ -545,9 +546,13 @@ test('a rejected first invalidation is retried and cannot preserve prior success
         createCommitStatus: async ({ sha, state, description }) => {
           statusAttempt += 1
           if (statusAttempt === 1) throw new Error('transient status failure')
+          if (statusAttempt === 2) assert.equal(comparisonStarted, false)
           statuses.push({ sha, state, description })
         },
-        compareCommitsWithBasehead: async () => ({ data: comparison() }),
+        compareCommitsWithBasehead: async () => {
+          comparisonStarted = true
+          return { data: comparison() }
+        },
       },
     },
   }

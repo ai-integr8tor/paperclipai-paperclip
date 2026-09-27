@@ -261,10 +261,7 @@ export async function runBranchFreshness({
   let comparisonFailed = false
   const preparedPulls = []
 
-  // Invalidate every previously successful status before doing any comparison.
-  // This keeps the remaining heads non-successful if a base-push run times out
-  // or is cancelled while processing a large set of open pull requests.
-  const invalidations = await Promise.allSettled(pulls.map(async (candidate) => {
+  async function invalidate(candidate) {
     const observedHeadSha = requireSha(candidate.headSha, `PR #${candidate.number} event head`)
     await publish(
       observedHeadSha,
@@ -272,7 +269,21 @@ export async function runBranchFreshness({
       `Checking head against protected ${protectedBase}.`,
     )
     return { ...candidate, observedHeadSha }
-  }))
+  }
+
+  // Invalidate every previously successful status before doing any comparison.
+  // This keeps the remaining heads non-successful if a base-push run times out
+  // or is cancelled while processing a large set of open pull requests.
+  const invalidations = await Promise.allSettled(pulls.map(invalidate))
+
+  // Retry every rejected invalidation together, before any per-PR comparison.
+  // A later head must not wait behind slow comparisons for earlier heads while
+  // its previous success remains visible.
+  const invalidationRetries = await Promise.allSettled(invalidations.map(
+    (invalidation, index) => invalidation.status === 'fulfilled'
+      ? invalidation.value
+      : invalidate(pulls[index]),
+  ))
 
   for (const [index, invalidation] of invalidations.entries()) {
     if (invalidation.status === 'fulfilled') {
@@ -283,15 +294,15 @@ export async function runBranchFreshness({
         ? invalidation.reason.message
         : String(invalidation.reason)
       core.error(`PR #${pulls[index].number}: could not publish pending status: ${message}`)
-      // Do not abandon a head because its first invalidation failed. A later
-      // pending or terminal write may still succeed and replace prior success.
-      preparedPulls.push({
-        ...pulls[index],
-        observedHeadSha: requireSha(
-          pulls[index].headSha,
-          `PR #${pulls[index].number} event head`,
-        ),
-      })
+      const retry = invalidationRetries[index]
+      if (retry.status === 'fulfilled') {
+        preparedPulls.push(retry.value)
+      } else {
+        const retryMessage = retry.reason instanceof Error
+          ? retry.reason.message
+          : String(retry.reason)
+        core.error(`PR #${pulls[index].number}: pending status retry failed: ${retryMessage}`)
+      }
     }
   }
 
