@@ -260,6 +260,7 @@ import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
   buildIssueBlockersResolvedWakeStateKey,
   findExistingIssueBlockersResolvedWakeForReadyState,
+  type IssueUnblockDescriptorLike,
 } from "../services/issue-dependency-wakeups.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import {
@@ -14571,6 +14572,7 @@ export function issueRoutes(
           resolvedBlockerIssueId: string;
           blockerIssueIds: string[];
           blockedTransitionAt?: Date | string | null;
+          unblockDescriptor?: IssueUnblockDescriptorLike | null;
           source: string;
           mutation: string;
         }) => {
@@ -14578,6 +14580,7 @@ export function issueRoutes(
             dependentIssueId: input.dependentIssueId,
             blockerIssueIds: input.blockerIssueIds,
             blockedTransitionAt: input.blockedTransitionAt,
+            unblockDescriptor: input.unblockDescriptor,
           });
           try {
             const existingWake =
@@ -14586,6 +14589,7 @@ export function issueRoutes(
                 dependentIssueId: input.dependentIssueId,
                 blockerIssueIds: input.blockerIssueIds,
                 blockedTransitionAt: input.blockedTransitionAt,
+                unblockDescriptor: input.unblockDescriptor,
               });
             if (existingWake) return;
           } catch (err) {
@@ -14827,6 +14831,7 @@ export function issueRoutes(
               resolvedBlockerIssueId: issue.id,
               blockerIssueIds: dependent.blockerIssueIds,
               blockedTransitionAt: dependent.blockedTransitionAt,
+              unblockDescriptor: dependent.unblockDescriptor,
               source: "issue.blockers_resolved",
               mutation: "blocker_done",
             });
@@ -14858,6 +14863,7 @@ export function issueRoutes(
               resolvedBlockerIssueId,
               blockerIssueIds: readiness.blockerIssueIds,
               blockedTransitionAt: issue.blockedTransitionAt,
+              unblockDescriptor: issue.unblockDescriptor,
               source: "issue.blockers_restored",
               mutation: "blocked_dependency_restored",
             });
@@ -18043,11 +18049,13 @@ export function issueRoutes(
           resolvedBlockerIssueId: string;
           blockerIssueIds: string[];
           blockedTransitionAt?: Date | string | null;
+          unblockDescriptor?: IssueUnblockDescriptorLike | null;
         }) => {
           const idempotencyKey = buildIssueBlockersResolvedWakeStateKey({
             dependentIssueId: input.dependentIssueId,
             blockerIssueIds: input.blockerIssueIds,
             blockedTransitionAt: input.blockedTransitionAt,
+            unblockDescriptor: input.unblockDescriptor,
           });
           try {
             const existingWake =
@@ -18056,6 +18064,7 @@ export function issueRoutes(
                 dependentIssueId: input.dependentIssueId,
                 blockerIssueIds: input.blockerIssueIds,
                 blockedTransitionAt: input.blockedTransitionAt,
+                unblockDescriptor: input.unblockDescriptor,
               });
             if (existingWake) return;
           } catch (err) {
@@ -18263,6 +18272,7 @@ export function issueRoutes(
               resolvedBlockerIssueId: currentIssue.id,
               blockerIssueIds: dependent.blockerIssueIds,
               blockedTransitionAt: dependent.blockedTransitionAt,
+              unblockDescriptor: dependent.unblockDescriptor,
             });
           }
         }
