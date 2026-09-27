@@ -602,7 +602,13 @@ async function startNetworkAllowlistProxy(
       ...describeEventHostname(hostname),
       port: port || null,
     } as const;
-    const malformedTarget = !hostname || !/^\d+$/.test(port);
+    // A hostname-only allowlist entry leaves the port unconstrained, so policy cannot reject an
+    // out-of-range one — this test is the only thing between the request line and net.connect, which
+    // validates the port synchronously and would throw out of this handler into the host process.
+    // Both bounds matter: above 65535 throws, and 0 does not throw but retargets, which is a silently
+    // wrong connection rather than a denial.
+    const portNumber = /^\d+$/.test(port) ? Number(port) : Number.NaN;
+    const malformedTarget = !hostname || !Number.isInteger(portNumber) || portNumber < 1 || portNumber > 65535;
     const matchedRule = malformedTarget ? null : matchNetworkTarget(hostname, port, rules);
     if (malformedTarget || !matchedRule) {
       sink.emit({
@@ -629,12 +635,35 @@ async function startNetworkAllowlistProxy(
       tunnelId,
     });
     const tunnelOpenedAt = Date.now();
-    const upstream = net.connect(Number(port), hostname, () => {
-      clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-      if (head.length > 0) upstream.write(head);
-      upstream.pipe(clientSocket);
-      clientSocket.pipe(upstream);
-    });
+    // The validated number, not a second Number(port): the value that passed the range check is the
+    // value that reaches the socket.
+    let upstream: net.Socket;
+    try {
+      upstream = net.connect(portNumber, hostname, () => {
+        clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+        if (head.length > 0) upstream.write(head);
+        upstream.pipe(clientSocket);
+        clientSocket.pipe(upstream);
+      });
+    } catch {
+      // Second layer, not the control — the range check above is that. net.connect validates its
+      // arguments synchronously, so any future unvalidated one would otherwise leave this handler as an
+      // uncaught exception and take the host process with it. A throw here is a transport failure, not
+      // a policy one, so the allow above stands and no second decision event is emitted; the client
+      // gets the same dead socket the asynchronous error path already gives it. The close event still
+      // fires, so no allowed tunnelId is left without its correlated end.
+      sink.emit({
+        event: "sandbox.network.tunnel.closed",
+        tunnelId,
+        hostname: connectEvent.hostname,
+        port: connectEvent.port,
+        bytesOut: 0,
+        bytesIn: 0,
+        durationMs: Date.now() - tunnelOpenedAt,
+      });
+      clientSocket.destroy();
+      return;
+    }
     upstream.on("error", () => clientSocket.destroy());
     clientSocket.on("close", () => {
       // Counters come off the socket rather than a transform in the pipe path: Node maintains both

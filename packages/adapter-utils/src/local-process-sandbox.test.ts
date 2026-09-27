@@ -55,6 +55,53 @@ function connectThroughProxy(socketPath: string, requestLine: string): Promise<s
   });
 }
 
+/**
+ * Same request as {@link connectThroughProxy}, but resolves with whatever arrived by the deadline
+ * instead of waiting for the proxy to close the socket. A proxy that dies mid-handler never answers
+ * and never ends the connection, so the plain helper would hang rather than report; this one lets the
+ * assertions run against the silence. The deadline stays well inside the suite's test timeout so a
+ * dead proxy fails on the assertion that names the cause, not on a timeout that names nothing.
+ */
+function connectThroughProxyWithDeadline(socketPath: string, requestLine: string, deadlineMs = 1000): Promise<string> {
+  return new Promise<string>((resolve) => {
+    let response = "";
+    const socket = net.createConnection(socketPath, () => {
+      socket.end(`CONNECT ${requestLine} HTTP/1.1\r\nHost: ${requestLine}\r\n\r\n`);
+    });
+    socket.setEncoding("utf8");
+    const finish = (): void => {
+      clearTimeout(deadline);
+      socket.destroy();
+      resolve(response);
+    };
+    const deadline = setTimeout(finish, deadlineMs);
+    socket.on("data", (chunk) => { response += chunk; });
+    socket.on("end", finish);
+    socket.on("error", finish);
+  });
+}
+
+/**
+ * Observes uncaught exceptions rather than inheriting them. The proxy's `http.Server` runs in this
+ * process, so a synchronous throw inside its `connect` handler is an uncaught exception in the test
+ * worker — it kills the run instead of failing an assertion, which is the difference between a
+ * readable regression and a mystery. Vitest's own handlers are parked for the duration and restored
+ * in `finally`, so a genuine crash elsewhere still reports normally.
+ */
+async function captureUncaughtExceptions<T>(run: () => Promise<T>): Promise<{ result: T; uncaught: Error[] }> {
+  const uncaught: Error[] = [];
+  const parked = process.listeners("uncaughtException");
+  for (const listener of parked) process.off("uncaughtException", listener);
+  const capture = (error: Error): void => { uncaught.push(error); };
+  process.on("uncaughtException", capture);
+  try {
+    return { result: await run(), uncaught };
+  } finally {
+    process.off("uncaughtException", capture);
+    for (const listener of parked) process.on("uncaughtException", listener);
+  }
+}
+
 async function withTmpDir<T>(tmpDir: string, run: () => Promise<T>): Promise<T> {
   const previousTmpDir = process.env.TMPDIR;
   process.env.TMPDIR = tmpDir;
@@ -446,6 +493,68 @@ describe("local process sandbox", () => {
         expect(event).toMatchObject({ decision: "deny", method: "CONNECT", scheme: null, tunnelId: null });
       }
       expect(decisions[2]).toMatchObject({ hostname: "denied.example", port: "443" });
+    } finally {
+      await target.cleanup?.();
+    }
+  });
+
+  it.runIf(process.platform === "linux")("denies an out-of-range CONNECT port instead of crashing the proxy", async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-network-port-range-"));
+    cleanup.push(workspace);
+    const events: SandboxNetworkEvent[] = [];
+    const target = await buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath,
+      args: ["-e", "process.exit(0)"],
+      cwd: workspace,
+      options: {
+        workspaceDir: workspace,
+        networkScope: "allowlist",
+        // Hostname-only, the common allowlist form: the rule's port is null, so it matches every port
+        // and policy cannot be what stops an out-of-range one. The range check has to.
+        networkAllowlist: ["allowed.example"],
+        onNetworkDecision: (event) => events.push(event),
+      },
+    });
+    const socketPath = proxySocketPath(target.args);
+
+    try {
+      const { result, uncaught } = await captureUncaughtExceptions(async () => ({
+        // net.connect validates the port synchronously, so an allowed 99999 throws ERR_SOCKET_BAD_PORT
+        // out of the connect handler and takes the host adapter process with it.
+        aboveRange: await connectThroughProxyWithDeadline(socketPath, "allowed.example:99999"),
+        // 65536 is the first illegal port; 0 does not throw but silently retargets, which is a wrong
+        // connection rather than a denial. Both have to deny.
+        justAboveRange: await connectThroughProxyWithDeadline(socketPath, "allowed.example:65536"),
+        zero: await connectThroughProxyWithDeadline(socketPath, "allowed.example:0"),
+        // Taken last, from the surviving proxy: the reference denial the three above must match byte
+        // for byte, and proof the proxy is still serving after them.
+        policyDenial: await connectThroughProxyWithDeadline(socketPath, "denied.example:443"),
+      }));
+
+      // 1. The proxy survives the request.
+      expect(uncaught).toEqual([]);
+      expect(result.policyDenial).toContain("HTTP/1.1 403 Forbidden\r\n");
+
+      // 2. One deny per attempt, reason invalid_connect_target, and no allow anywhere.
+      const decisions = decisionEvents(events);
+      expect(decisions.map((event) => event.reason)).toEqual([
+        "invalid_connect_target",
+        "invalid_connect_target",
+        "invalid_connect_target",
+        "network_target_denied",
+      ]);
+      for (const event of decisions) {
+        expect(event).toMatchObject({ decision: "deny", method: "CONNECT", scheme: null, tunnelId: null });
+      }
+      expect(decisions.slice(0, 3).map((event) => event.port)).toEqual(["99999", "65536", "0"]);
+      // No tunnel was opened, so no tunnel.closed can be correlated to one.
+      expect(tunnelEvents(events)).toEqual([]);
+
+      // 3. The wire response is byte-identical to a policy denial: the confined process learns nothing
+      // about which branch it hit, so an out-of-range port stays as unreachable as it already was.
+      expect(result.aboveRange).toEqual(result.policyDenial);
+      expect(result.justAboveRange).toEqual(result.policyDenial);
+      expect(result.zero).toEqual(result.policyDenial);
     } finally {
       await target.cleanup?.();
     }
