@@ -79,8 +79,14 @@ export function githubPrClosureSweepService(
         const prOrConditions = companyHints.map((hint) =>
           sql`EXISTS (
             SELECT 1
-            FROM jsonb_array_elements(${approvals.payload}->'prs') AS pr
+            FROM jsonb_array_elements(
+              CASE WHEN jsonb_typeof(${approvals.payload}->'prs') = 'array'
+                   THEN ${approvals.payload}->'prs'
+                   ELSE '[]'::jsonb
+              END
+            ) AS pr
             WHERE (pr->>'repo') ILIKE ${hint.owner + "/" + hint.repo}
+              AND (pr->>'number') ~ '^[0-9]+$'
               AND (pr->>'number')::int = ${hint.number}
           )`,
         );
@@ -133,7 +139,10 @@ export function githubPrClosureSweepService(
         const cancelledIds = cancelledApprovals.map((a) => a.id);
 
         // Find tasks linked to those cancelled cards that are still waiting.
-        const linkedIssues = await db
+        // Enforce company scope so a cross-company approval link (data anomaly)
+        // cannot route tasks in another company. Deduplicate by issue id to
+        // avoid double-processing when two cards link to the same task.
+        const linkedIssuesRaw = await db
           .select({
             id: issues.id,
             companyId: issues.companyId,
@@ -145,9 +154,17 @@ export function githubPrClosureSweepService(
           .where(
             and(
               inArray(issueApprovals.approvalId, cancelledIds),
+              eq(issues.companyId, companyId),
               inArray(issues.status, ["in_review", "blocked"]),
             ),
           );
+
+        const seenIssueIds = new Set<string>();
+        const linkedIssues = linkedIssuesRaw.filter((i) => {
+          if (seenIssueIds.has(i.id)) return false;
+          seenIssueIds.add(i.id);
+          return true;
+        });
 
         if (linkedIssues.length === 0) continue;
 
