@@ -59,7 +59,7 @@ The agent request is built as:
 
 - `timeoutSec` controls adapter-level request budget
 - `runBudgetMs` is the total run budget (legacy alias: `waitTimeoutMs`). It is sent as `agent.timeout` in **seconds** and bounds the adapter's wait loop.
-- `waitWindowMs` controls each `agent.wait.timeoutMs` (default `60000`)
+- `waitWindowMs` controls each `agent.wait.timeoutMs` (default `60000`), capped to the run budget left, so no observation outlives `runBudgetMs`
 - `maxWaitCalls` caps `agent.wait` calls per run (default `60`)
 
 Once the gateway accepts a run, the adapter emits an `openclaw.run.accepted` run event and never re-sends `agent` for that execution:

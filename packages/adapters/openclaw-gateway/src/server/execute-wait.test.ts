@@ -210,6 +210,36 @@ describe("openclaw_gateway execute wait loop", () => {
     expect(gateway.waitRequests.length).toBeLessThan(60);
   });
 
+  it("caps each agent.wait window to the budget left and never starts a call past it", async () => {
+    gateway.wait = () => ({ status: "timeout" });
+    const { ctx } = createContext({ runBudgetMs: 2_500, waitWindowMs: 1_000 });
+
+    const result = await runExecute(ctx);
+
+    expect(result.errorCode).toBe("openclaw_gateway_wait_budget_exhausted");
+    // t=0 and t=1000 get the full window; t=2000 only the 500ms left; none at t=2500.
+    expect(gateway.waitRequests.map((request) => request.timeoutMs)).toEqual([1_000, 1_000, 500]);
+  });
+
+  it.each([
+    ["error", { status: "error", error: "model crashed" }, "openclaw_gateway_wait_error", "wait_error"],
+    ["unexpected", { status: "weird" }, "openclaw_gateway_wait_status_unexpected", "wait_status_unexpected"],
+  ])("keeps accepted-run evidence on a %s wait status", async (_label, reply, errorCode, phase) => {
+    gateway.wait = () => reply;
+    const { ctx } = createContext({ runBudgetMs: 20_000, waitWindowMs: 200 });
+
+    const result = await runExecute(ctx);
+
+    expect(result).toMatchObject({ exitCode: 1, errorCode });
+    expect(result.errorMessage).toContain("oc-run-1");
+    expect(dispatchOf(result)).toMatchObject({
+      phase,
+      acceptedRunId: "oc-run-1",
+      idempotencyKey: PAPERCLIP_RUN_ID,
+      providerWorkStarted: true,
+    });
+  });
+
   it("reconnects after a dropped socket and resumes agent.wait without re-sending agent", async () => {
     gateway.wait = (n) => (n === 2 ? "drop" : n < 3 ? { status: "timeout" } : { status: "ok", summary: "done" });
     const { ctx } = createContext({ runBudgetMs: 20_000, waitWindowMs: 200 });

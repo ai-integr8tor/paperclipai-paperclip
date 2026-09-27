@@ -1485,15 +1485,41 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (acceptedStatus !== "ok") {
         let waitPayload: Record<string, unknown> | null = null;
         let waitStatus = "";
+        // The run may still be working on the gateway: name it and stop, never re-dispatch.
+        const waitBudgetExhausted = async (): Promise<AdapterExecutionResult> => {
+          await ctx.onLog(
+            "stderr",
+            `[openclaw-gateway] wait budget exhausted runId=${acceptedRunId} wait_calls=${waitCallsTotal}/${maxWaitCalls} budget_ms=${runBudgetMs}\n`,
+          );
+          return {
+            exitCode: 1,
+            signal: null,
+            timedOut: true,
+            errorMessage:
+              `OpenClaw gateway wait budget exhausted after ${waitCallsTotal} agent.wait calls over ${runBudgetMs}ms; ` +
+              `run ${acceptedRunId} was accepted and may still be running`,
+            errorCode: "openclaw_gateway_wait_budget_exhausted",
+            resultJson: {
+              ...(waitPayload ?? {}),
+              openclawDispatch: dispatchEvidence("wait_budget_exhausted", acceptedRunId, {
+                observation: waitObservation(waitPayload),
+              }),
+            },
+          };
+        };
         // Observe the same run until it settles. An observation timeout means
         // "still running", so wait again, bounded by the run budget and call cap.
         while (true) {
+          const budgetLeftMs = waitDeadlineMs - Date.now();
+          if (waitCallsTotal > 0 && budgetLeftMs <= 0) return await waitBudgetExhausted();
+          // No single observation may outlive the run budget.
+          const callWindowMs = Math.max(1, Math.min(waitWindowMs, budgetLeftMs));
           waitCallsTotal++;
           waitPayload = asRecord(
             await client.request<unknown>(
               "agent.wait",
-              { runId: acceptedRunId, timeoutMs: waitWindowMs },
-              { timeoutMs: waitWindowMs + connectTimeoutMs },
+              { runId: acceptedRunId, timeoutMs: callWindowMs },
+              { timeoutMs: callWindowMs + connectTimeoutMs },
             ),
           );
           latestResultPayload = waitPayload;
@@ -1507,37 +1533,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             break;
           }
 
-          const budgetLeftMs = waitDeadlineMs - Date.now();
-          if (budgetLeftMs <= 0 || waitCallsTotal >= maxWaitCalls) {
-            // The run may still be working on the gateway: name it and stop,
-            // never re-dispatch.
-            await ctx.onLog(
-              "stderr",
-              `[openclaw-gateway] wait budget exhausted runId=${acceptedRunId} wait_calls=${waitCallsTotal}/${maxWaitCalls} budget_ms=${runBudgetMs}\n`,
-            );
-            return {
-              exitCode: 1,
-              signal: null,
-              timedOut: true,
-              errorMessage:
-                `OpenClaw gateway wait budget exhausted after ${waitCallsTotal} agent.wait calls over ${runBudgetMs}ms; ` +
-                `run ${acceptedRunId} was accepted and may still be running`,
-              errorCode: "openclaw_gateway_wait_budget_exhausted",
-              resultJson: {
-                ...(waitPayload ?? {}),
-                openclawDispatch: dispatchEvidence("wait_budget_exhausted", acceptedRunId, {
-                  observation: waitObservation(waitPayload),
-                }),
-              },
-            };
-          }
+          const budgetLeftAfterMs = waitDeadlineMs - Date.now();
+          if (budgetLeftAfterMs <= 0 || waitCallsTotal >= maxWaitCalls) return await waitBudgetExhausted();
 
           await ctx.onLog(
             "stdout",
             `[openclaw-gateway] observation timeout, continuing runId=${acceptedRunId} ` +
-              `wait_call=${waitCallsTotal}/${maxWaitCalls} budget_left_ms=${budgetLeftMs}\n`,
+              `wait_call=${waitCallsTotal}/${maxWaitCalls} budget_left_ms=${budgetLeftAfterMs}\n`,
           );
-          await new Promise((r) => setTimeout(r, Math.min(WAIT_LOOP_BACKOFF_MS, budgetLeftMs)));
+          await new Promise((r) => setTimeout(r, Math.min(WAIT_LOOP_BACKOFF_MS, budgetLeftAfterMs)));
         }
 
         if (waitStatus === "timeout") {
@@ -1561,12 +1565,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             exitCode: 1,
             signal: null,
             timedOut: false,
-            errorMessage:
-              nonEmpty(waitPayload?.error) ??
-              lifecycleError ??
-              "OpenClaw gateway run failed",
+            errorMessage: `${
+              nonEmpty(waitPayload?.error) ?? lifecycleError ?? "OpenClaw gateway run failed"
+            } (accepted run ${acceptedRunId})`,
             errorCode: "openclaw_gateway_wait_error",
-            resultJson: waitPayload,
+            resultJson: {
+              ...(waitPayload ?? {}),
+              openclawDispatch: dispatchEvidence("wait_error", acceptedRunId, {
+                observation: waitObservation(waitPayload),
+              }),
+            },
           };
         }
 
@@ -1575,9 +1583,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             exitCode: 1,
             signal: null,
             timedOut: false,
-            errorMessage: `Unexpected OpenClaw gateway agent.wait status: ${waitStatus}`,
+            errorMessage: `Unexpected OpenClaw gateway agent.wait status: ${waitStatus} (accepted run ${acceptedRunId})`,
             errorCode: "openclaw_gateway_wait_status_unexpected",
-            resultJson: waitPayload,
+            resultJson: {
+              ...(waitPayload ?? {}),
+              openclawDispatch: dispatchEvidence("wait_status_unexpected", acceptedRunId, {
+                observation: waitObservation(waitPayload),
+              }),
+            },
           };
         }
       }
@@ -1703,19 +1716,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           lower.includes("gateway not connected") ||
           lower.includes("gateway request timeout (agent.wait)"));
 
+      const reconnectBackoffMs = Math.min(
+        OBSERVATION_RECONNECT_MAX_BACKOFF_MS,
+        WAIT_LOOP_BACKOFF_MS * 2 ** observationReconnects,
+      );
       if (
         observationTransportLost &&
         acceptedRunIdCheckpoint &&
-        Date.now() < waitDeadlineMs &&
+        // Reconnect only if run budget is left to observe once the backoff ends.
+        Date.now() + reconnectBackoffMs < waitDeadlineMs &&
         waitCallsTotal < maxWaitCalls &&
         observationReconnects < MAX_OBSERVATION_RECONNECTS
       ) {
         observationReconnects++;
-        const backoffMs = Math.min(
-          OBSERVATION_RECONNECT_MAX_BACKOFF_MS,
-          WAIT_LOOP_BACKOFF_MS * 2 ** (observationReconnects - 1),
-          Math.max(0, waitDeadlineMs - Date.now()),
-        );
+        const backoffMs = reconnectBackoffMs;
         await ctx.onLog(
           "stdout",
           `[openclaw-gateway] websocket lost while observing runId=${acceptedRunIdCheckpoint}; ` +
