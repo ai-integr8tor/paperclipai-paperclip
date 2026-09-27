@@ -109,7 +109,7 @@
 - [ ] I have added or updated tests where applicable
 - [ ] I have updated relevant documentation to reflect my changes
 - [ ] I have considered and documented any risks above
-- [ ] For behaviour / schema / auth / data changes: I expect the reviewer to apply [`doc/reviews/code-review-checklist.md`](../doc/reviews/code-review-checklist.md) (correctness, safety, tests, compatibility, observability, operability, performance, docs)
+- [ ] For behaviour / schema / auth / data changes: I expect the reviewer to apply [`doc/reviews/code-review-checklist.md`](doc/reviews/code-review-checklist.md) (correctness, safety, tests, compatibility, observability, operability, performance, docs)
 - [ ] High-risk changes (auth, payments, migrations, external contracts): rollback plan is attached or linked in Risks
 - [ ] All Paperclip CI gates are green
 - [ ] Greptile is 5/5 with no open P2s, recommendations, or follow-ups

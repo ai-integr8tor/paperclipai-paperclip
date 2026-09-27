@@ -31,7 +31,7 @@ Use the governance gates. Risk-tier automation is tracked separately.
 | Class | Minimum before approve |
 |---|---|
 | **Low** (docs, non-runtime tooling) | Checklist pass + CI green + 1 reviewer approval |
-| **Medium** (business logic / internal API) | Checklist pass + CI + tests for changed behavior + reviewer + Lead Engineer when applicable |
+| **Medium** (business logic / internal API) | Checklist pass + CI + tests for changed behavior + 1 reviewer + Lead Engineer approval |
 | **High** (auth, payments, data migrations, external contracts) | Checklist pass + security focus + rollback plan attached + 2 approvals (Reviewer + Lead or CTO) |
 
 ## High-risk extras (when applicable)
