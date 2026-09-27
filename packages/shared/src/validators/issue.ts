@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { executionGrantApprovalDetails } from "../execution-grant-details.js";
 import {
   ISSUE_EXECUTION_DECISION_OUTCOMES,
   ISSUE_EXECUTION_MONITOR_CLEAR_REASONS,
@@ -1505,14 +1506,23 @@ export const requestConfirmationSecretProposalPayloadSchema = z.object({
   expiresAt: z.string().datetime({ offset: true }),
 });
 
-export const executionGrantRequestPayloadSchema = z.object({
+const executionGrantDisplaySafeFields = new Set([
+  "name", "role", "title", "icon", "reportsTo", "capabilities",
+  "adapterType", "defaultEnvironmentId", "budgetMonthlyCents",
+]);
+
+export const executionGrantRequestPayloadSchema = z.strictObject({
   version: z.literal(1),
   executorAgentId: z.string().guid(),
   targetAgentId: z.string().guid(),
   operation: z.literal("agent_config:update"),
   targetRevisionId: z.string().guid().nullable(),
   targetUpdatedAt: z.string().datetime({ offset: true }),
-  requestBody: z.record(z.string(), z.unknown()),
+  requestBody: z.record(z.string(), z.unknown()).refine(
+    (body) => Object.keys(body).length > 0 &&
+      Object.keys(body).every((key) => executionGrantDisplaySafeFields.has(key)),
+    "Execution grants only support display-safe agent configuration fields",
+  ),
   requestHash: z.string().regex(/^[a-f0-9]{64}$/),
   expiresAt: z.string().datetime({ offset: true }),
   policyVersion: z.number().int().positive(),
@@ -1539,6 +1549,15 @@ export const requestConfirmationPayloadSchema = z.object({
   toolAction: requestConfirmationToolActionPayloadSchema.optional(),
   secretProposal: requestConfirmationSecretProposalPayloadSchema.optional(),
   executionGrant: executionGrantRequestPayloadSchema.optional(),
+}).superRefine((value, ctx) => {
+  if (value.executionGrant &&
+      value.detailsMarkdown !== executionGrantApprovalDetails(value.executionGrant)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["detailsMarkdown"],
+      message: "Execution grant approval details must show the exact request",
+    });
+  }
 });
 
 export const requestCheckboxConfirmationOptionSchema = z.object({

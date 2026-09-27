@@ -73,14 +73,16 @@ export function executionGrantRoutes(db: Db) {
     const companyId = req.actor.companyId;
     if (!companyId) throw forbidden("Company-scoped agent authentication is required");
     assertCompanyAccess(req, companyId);
+    const executorAgentId = req.actor.agentId;
+    const runId = req.actor.runId;
     const actor = getActorInfo(req);
     const grant = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       await assertActiveExecutionGrantRun({
         db: txDb,
         companyId,
-        executorAgentId: req.actor.agentId,
-        runId: req.actor.runId,
+        executorAgentId,
+        runId,
       });
       const issued = await issueExecutionGrant({
         db: txDb,
@@ -88,7 +90,7 @@ export function executionGrantRoutes(db: Db) {
         issueId: req.params.id as string,
         decisionKind: req.body.decisionKind,
         decisionId: req.body.decisionId,
-        executorAgentId: req.actor.agentId,
+        executorAgentId,
       });
       if (issued?.newlyIssued) {
         await logActivity(txDb, {

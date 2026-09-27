@@ -1,0 +1,43 @@
+import { describe, expect, it } from "vitest";
+import { executionGrantApprovalDetails } from "../execution-grant-details.js";
+import { createApprovalSchema, resubmitApprovalSchema } from "./approval.js";
+import { requestConfirmationPayloadSchema } from "./issue.js";
+
+const request = {
+  version: 1 as const,
+  executorAgentId: "11111111-1111-4111-8111-111111111111",
+  targetAgentId: "22222222-2222-4222-8222-222222222222",
+  operation: "agent_config:update" as const,
+  targetRevisionId: null,
+  targetUpdatedAt: "2026-09-27T00:00:00Z",
+  requestBody: { name: "Chief of staff" },
+  requestHash: "a".repeat(64),
+  expiresAt: "2026-09-28T00:00:00Z",
+  policyVersion: 1,
+};
+
+const detailsMarkdown = executionGrantApprovalDetails(request);
+const interaction = { version: 1, prompt: "Approve?", executionGrant: request, detailsMarkdown };
+const board = { type: "request_board_approval" as const, payload: { executionGrant: request, detailsMarkdown } };
+
+describe("execution grant approval payloads", () => {
+  it("accepts the exact displayed request in interaction and board decisions", () => {
+    expect(requestConfirmationPayloadSchema.safeParse(interaction).success).toBe(true);
+    expect(createApprovalSchema.safeParse(board).success).toBe(true);
+    expect(resubmitApprovalSchema.safeParse({ payload: board.payload }).success).toBe(true);
+  });
+
+  it.each([
+    ["interaction", (payload: unknown) => requestConfirmationPayloadSchema.safeParse(payload).success,
+      (executionGrant: unknown, details: string) => ({ ...interaction, executionGrant, detailsMarkdown: details })],
+    ["board creation", (payload: unknown) => createApprovalSchema.safeParse(payload).success,
+      (executionGrant: unknown, details: string) => ({ ...board, payload: { executionGrant, detailsMarkdown: details } })],
+    ["board resubmission", (payload: unknown) => resubmitApprovalSchema.safeParse(payload).success,
+      (executionGrant: unknown, details: string) => ({ payload: { executionGrant, detailsMarkdown: details } })],
+  ] as const)("rejects hidden or undisplayed grant content at %s", (_name, parse, wrap) => {
+    expect(parse(wrap({ ...request, requestBody: { adapterConfig: { apiKey: "secret" } } }, detailsMarkdown)))
+      .toBe(false);
+    expect(parse(wrap({ ...request, hiddenSecret: "secret" }, detailsMarkdown))).toBe(false);
+    expect(parse(wrap({ ...request, requestBody: { name: "Changed" } }, detailsMarkdown))).toBe(false);
+  });
+});

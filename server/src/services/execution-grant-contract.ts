@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+export { executionGrantApprovalDetails } from "@paperclipai/shared";
 
 export const EXECUTION_GRANT_POLICY_VERSION = 1;
 
@@ -64,35 +65,6 @@ export function executionGrantRequestHash(method: string, path: string, body: un
     .digest("hex");
 }
 
-/** This exact text is shown to the approver and checked again before issuance. */
-export function executionGrantApprovalDetails(request: {
-  executorAgentId: string;
-  targetAgentId: string;
-  targetRevisionId: string | null;
-  targetUpdatedAt: string;
-  requestBody: Record<string, unknown>;
-  requestHash: string;
-  expiresAt: string;
-  policyVersion: number;
-}): string {
-  const bodyLines = JSON.stringify(canonicalize(request.requestBody), null, 2)
-    .split("\n").map((line) => `+${line}`);
-  return [
-    "Approve one exact agent configuration write.",
-    `Executor agent: ${request.executorAgentId}`,
-    `Target agent: ${request.targetAgentId}`,
-    `Target revision: ${request.targetRevisionId ?? "none"}`,
-    `Target updated at: ${request.targetUpdatedAt}`,
-    `Expires at: ${request.expiresAt}`,
-    `Policy version: ${request.policyVersion}`,
-    "",
-    "```diff",
-    `+++ PATCH /api/agents/${request.targetAgentId}`,
-    ...bodyLines,
-    "```",
-    `Request SHA-256: ${request.requestHash}`,
-  ].join("\n");
-}
 
 export function executionGrantDenial(
   grant: ExecutionGrant,

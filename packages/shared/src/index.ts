@@ -1,4 +1,5 @@
 export { agentAdapterTypeSchema, optionalAgentAdapterTypeSchema } from "./adapter-type.js";
+export { executionGrantApprovalDetails, type ExecutionGrantDisplayRequest } from "./execution-grant-details.js";
 export {
   RUNNER_GOAL_MAX_OBJECTIVE_CHARS,
   runnerGoalAvailabilitySchema,
