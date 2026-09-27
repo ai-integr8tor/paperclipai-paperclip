@@ -542,6 +542,88 @@ test('a stalled invalidation and retry are bounded without blocking other compar
   assert.match(failure, /comparison was unavailable or stale/)
 })
 
+test('a late first invalidation write taints the head even when its retry succeeds', async () => {
+  const taintedHead = head
+  const healthyHead = 'c'.repeat(40)
+  const statuses = []
+  const comparedHeads = []
+  const errors = []
+  let failure
+  let taintedAttempt = 0
+  let releaseLateWrite
+  const lateWrite = new Promise((resolve) => {
+    releaseLateWrite = resolve
+  })
+  const pulls = [
+    { number: 41, head: { sha: taintedHead } },
+    { number: 42, head: { sha: healthyHead } },
+  ]
+  const github = {
+    request: rulesetRequest(),
+    paginate: async () => pulls,
+    rest: {
+      git: { getRef: async () => ({ data: { object: { sha: base } } }) },
+      pulls: {
+        list: async () => ({ data: pulls }),
+        get: async ({ pull_number: number }) => ({
+          data: {
+            state: 'open',
+            base: { ref: 'master' },
+            head: { sha: number === 41 ? taintedHead : healthyHead },
+          },
+        }),
+      },
+      repos: {
+        createCommitStatus: async ({ sha, state, description }) => {
+          if (sha === taintedHead && state === 'pending' && ++taintedAttempt === 1) {
+            await lateWrite
+          }
+          statuses.push({ sha, state, description })
+        },
+        compareCommitsWithBasehead: async ({ basehead }) => {
+          const comparedHead = basehead.split('...')[1]
+          comparedHeads.push(comparedHead)
+          return { data: comparison({ behind_by: 1 }) }
+        },
+      },
+    },
+  }
+  const context = {
+    eventName: 'push',
+    payload: { after: base },
+    sha: base,
+    repo: { owner: 'paperclipai', repo: 'paperclip' },
+    runId: 1,
+    serverUrl: 'https://github.com',
+  }
+  const core = {
+    error: (message) => errors.push(message),
+    setFailed: (message) => { failure = message },
+  }
+
+  await runBranchFreshness({
+    github,
+    context,
+    core,
+    invalidationTimeoutMs: 5,
+  })
+
+  assert.deepEqual(comparedHeads, [healthyHead])
+  assert.equal(statuses.filter(({ sha }) => sha === taintedHead).length, 1)
+  assert.equal(statuses.find(({ sha }) => sha === taintedHead).state, 'pending')
+  assert.match(errors[0], /timed out after 5ms/)
+  assert.match(errors[1], /head remains excluded after an uncertain first write/)
+  assert.match(failure, /comparison was unavailable or stale/)
+
+  releaseLateWrite()
+  await new Promise((resolve) => setImmediate(resolve))
+
+  assert.equal(statuses.filter(({ sha }) => sha === taintedHead).length, 2)
+  assert.ok(statuses
+    .filter(({ sha }) => sha === taintedHead)
+    .every(({ state }) => state === 'pending'))
+})
+
 test('a base change during success publication overwrites the transient success', async () => {
   const newerBase = 'c'.repeat(40)
   const statuses = []
@@ -592,7 +674,7 @@ test('a base change during success publication overwrites the transient success'
   assert.match(failure, /unavailable or stale/)
 })
 
-test('a rejected first invalidation is retried before any comparison', async () => {
+test('a rejected first invalidation is retried but excluded from comparison', async () => {
   const statuses = []
   let statusAttempt = 0
   let comparisonStarted = false
@@ -635,11 +717,8 @@ test('a rejected first invalidation is retried before any comparison', async () 
 
   await runBranchFreshness({ github, context, core })
 
+  assert.equal(comparisonStarted, false)
   assert.equal(statuses[0].state, 'pending')
-  assert.deepEqual(statuses.at(-1), {
-    sha: head,
-    state: 'error',
-    description: 'Strict branch-freshness enforcement is unavailable.',
-  })
+  assert.equal(statuses.length, 1)
   assert.match(failure, /unavailable or stale/)
 })

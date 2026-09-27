@@ -316,7 +316,11 @@ export async function runBranchFreshness({
       core.error(`PR #${pulls[index].number}: could not publish pending status: ${message}`)
       const retry = invalidationRetries[index]
       if (retry.status === 'fulfilled') {
-        preparedPulls.push(retry.value)
+        // A rejected request has an unknown server-side outcome. It can still
+        // complete after this retry and replace a later terminal status with
+        // pending. The retry removes any prior success when it lands, but this
+        // run must not compare or finalize the tainted head.
+        core.error(`PR #${pulls[index].number}: pending status retry succeeded, but the head remains excluded after an uncertain first write`)
       } else {
         const retryMessage = retry.reason instanceof Error
           ? retry.reason.message
