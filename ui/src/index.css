@@ -3009,6 +3009,9 @@ span.paperclip-mention-chip[data-mention-kind="external-object"] {
 @media (max-width: 40rem) {
   [data-radix-popper-content-wrapper]:has(> [data-mobile-entity-picker]) {
     transform: none !important;
+    /* will-change: transform also makes the wrapper the containing block for the
+       fixed sheet, which then collapses to the wrapper's 0x0 box. */
+    will-change: auto !important;
   }
 
   [data-mobile-entity-picker] {
