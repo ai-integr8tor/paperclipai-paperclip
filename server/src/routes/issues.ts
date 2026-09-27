@@ -1451,6 +1451,18 @@ const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS = new Set([
   "issue_assignment_recovery",
   "issue_continuation_needed",
   "provider_quota_recovery",
+  // Scheduled monitors and bounded retries the dispatcher enqueues itself.
+  "issue_monitor_due",
+  "transient_failure_retry",
+  "workspace_busy_retry",
+  "max_turns_continuation_retry",
+  "ai_connection_busy_retry",
+  "interaction_continuation_infra_retry",
+  "execution_review_participant_recovery",
+  "native_safe_replacement",
+  "issue_review_path_lost",
+  // Interaction hand-off wake.
+  "interaction_pending",
   // Operator- and timer-driven wakes.
   "retry_failed_run",
   "queued_comment_interrupt",
