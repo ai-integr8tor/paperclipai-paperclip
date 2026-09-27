@@ -1,4 +1,5 @@
 import { redactCommandText } from "@paperclipai/adapter-utils";
+import { isPublicExecutorToolSelector } from "@paperclipai/adapter-utils/command-redaction";
 
 const SECRET_FIELD_NAME_PATTERN = String.raw`[A-Za-z0-9_-]*(?:api[-_]?key|access[-_]?token|auth(?:_?token)?|token|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring|browser[-_]?code|login[-_]?url)[A-Za-z0-9_-]*`;
 
@@ -45,6 +46,8 @@ const COMMAND_PAYLOAD_KEY_RE =
 const COMMAND_ARGS_PAYLOAD_KEY_RE = /^(commandArgs|command_?args|argv)$/i;
 const JWT_VALUE_RE =
   /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?$/;
+const JWT_TEXT_CANDIDATE_RE =
+  /(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{8,}){2,}/g;
 // Durable protocol schema identifiers share JWT's broad dotted shape but are
 // public discriminators, not credentials. Exempt the Paperclip schema
 // namespace only in fields that actually declare a schema; the same value in
@@ -735,7 +738,7 @@ function sanitizeValue(value: unknown): unknown {
   // string leaf after validated protocol discriminators have had a chance to
   // opt in above in sanitizeRecord.
   if (typeof value === "string") {
-    return JWT_VALUE_RE.test(value)
+    return JWT_VALUE_RE.test(value) && !isPublicExecutorToolSelector(value)
       ? REDACTED_EVENT_VALUE
       : redactSensitiveText(value);
   }
@@ -926,6 +929,7 @@ export function sanitizeRecord(
     if (
       typeof value === "string" &&
       JWT_VALUE_RE.test(value) &&
+      !isPublicExecutorToolSelector(value) &&
       !isPaperclipSchemaDiscriminator(key, value)
     ) {
       redacted[key] = REDACTED_EVENT_VALUE;
@@ -995,7 +999,15 @@ export function redactSensitiveText(input: string): string {
       .replace(
         ESCAPED_JSON_SECRET_FIELD_TEXT_RE,
         `$1${REDACTED_EVENT_VALUE}$2`,
-      ),
+      )
+      .replace(JWT_TEXT_CANDIDATE_RE, (match, offset: number, source: string) => {
+        const address = source
+          .slice(offset)
+          .match(/^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*/)?.[0];
+        return address && isPublicExecutorToolSelector(address)
+          ? match
+          : REDACTED_EVENT_VALUE;
+      }),
     REDACTED_EVENT_VALUE,
   );
 }

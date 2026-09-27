@@ -73,7 +73,6 @@ import {
   removeMaintainerOnlySkillSymlinks,
   rewriteWorkspaceCwdEnvVarsForExecution,
   shapePaperclipWorkspaceEnvForExecution,
-  stringifyPaperclipWakePayload,
   type PaperclipSkillEntry,
 } from "@paperclipai/adapter-utils/server-utils";
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
@@ -360,9 +359,25 @@ export interface AcpxRemoteManagedHomeResult {
   disposeStaged?: () => Promise<void>;
 }
 
+export interface AcpxTerminalSessionFailure {
+  category: string;
+  title?: string;
+  details?: string;
+}
+
+export type AcpxTerminalFailureClassification = Pick<
+  AdapterExecutionResult,
+  "errorCode" | "errorFamily" | "retryNotBefore"
+>;
+
 export interface AcpxEngineExecutorOptions {
   createRuntime?: AcpxRuntimeFactory;
   now?: () => number;
+  /** Inspect terminal provider text in memory; return only recovery labels and a timestamp. */
+  classifyTerminalSessionFailure?: (
+    failure: AcpxTerminalSessionFailure,
+    now: Date,
+  ) => AcpxTerminalFailureClassification | null;
   /**
    * The bound on how long the fail-fast seam waits for a cooperative
    * `turn.cancel()` after a latched terminal sandbox duplex-channel loss,
@@ -2014,7 +2029,7 @@ function normalizeMode(config: Record<string, unknown>): "persistent" | "oneshot
 function normalizePermissionMode(config: Record<string, unknown>): "approve-all" | "approve-reads" | "deny-all" {
   const value = asString(config.permissionMode, DEFAULT_ACP_ENGINE_PERMISSION_MODE).trim();
   if (value === "approve-reads" || value === "deny-all") return value;
-  if (value === "default") return "approve-reads";
+  if (value === "default") return DEFAULT_ACP_ENGINE_PERMISSION_MODE;
   return "approve-all";
 }
 
@@ -2530,7 +2545,6 @@ async function buildRuntimeInner(
   const linkedIssueIds = Array.isArray(context.issueIds)
     ? context.issueIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     : [];
-  const wakePayloadJson = stringifyPaperclipWakePayload(context.paperclipWake);
   const issueWorkMode = readPaperclipIssueWorkModeFromContext(context);
   if (wakeTaskId) env.PAPERCLIP_TASK_ID = wakeTaskId;
   if (issueWorkMode) env.PAPERCLIP_ISSUE_WORK_MODE = issueWorkMode;
@@ -2539,7 +2553,6 @@ async function buildRuntimeInner(
   if (approvalId) env.PAPERCLIP_APPROVAL_ID = approvalId;
   if (approvalStatus) env.PAPERCLIP_APPROVAL_STATUS = approvalStatus;
   if (linkedIssueIds.length > 0) env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
-  if (wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
   applyPaperclipWorkspaceEnv(env, {
     workspaceCwd: shapedWorkspaceEnv.workspaceCwd,
     workspaceSource,
@@ -4709,6 +4722,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       // `endSession` step can cancel a running turn before it closes the runtime
       // (the cancel-before-close order). The turn wrapper assigns it in `turnStart`.
       let activeTurn: AcpRuntimeTurn | null = null;
+      let terminalFailureClassification: AcpxTerminalFailureClassification | null = null;
       // How the settlement `endSession` step must release the runtime for the path
       // this run took. Each exit path that acquired the runtime records it before it
       // returns; a build or create-runtime failure never registers the runtime, so
@@ -5389,6 +5403,15 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           requestId: ctx.runId,
           timeoutMs: startTimeoutMs,
           signal,
+          // The callback belongs to this turn, including when a runtime is reused.
+          // Raw provider text must never enter the result or the run log.
+          ...(deps.classifyTerminalSessionFailure
+            ? {
+                onTerminalSessionFailure: (failure: AcpxTerminalSessionFailure) => {
+                  terminalFailureClassification = deps.classifyTerminalSessionFailure!(failure, new Date(now()));
+                },
+              }
+            : {}),
         });
         activeTurn = turn;
         // A latched sandbox duplex-channel loss otherwise has no way to reach
@@ -5607,6 +5630,9 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             ? channelLostMessage
             : resultErrorMessage(terminal);
         const terminalStopReason = terminal.status === "failed" ? terminal.error.message : terminal.stopReason;
+        const classifiedFailure = !timedOut && !channelLost && terminal.status === "failed"
+          ? terminalFailureClassification
+          : null;
         await emitAcpxLog(ctx, {
           type: turnSucceeded ? "acpx.result" : "acpx.error",
           summary: channelLost ? "duplex_channel_lost" : terminal.status,
@@ -5627,8 +5653,10 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             : channelLost
               ? DUPLEX_CHANNEL_LOST_ERROR_CODE
               : terminal.status === "failed"
-                ? "acpx_turn_failed"
+                ? classifiedFailure?.errorCode ?? "acpx_turn_failed"
                 : null,
+          ...(classifiedFailure?.errorFamily ? { errorFamily: classifiedFailure.errorFamily } : {}),
+          ...(classifiedFailure?.retryNotBefore ? { retryNotBefore: classifiedFailure.retryNotBefore } : {}),
           sessionId: sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName,
           sessionParams: buildSessionParams({ prepared, handle: sessionHandle }),
           sessionDisplayId: sessionHandle.agentSessionId ?? sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName,
@@ -5639,6 +5667,15 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           costUsd: turnUsage.costUsd,
           resultJson: {
             status: channelLost ? "failed" : terminal.status,
+            ...(classifiedFailure?.errorFamily ? { errorFamily: classifiedFailure.errorFamily } : {}),
+            ...(classifiedFailure?.retryNotBefore
+              ? {
+                  retryNotBefore: classifiedFailure.retryNotBefore,
+                  ...(classifiedFailure.errorFamily === "provider_quota"
+                    ? { providerQuotaRetryNotBefore: classifiedFailure.retryNotBefore }
+                    : {}),
+                }
+              : {}),
             stopReason: terminalStopReason,
             permissionMode: prepared.permissionMode,
             mode: prepared.mode,

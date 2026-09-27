@@ -1,3 +1,7 @@
+import { useUserPreferences } from "../hooks/useUserPreferences";
+import { DispositionRecoveryProvider } from "../components/DispositionRecoveryNotice";
+import { AgentAvatar } from "@/components/AgentAvatar";
+import { AgentIdentity } from "@/components/AgentIdentity";
 import { clearLegacyChatMessageRequests } from "@/lib/chat-message-request";
 import { agentChatDraft } from "@/lib/agent-chat-draft";
 import { Settings as ChatSettings } from "lucide-react";
@@ -190,13 +194,12 @@ import { isImageAttachment, isVideoAttachment } from "../lib/issue-attachments";
 import {
   getIssueOutputs,
   getPromotedOutputAttachmentIds,
-  isImageContentType,
+  isImageLikeOutput,
   isVideoLikeOutput,
 } from "../lib/issue-output";
 import { IssueSiblingNavigation } from "../components/IssueSiblingNavigation";
 import type { MarkdownExternalReferenceMap } from "../components/MarkdownBody";
 import { IssuesList } from "../components/IssuesList";
-import { AgentIcon } from "../components/AgentIconPicker";
 import { IssueReferenceActivitySummary } from "../components/IssueReferenceActivitySummary";
 import { IssueFieldChangeReceipt } from "../components/IssueFieldChangeReceipt";
 import { IssueWriteDenialNotice } from "../components/IssueWriteDenialNotice";
@@ -663,7 +666,7 @@ function ActorIdentity({
   const id = evt.actorId;
   if (evt.actorType === "agent") {
     const agent = agentMap.get(id);
-    return <Identity name={agent?.name ?? id.slice(0, 8)} size="sm" />;
+    return <AgentIdentity agent={agent ?? { id, name: id.slice(0, 8) }} size="sm" />;
   }
   if (evt.actorType === "system") return <Identity name="System" size="sm" />;
   if (evt.actorType === "user") {
@@ -680,6 +683,7 @@ function ActorIdentity({
 }
 
 export type AttributionActor = {
+  appearance?: Agent["appearance"];
   kind: "agent" | "user";
   id: string;
   name: string;
@@ -710,36 +714,26 @@ function AttributionAvatar({
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <Avatar
-          size="xs"
-          shape={actor.kind === "agent" ? "square" : "circle"}
-          aria-label={accessibleLabel}
-          data-testid={`issue-${testIdLabel}-avatar`}
-          className="ring-2 ring-background"
-        >
-          {actor.avatarUrl ? (
-            <AvatarImage src={actor.avatarUrl} alt="" />
-          ) : null}
-          <AvatarFallback>{attributionInitials(actor.name)}</AvatarFallback>
-        </Avatar>
+        <span aria-label={accessibleLabel} data-testid={`issue-${testIdLabel}-avatar`}>
+          {actor.kind === "agent" ? <AgentAvatar agent={actor} size={20} /> : (
+            <Avatar size="xs" className="ring-2 ring-background">
+              {actor.avatarUrl ? <AvatarImage src={actor.avatarUrl} alt="" /> : null}
+              <AvatarFallback>{attributionInitials(actor.name)}</AvatarFallback>
+            </Avatar>
+          )}
+        </span>
       </TooltipTrigger>
       <TooltipContent side="top" sideOffset={6} className="px-2 py-1.5">
         <div
           className="flex items-center gap-2"
           data-testid={`issue-${testIdLabel}-tooltip`}
         >
-          <Avatar
-            size="sm"
-            shape={actor.kind === "agent" ? "square" : "circle"}
-            className="ring-1 ring-background/30"
-          >
-            {actor.avatarUrl ? (
-              <AvatarImage src={actor.avatarUrl} alt="" />
-            ) : null}
-            <AvatarFallback className="bg-background/20 text-background">
-              {attributionInitials(actor.name)}
-            </AvatarFallback>
-          </Avatar>
+          {actor.kind === "agent" ? <AgentAvatar agent={actor} size={32} /> : (
+            <Avatar size="sm" className="ring-1 ring-background/30">
+              {actor.avatarUrl ? <AvatarImage src={actor.avatarUrl} alt="" /> : null}
+              <AvatarFallback>{attributionInitials(actor.name)}</AvatarFallback>
+            </Avatar>
+          )}
           <div className="min-w-0">
             <div className="text-(length:--text-nano) font-medium uppercase leading-none text-background/70">
               {label}
@@ -777,6 +771,7 @@ function IssueAttributionByline({
     ? {
         kind: "agent",
         id: issue.assigneeAgentId,
+        appearance: agentMap.get(issue.assigneeAgentId)?.appearance,
         name:
           agentMap.get(issue.assigneeAgentId)?.name ??
           issue.assigneeAgentId.slice(0, 8),
@@ -798,6 +793,7 @@ function IssueAttributionByline({
       ? {
           kind: "agent",
           id: originatingActor.id,
+          appearance: agentMap.get(originatingActor.id)?.appearance,
           name:
             agentMap.get(originatingActor.id)?.name ??
             originatingActor.id.slice(0, 8),
@@ -1568,6 +1564,8 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
           tone: "success",
         });
       }
+    },
+    onSettled: () => {
       queryClient.invalidateQueries({
         queryKey: queryKeys.issues.runs(issueId),
       });
@@ -3385,8 +3383,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     enabled: !!issueId,
     retry: false,
   });
-  const keyboardShortcutsEnabled =
-    instanceGeneralSettings?.keyboardShortcuts === true;
+  const keyboardShortcutsEnabled = useUserPreferences().data?.keyboardShortcuts === true;
   // Experimental Cases: linkify `PAP-C7` chips in this issue's comment bodies.
   const casesChipsEnabled = instanceExperimentalSettings?.enableCases === true;
   const feedbackDataSharingPreference =
@@ -3517,10 +3514,12 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     const createdTasks = createdTasksQuery.data ?? EMPTY_ISSUES;
     const hasError = createdTasksQuery.isError || childIssuesError;
     return {
-      count: new Set([...childIssues, ...createdTasks].map((task) => task.id)).size,
+      count: new Set([...(issue?.ancestors ?? []), ...childIssues, ...createdTasks].map((task) => task.id)).size,
       hasError,
       content: (
         <TaskDetailTasksPanel
+          ancestors={issue?.ancestors}
+          issueLinkState={resolvedIssueDetailState ?? location.state}
           subtasks={childIssues}
           createdTasks={createdTasks}
           projects={projects ?? []}
@@ -3535,6 +3534,9 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     };
   }, [
     tasksTab,
+    issue?.ancestors,
+    resolvedIssueDetailState,
+    location.state,
     streamlinedTaskDetailEnabled,
     childIssues,
     childIssuesLoading,
@@ -3718,13 +3720,14 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   // from the blocker counts — so the key signs over the full blockerAttention,
   // not just `state`, to avoid a stale label when counts change.
   const breadcrumbStatusKey = breadcrumbStatus
-    ? `${breadcrumbStatus}|${JSON.stringify(breadcrumbBlockerAttention ?? null)}`
+    ? `${breadcrumbStatus}|${issue?.externalConversationState ?? ""}|${JSON.stringify(breadcrumbBlockerAttention ?? null)}`
     : undefined;
   const breadcrumbStatusLeading = useMemo(
     () =>
       breadcrumbStatus ? (
         <StatusIcon
           status={breadcrumbStatus}
+          externalConversationState={issue?.externalConversationState}
           className="size-3"
           blockerAttention={breadcrumbBlockerAttention}
         />
@@ -4097,6 +4100,39 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         queryClient.invalidateQueries({
           queryKey: queryKeys.issues.list(selectedCompanyId),
         });
+      }
+    },
+  });
+  // The inline notice owns feedback; do not also emit a global error toast.
+  const retryDispositionRecovery = useMutation({
+    mutationFn: async (actionId: string) => {
+      const result = await issuesApi.resolveRecoveryAction(issueId!, {
+        actionId,
+        outcome: "restored",
+        sourceIssueStatus: "todo",
+      });
+      if (
+        result.issue.status !== "todo" ||
+        result.issue.assigneeAgentId !== result.recoveryAction.returnOwnerAgentId
+      ) {
+        throw new Error("The task’s state has changed. Refresh to see its current state.");
+      }
+      return result;
+    },
+    onSuccess: ({ issue: nextIssue }) => {
+      const issueRefs = new Set<string>([issueId!, nextIssue.id]);
+      if (nextIssue.identifier) issueRefs.add(nextIssue.identifier);
+      mergeIssueResponseIntoCaches(issueRefs, nextIssue);
+      invalidateIssueCollections();
+    },
+    onSettled: () => {
+      for (const queryKey of [
+        queryKeys.issues.detail(issueId!),
+        queryKeys.issues.activity(issueId!),
+        queryKeys.issues.runs(issueId!),
+        queryKeys.issues.liveRuns(issueId!),
+      ]) {
+        void queryClient.invalidateQueries({ queryKey });
       }
     },
   });
@@ -5530,7 +5566,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       const meta = item.metadata;
       if (!meta) continue;
       const isMedia =
-        isImageContentType(meta.contentType) ||
+        isImageLikeOutput(meta.contentType, meta.originalFilename ?? item.title) ||
         isVideoLikeOutput(meta.contentType, meta.originalFilename);
       if (!isMedia || hasSeen(meta.attachmentId, meta.contentPath)) continue;
       items.push({
@@ -6847,7 +6883,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
 
   const issueStatusControl = (
     <StatusIcon
-      status={issue.status}
+      status={issue.status} externalConversationState={issue.externalConversationState}
       size="lg"
       blockerAttention={issue.blockerAttention}
       onChange={(status) => updateIssue.mutate({ status })}
@@ -7385,6 +7421,10 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
             issueCacheRefs={issueCacheRefs}
           />
 
+          {issue.status === "in_review" && issue.externalConversationState === "waiting" && (
+            <p role="status" className="text-sm text-muted-foreground">Reply sent. Send a message to continue.</p>
+          )}
+
           {issue.hiddenAt && (
             <div
               className={cn(
@@ -7688,6 +7728,21 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                 <ExecutionBlockerNotice companyId={issue.companyId} issueId={issue.id} blocker={issue.executionBlocker} onRetried={invalidateIssueDetail} />
               )}
               {resolvedDetailTab === "chat" ? (
+                <DispositionRecoveryProvider value={{
+                  issue,
+                  agentMap,
+                  hasPendingInteraction: interactions.some((interaction) => interaction.status === "pending"),
+                  unavailableReason: boardAccess && !canResolveBoardRecoveryAction
+                    ? "You don’t have permission to retry this recovery action."
+                    : treeControlStateError
+                    ? "Couldn’t check whether this task is paused. Refresh to try again."
+                    : activePauseHold
+                      ? "The task is paused. Resume it before retrying."
+                      : issue.project?.pausedAt
+                        ? "The project is paused. Resume it before retrying."
+                        : null,
+                  onRetry: (actionId) => retryDispositionRecovery.mutateAsync(actionId).then(() => undefined),
+                }}>
                 <IssueDetailChatTab
                   onOpenSkill={handleOpenSkill}
                   threadHeader={<>{taskChatThreadHeader}{instanceExperimentalSettings?.enableChatConnectors && <EmailTaskActivity key={issue.id} companyId={issue.companyId} issueId={issue.id} />}</>}
@@ -7704,7 +7759,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                             ? (agentMap.get(issue.createdByAgentId)?.name ??
                               "Agent")
                             : undefined,
-                          agentIcon: issue.createdByAgentId
+                          agent: issue.createdByAgentId ? agentMap.get(issue.createdByAgentId) ?? { id: issue.createdByAgentId } : undefined,
+                        agentIcon: issue.createdByAgentId
                             ? agentMap.get(issue.createdByAgentId)?.icon
                             : undefined,
                           createdAt: issue.createdAt,
@@ -7936,6 +7992,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                   }
                   linkCaseReferences={casesChipsEnabled}
                 />
+                </DispositionRecoveryProvider>
               ) : null}
             </TabsContent>
 
