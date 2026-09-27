@@ -604,9 +604,7 @@ async function copyDirectoryContents(sourceDir: string, targetDir: string): Prom
       recursive: true,
       force: true,
       preserveTimestamps: true,
-      // The source is a temporary staging directory that the caller removes.
-      // Without this option, Node resolves a relative link target against that
-      // directory, so the copied link dangles after cleanup.
+      // Keep relative symlink targets instead of resolving them into the staging dir.
       verbatimSymlinks: true,
     });
   }));
