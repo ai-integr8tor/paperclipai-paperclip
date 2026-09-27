@@ -67,7 +67,7 @@
   {
     "dir": "packages/adapters/openrouter",
     "name": "@paperclipai/adapter-openrouter",
-    "publishFromCi": false
+    "publishFromCi": true
   },
   {
     "dir": "packages/shared",
