@@ -715,6 +715,95 @@ const support = await getEmbeddedPostgresTestSupport();
         }),
       ).toMatchObject({ status: "unavailable", env: {} });
     });
+    it("QG-GITHUB-AGENT-GRANT-STICKS: another member's grant does not replace a revoked grant", async () => {
+      // Shift Left on Security: an agent install is not consent for every
+      // user grant on that connection. After the sticky grant is revoked, a
+      // second member's active grant must fail closed.
+      const input = await seed();
+      const installed = await grant(input, "A");
+      const otherSecretId = randomUUID();
+      const otherDefinitionId = randomUUID();
+      const otherGrantId = randomUUID();
+      await db.insert(userSecretDefinitions).values({
+        id: otherDefinitionId,
+        companyId: input.companyId,
+        key: otherDefinitionId,
+        name: "Other GitHub",
+      });
+      await db.insert(companySecrets).values({
+        id: otherSecretId,
+        companyId: input.companyId,
+        key: otherSecretId,
+        name: `Test token ${otherSecretId}`,
+        scope: "user",
+        ownerUserId: "B",
+        userSecretDefinitionId: otherDefinitionId,
+      });
+      await db.insert(connectionGrants).values({
+        id: otherGrantId,
+        companyId: input.companyId,
+        connectionId: installed.connectionId,
+        kind: "user",
+        subjectUserId: "B",
+        subjectAgentId: null,
+        status: "active",
+        credentialSecretRefs: [
+          {
+            secretId: otherSecretId,
+            configPath: "oauth.access_token",
+            versionSelector: "latest",
+          },
+        ],
+        providerTenant: {
+          github: {
+            userId: "B",
+            login: "B",
+            installationCount: 1,
+            repositoryCount: 1,
+            repositorySelection: "selected",
+            installationIds: ["2"],
+            installationOwnerLogins: ["B"],
+          },
+        },
+      });
+      await db
+        .update(connectionGrants)
+        .set({ status: "revoked" })
+        .where(eq(connectionGrants.id, installed.id));
+      await db
+        .update(runIdentityContexts)
+        .set({ cause: "company_default" })
+        .where(eq(runIdentityContexts.runId, input.runId));
+      vault.resolveUserSecretValue.mockClear();
+      expect(await resolveGitHubOperationCredentials(db, input)).toMatchObject({
+        status: "unavailable",
+        source: "personal",
+        env: {},
+      });
+      expect(vault.resolveUserSecretValue).not.toHaveBeenCalled();
+
+      await db
+        .update(toolConnectionInstalls)
+        .set({ createdByUserId: "A" })
+        .where(eq(toolConnectionInstalls.connectionId, installed.connectionId));
+      expect(await resolveGitHubOperationCredentials(db, input)).toMatchObject({
+        status: "unavailable",
+        env: {},
+      });
+      expect(vault.resolveUserSecretValue).not.toHaveBeenCalled();
+
+      await db
+        .update(toolConnectionInstalls)
+        .set({ createdByUserId: "B" })
+        .where(eq(toolConnectionInstalls.connectionId, installed.connectionId));
+      expect(await resolveGitHubOperationCredentials(db, input)).toMatchObject({
+        status: "available",
+        source: "personal",
+        login: "B",
+        grantId: otherGrantId,
+        connectionId: installed.connectionId,
+      });
+    });
     it("QG-GITHUB-AGENT-GRANT-STICKS: a missing grant on a Ready catalog fails closed", async () => {
       const input = await seed();
       const installed = await grant(input, "A");

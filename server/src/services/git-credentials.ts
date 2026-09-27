@@ -370,13 +370,33 @@ export async function resolveManagedGitHubIdentitySelection(
   // Agent-stable grant (QG-GITHUB-AGENT-GRANT-STICKS): a fresh identity
   // context may omit the responsible person, but a connection installed on
   // this agent still resolves. Company-target installs do not.
-  const agentInstalledConnectionIds = new Set(installs
-    .filter((install) => install.targetType === "agent" && install.targetId === context.agentId)
-    .map((install) => install.connectionId));
+  // The sticky grant is the installer's user grant, or the only user grant
+  // on that connection. Another member's active grant must not replace a
+  // missing or revoked grant (Shift Left on Security).
+  const agentInstallsForContext = installs.filter((install) =>
+    install.targetType === "agent" && install.targetId === context.agentId);
+  const installerUserIdsByConnection = new Map<string, Set<string>>();
+  for (const install of agentInstallsForContext) {
+    const users = installerUserIdsByConnection.get(install.connectionId) ?? new Set<string>();
+    if (install.createdByUserId) users.add(install.createdByUserId);
+    installerUserIdsByConnection.set(install.connectionId, users);
+  }
+  const userIdsByAgentConnection = new Map<string, Set<string>>();
+  for (const grant of grants) {
+    if (grant.kind !== "user" || !grant.subjectUserId || !installerUserIdsByConnection.has(grant.connectionId)) continue;
+    const users = userIdsByAgentConnection.get(grant.connectionId) ?? new Set<string>();
+    users.add(grant.subjectUserId);
+    userIdsByAgentConnection.set(grant.connectionId, users);
+  }
   const agentInstallGrants = context.allowAgentInstallGrant && !context.responsibleUserId && context.agentId
-    ? grants.filter((grant) => grant.kind === "user"
-      && grant.status === "active"
-      && agentInstalledConnectionIds.has(grant.connectionId))
+    ? grants.filter((grant) => {
+        if (grant.kind !== "user" || grant.status !== "active" || !grant.subjectUserId) return false;
+        const installers = installerUserIdsByConnection.get(grant.connectionId);
+        if (!installers) return false;
+        if (installers.size > 0) return installers.has(grant.subjectUserId);
+        const users = userIdsByAgentConnection.get(grant.connectionId);
+        return users?.size === 1 && users.has(grant.subjectUserId);
+      })
     : [];
   const candidates = dedicated.length > 0 ? dedicated : personal.length > 0 ? personal : delegated.length > 0 ? delegated : agentInstallGrants;
   const identitySource = dedicated.length > 0 ? "dedicated" as const : "personal" as const;
