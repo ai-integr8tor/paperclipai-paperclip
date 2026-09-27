@@ -266,4 +266,95 @@ describeEmbeddedPostgres("githubPrClosureSweepService", () => {
     const result = await svc.sweepClosedWithoutMergedPrApprovals([]);
     expect(result).toEqual({ checked: 0, cancelled: 0, issuesRouted: 0, woken: 0 });
   });
+
+  it("cross-company: task in another company is not routed", async () => {
+    const wakeup = vi.fn().mockResolvedValue(undefined);
+    const f = await seed({ issueStatus: "in_review" });
+
+    // Second company with its own issue linked to the SAME approval
+    const otherCompanyId = randomUUID();
+    const otherIssueId = randomUUID();
+    await db.insert(companies).values({ id: otherCompanyId, name: "Other Co", issuePrefix: "OTH" });
+    await db.insert(issues).values({
+      id: otherIssueId,
+      companyId: otherCompanyId,
+      title: "Other company task",
+      status: "in_review",
+    });
+    await db.insert(issueApprovals).values({
+      companyId: otherCompanyId,
+      issueId: otherIssueId,
+      approvalId: f.approvalId,
+    });
+
+    const svc = githubPrClosureSweepService(db, { wakeup });
+    const result = await svc.sweepClosedWithoutMergedPrApprovals([
+      { companyId: f.companyId, owner: f.owner, repo: f.repo, number: f.prNumber },
+    ]);
+
+    // Only the first company's task should be routed
+    expect(result.issuesRouted).toBe(1);
+
+    const [otherIssue] = await db.select().from(issues).where(eq(issues.id, otherIssueId));
+    expect(otherIssue?.status).toBe("in_review");
+  });
+
+  it("duplicate card links: task processed only once even with two cancelled cards", async () => {
+    const wakeup = vi.fn().mockResolvedValue(undefined);
+    const f = await seed({ issueStatus: "in_review" });
+
+    // Second approval card in the same company referencing the same PR
+    const approval2Id = randomUUID();
+    await db.insert(approvals).values({
+      id: approval2Id,
+      companyId: f.companyId,
+      type: "request_board_approval",
+      status: "pending",
+      payload: {
+        title: "Second approval card for same PR",
+        prs: [{ repo: `${f.owner}/${f.repo}`, number: f.prNumber, sha: "def456" }],
+      },
+    });
+    await db.insert(issueApprovals).values({
+      companyId: f.companyId,
+      issueId: f.issueId,
+      approvalId: approval2Id,
+    });
+
+    const svc = githubPrClosureSweepService(db, { wakeup });
+    const result = await svc.sweepClosedWithoutMergedPrApprovals([
+      { companyId: f.companyId, owner: f.owner, repo: f.repo, number: f.prNumber },
+    ]);
+
+    expect(result.checked).toBe(2);
+    expect(result.cancelled).toBe(2);
+    // Despite two links, issue should be routed only once
+    expect(result.issuesRouted).toBe(1);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
+    expect(comments).toHaveLength(1);
+    expect(wakeup).toHaveBeenCalledOnce();
+  });
+
+  it("malformed prs payload does not throw, card is skipped", async () => {
+    const companyId = randomUUID();
+    const approvalId = randomUUID();
+
+    await db.insert(companies).values({ id: companyId, name: "Malformed Co", issuePrefix: "MAL" });
+    // Approval with prs: null (malformed)
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "request_board_approval",
+      status: "pending",
+      payload: { title: "Bad payload", prs: null },
+    });
+
+    const svc = githubPrClosureSweepService(db);
+    await expect(
+      svc.sweepClosedWithoutMergedPrApprovals([
+        { companyId, owner: "acme", repo: "acme-app", number: 42 },
+      ]),
+    ).resolves.toMatchObject({ checked: 0, cancelled: 0 });
+  });
 });
