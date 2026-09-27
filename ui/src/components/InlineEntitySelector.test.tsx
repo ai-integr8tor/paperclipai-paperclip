@@ -131,6 +131,8 @@ describe("InlineEntitySelector", () => {
     expect(searchInput).not.toBeNull();
     expect(searchInput?.className).toContain("text-base");
     expect(document.querySelector("[data-mobile-entity-picker]")).not.toBeNull();
+    expect(document.querySelector("[data-mobile-entity-picker-header]")?.textContent).toContain("Responsible");
+    expect(document.querySelector('button[aria-label="Close selector"]')).not.toBeNull();
     expect(document.activeElement).toBe(searchInput);
 
     act(() => {

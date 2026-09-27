@@ -1,5 +1,5 @@
 import { forwardRef, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
-import { Check } from "lucide-react";
+import { Check, X } from "lucide-react";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { orderItemsBySelectedAndRecent } from "../lib/recent-selections";
 import { cn } from "../lib/utils";
@@ -35,6 +35,8 @@ interface InlineEntitySelectorProps {
   triggerDataSlot?: string;
   /** Runtime geometry variables for the portalled mobile picker sheet. */
   contentStyle?: CSSProperties;
+  /** Heading for the large mobile selector modal. Defaults to the placeholder. */
+  mobileTitle?: string;
 }
 
 const EMPTY_RECENT_OPTION_IDS: string[] = [];
@@ -60,6 +62,7 @@ export const InlineEntitySelector = forwardRef<HTMLButtonElement, InlineEntitySe
       triggerTestId,
       triggerDataSlot,
       contentStyle,
+      mobileTitle,
     },
     ref,
   ) {
@@ -146,6 +149,7 @@ export const InlineEntitySelector = forwardRef<HTMLButtonElement, InlineEntitySe
         </PopoverTrigger>
         <PopoverContent
           data-mobile-entity-picker=""
+          aria-label={mobileTitle ?? placeholder}
           align="start"
           side="bottom"
           collisionPadding={16}
@@ -162,6 +166,17 @@ export const InlineEntitySelector = forwardRef<HTMLButtonElement, InlineEntitySe
             shouldPreventCloseAutoFocusRef.current = false;
           }}
         >
+          <div data-mobile-entity-picker-header="" className="hidden items-center justify-between border-b border-border px-4 py-3">
+            <span className="text-base font-semibold text-foreground">{mobileTitle ?? placeholder}</span>
+            <button
+              type="button"
+              className="inline-flex size-9 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
+              aria-label="Close selector"
+              onClick={() => setOpen(false)}
+            >
+              <X className="size-5" />
+            </button>
+          </div>
           <input
             ref={inputRef}
             className="w-full border-b border-border bg-transparent px-2 py-1.5 text-base outline-none placeholder:text-muted-foreground/60 md:text-sm"
