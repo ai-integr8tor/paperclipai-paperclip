@@ -12,6 +12,7 @@ import {
 } from "@paperclipai/adapter-utils/execution-target";
 import { DEFAULT_MUSE_LOCAL_MODEL } from "../index.js";
 import { isMuseAuthError, parseMuseJsonl } from "./parse.js";
+import { readCompanyMuseApiKey } from "./muse-home.js";
 
 function summarizeStatus(checks: AdapterEnvironmentCheck[]): AdapterEnvironmentTestResult["status"] {
   if (checks.some((c) => c.level === "error")) return "fail";
@@ -55,7 +56,14 @@ export async function testEnvironment(ctx: AdapterEnvironmentTestContext): Promi
     checks.push({ code: "muse_cwd_invalid", level: "error", message: err instanceof Error ? err.message : "Invalid working directory", detail: cwd });
   }
 
-  const env = { ...normalizeEnv(config.env), MUSE_NO_AUTO_UPDATE: "1" };
+  const env: Record<string, string> = { ...normalizeEnv(config.env), MUSE_NO_AUTO_UPDATE: "1" };
+  // Same credential precedence as execute: a bound key or managed connection
+  // wins, then the company key from a sandbox device login, then host login.
+  const boundKey = env.META_API_KEY?.trim() || process.env.META_API_KEY?.trim();
+  if (!config.managedAiConnection && !boundKey && ctx.companyId) {
+    const companyKey = await readCompanyMuseApiKey(process.env, ctx.companyId);
+    if (companyKey) env.META_API_KEY = companyKey;
+  }
   const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
   try {
     await ensureAdapterExecutionTargetCommandResolvable(command, target, cwd, runtimeEnv);

@@ -3,9 +3,32 @@ export const label = "Muse Code";
 
 export const DEFAULT_MUSE_LOCAL_MODEL = "muse-spark-1.3";
 
-/** Installs Muse Code in a sandbox with the official launcher (no npm package exists). */
-export const MUSE_SANDBOX_INSTALL_COMMAND =
-  'mkdir -p "$HOME/.local/bin" && curl -fsSL https://api.meta.ai/muse-launcher.sh -o "$HOME/.local/bin/muse" && chmod +x "$HOME/.local/bin/muse" && MUSE_LAUNCHER_INSTALL=1 "$HOME/.local/bin/muse"';
+/**
+ * SHA-256 of the reviewed official Muse launcher (launcher_version 3). The
+ * launcher itself verifies the native binary against the SHA-256 in Meta's
+ * release manifest, so pinning the launcher pins the whole install chain.
+ * A new launcher release fails the install closed until this is updated.
+ */
+export const MUSE_LAUNCHER_SHA256 = "c6db294799a190ca380da274beb3b9c0e160e0da9681a3d364ce8b0e5fa3a4bc";
+
+/**
+ * Installs Muse Code in a sandbox (there is no npm package). It verifies the
+ * launcher checksum before running it, and installs to /usr/local/bin as root
+ * or with passwordless sudo, so `muse` is on PATH for later commands. Only
+ * without either does it fall back to $HOME/.local/bin.
+ */
+export const MUSE_SANDBOX_INSTALL_COMMAND = [
+  "(set -e;",
+  'd="$HOME/.local/bin"; s="";',
+  'if [ "$(id -u)" -eq 0 ]; then d=/usr/local/bin;',
+  "elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then d=/usr/local/bin; s=sudo; fi;",
+  't="$(mktemp)";',
+  'curl -fsSL https://api.meta.ai/muse-launcher.sh -o "$t";',
+  'if command -v sha256sum >/dev/null 2>&1; then a="$(sha256sum "$t" | cut -d " " -f1)"; else a="$(shasum -a 256 "$t" | cut -d " " -f1)"; fi;',
+  `if [ "$a" != "${MUSE_LAUNCHER_SHA256}" ]; then rm -f "$t"; echo "muse launcher checksum mismatch" >&2; exit 1; fi;`,
+  '$s mkdir -p "$d"; $s install -m 0755 "$t" "$d/muse"; rm -f "$t";',
+  '$s env MUSE_LAUNCHER_INSTALL=1 "$d/muse")',
+].join(" ");
 
 export const models = [
   { id: DEFAULT_MUSE_LOCAL_MODEL, label: "Muse Spark 1.3" },

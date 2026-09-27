@@ -13,7 +13,10 @@ vi.mock("@paperclipai/adapter-utils/execution-target", () => ({
   runAdapterExecutionTargetProcess: (...a: unknown[]) => (mocks.runProcessMock as (...x: unknown[]) => unknown)(...a),
 }));
 
+import os from "node:os";
+import { afterEach } from "vitest";
 import { testEnvironment } from "./test.js";
+import { promoteMuseDeviceLoginCredential } from "./muse-home.js";
 
 const fixture = (name: string) =>
   fs.readFile(path.join(path.dirname(fileURLToPath(import.meta.url)), "__fixtures__", name), "utf8");
@@ -38,6 +41,23 @@ describe("muse_local testEnvironment", () => {
     expect(args).toEqual(expect.arrayContaining(["exec", "--json", "--no-session-log", "--approval-mode", "never"]));
     const env = (mocks.runProcessMock.mock.calls[0]![4] as { env: Record<string, string> }).env;
     expect(env.TBH_CREDENTIAL_BACKEND).toBeUndefined();
+  });
+
+  it("probes with the company Muse key from a sandbox device login when nothing else is bound", async () => {
+    const home = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-muse-envtest-")));
+    vi.stubEnv("PAPERCLIP_HOME", home);
+    vi.stubEnv("META_API_KEY", "");
+    try {
+      const key = "LLM|888888888888888|envtestcompanykey00000000";
+      await promoteMuseDeviceLoginCredential({ authBytes: Buffer.from(JSON.stringify({ providers: { meta: { api_key: key } } })), companyId: "c", userInitiated: true, isSoleActiveOwner: () => true, log: () => {} });
+      mocks.runProcessMock.mockResolvedValue({ exitCode: 0, signal: null, timedOut: false, stdout: helloStdout("hello"), stderr: "" });
+      await testEnvironment({ companyId: "c", adapterType: "muse_local", config: { cwd: "/tmp" } } as never);
+      const env = (mocks.runProcessMock.mock.calls[0]![4] as { env: Record<string, string> }).env;
+      expect(env.META_API_KEY).toBe(key);
+    } finally {
+      vi.unstubAllEnvs();
+      await fs.rm(home, { recursive: true, force: true });
+    }
   });
 
   it("warns with auth_required when the key is rejected", async () => {

@@ -168,8 +168,14 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
 # Muse Code (muse_local) ships as a launcher script plus a native binary that
 # the launcher installs next to itself; there is no npm package. Runs set
 # MUSE_NO_AUTO_UPDATE=1, so this root-owned install never self-updates.
-RUN curl -fsSL https://api.meta.ai/muse-launcher.sh -o /usr/local/bin/muse \
-  && chmod 0755 /usr/local/bin/muse \
+# The launcher is pinned by SHA-256 (keep in sync with MUSE_LAUNCHER_SHA256 in
+# packages/adapters/muse-local/src/index.ts); it then verifies the native
+# binary against the SHA-256 in Meta's release manifest.
+ARG MUSE_LAUNCHER_SHA256=c6db294799a190ca380da274beb3b9c0e160e0da9681a3d364ce8b0e5fa3a4bc
+RUN curl -fsSL https://api.meta.ai/muse-launcher.sh -o /tmp/muse-launcher.sh \
+  && echo "${MUSE_LAUNCHER_SHA256}  /tmp/muse-launcher.sh" | sha256sum -c - \
+  && install -m 0755 /tmp/muse-launcher.sh /usr/local/bin/muse \
+  && rm -f /tmp/muse-launcher.sh \
   && MUSE_LAUNCHER_INSTALL=1 /usr/local/bin/muse \
   && command -v muse
 

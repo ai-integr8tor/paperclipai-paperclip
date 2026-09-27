@@ -84,7 +84,7 @@ describe("muse_local execute", () => {
     mocks.runProcessMock.mockReset();
     mocks.restoreMock.mockClear();
     mocks.prepareRuntimeMock.mockReset();
-    mocks.prepareRuntimeMock.mockImplementation(async () => ({ workspaceRemoteDir: "/remote/ws", runtimeRootDir: "/remote/ws/.paperclip-runtime", assetDirs: {}, restoreWorkspace: mocks.restoreMock }));
+    mocks.prepareRuntimeMock.mockImplementation(async () => ({ workspaceRemoteDir: "/remote/ws/runs/run-1", runtimeRootDir: "/remote/ws/runs/run-1/.paperclip-runtime", assetDirs: {}, restoreWorkspace: mocks.restoreMock }));
     mocks.bridgeStopMock.mockClear();
     mocks.startBridgeMock.mockReset();
     mocks.startBridgeMock.mockImplementation(async () => ({ env: { PAPERCLIP_API_URL: "http://127.0.0.1:43123", PAPERCLIP_API_KEY: "bridge-token" }, stop: mocks.bridgeStopMock }));
@@ -180,6 +180,14 @@ describe("muse_local execute", () => {
     });
     const result = await execute(makeCtx(root));
     expect(result.errorMessage).toBe("received SIGTERM; flushed session logs");
+  });
+
+  it("fails a run that exits 0 without a terminal record", async () => {
+    const root = await makeTempRoot();
+    const truncated = (await fixture("exec-basic.jsonl")).split("\n").filter((line) => line && !line.includes('"run.terminal.')).join("\n");
+    mocks.runProcessMock.mockResolvedValue({ exitCode: 0, signal: null, timedOut: false, stdout: truncated, stderr: "" });
+    const result = await execute(makeCtx(root));
+    expect(result.errorMessage).toMatch(/ended without a final result/);
   });
 
   it("reports api billing when META_API_KEY is bound", async () => {
@@ -312,11 +320,14 @@ describe("muse_local execute", () => {
     expect(mocks.prepareRuntimeMock).toHaveBeenCalledWith(expect.objectContaining({ adapterKey: "muse", workspaceLocalDir: root }));
     expect((mocks.prepareRuntimeMock.mock.calls[0]![0] as { assets?: unknown }).assets).toBeUndefined();
     const [, , , args, options] = mocks.runProcessMock.mock.calls[0]!;
-    expect(args[args.indexOf("--workspace") + 1]).toBe("/remote/ws");
+    expect(args[args.indexOf("--workspace") + 1]).toBe("/remote/ws/runs/run-1");
     expect(args).not.toContain("--prompt-file");
     expect(args.at(-1)).toContain("Paperclip");
     const env = (options as { env: Record<string, string> }).env;
-    expect(env.XDG_DATA_HOME).toBe("/remote/ws/.paperclip-runtime/muse/data");
+    // A stable per-agent store outside the per-run workspace, so the next
+    // remote heartbeat finds the Muse session (the synced workspace dir can
+    // change every run).
+    expect(env.XDG_DATA_HOME).toBe("/remote/ws/.paperclip-muse/agent-1/data");
     expect(env.XDG_CONFIG_HOME).toBeUndefined();
     expect(env.META_API_KEY).toBe("LLM|remote-key-000000000000000000000000000000");
     // The remote agent reaches the Paperclip API through the bridge, with the
@@ -327,7 +338,7 @@ describe("muse_local execute", () => {
     expect(mocks.bridgeStopMock).toHaveBeenCalled();
     expect(mocks.restoreMock).toHaveBeenCalled();
     expect(result.exitCode).toBe(0);
-    expect(result.sessionParams).toMatchObject({ cwd: "/remote/ws", remoteExecution: { kind: "remote" } });
+    expect(result.sessionParams).toMatchObject({ cwd: "/remote/ws/runs/run-1", remoteExecution: { kind: "remote" } });
   });
 
 });

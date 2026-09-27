@@ -186,6 +186,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const cwd = effectiveWorkspaceCwd || configuredCwd || process.cwd();
   await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
   let effectiveExecutionCwd = adapterExecutionTargetRemoteCwd(executionTarget, cwd);
+  // The configured remote base, before the per-run workspace sync picks a
+  // run-specific directory.
+  const remoteBaseCwd = effectiveExecutionCwd;
 
   const skillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredSkillNames = resolveLegacyPaperclipDesiredSkillNames(config, skillEntries);
@@ -297,7 +300,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         executionTargetIsRemote,
         executionCwd: effectiveExecutionCwd,
       });
-      env.XDG_DATA_HOME = path.posix.join(effectiveExecutionCwd, ".paperclip-runtime", "muse", "data");
+      // A stable per-agent Muse session store under the configured remote base,
+      // not the per-run workspace, so the next remote heartbeat can resume.
+      env.XDG_DATA_HOME = path.posix.join(remoteBaseCwd, ".paperclip-muse", agent.id, "data");
     }
     const runtimeExecutionTarget = overrideAdapterExecutionTargetRemoteCwd(executionTarget, effectiveExecutionCwd);
     // A remote agent reaches the Paperclip API through the bridge (the host's
@@ -452,8 +457,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       settleRunDisposition: paperclipBridge?.settleRunDisposition,
     });
     const parsed = parseMuseJsonl(proc.stdout);
-    const failed = proc.timedOut || (proc.exitCode ?? 0) !== 0 || (parsed.terminal !== null && parsed.terminal !== "completed");
-    const rawError = parsed.reason || lastMeaningfulLine(proc.stderr) || `Muse exited with code ${proc.exitCode ?? -1}`;
+    // A clean exit without a run.terminal.* record means the output was cut
+    // short, so its partial text must not become the final summary.
+    const missingTerminal = parsed.terminal === null && !proc.timedOut && (proc.exitCode ?? 0) === 0;
+    const failed = proc.timedOut || (proc.exitCode ?? 0) !== 0 || missingTerminal || (parsed.terminal !== null && parsed.terminal !== "completed");
+    const rawError = missingTerminal
+      ? "Muse run ended without a final result (no run.terminal record in the output)."
+      : parsed.reason || lastMeaningfulLine(proc.stderr) || `Muse exited with code ${proc.exitCode ?? -1}`;
     const authFailure = failed && !proc.timedOut && isMuseAuthError(`${rawError}\n${proc.stderr}`);
     const errorMessage = proc.timedOut
       ? `Timed out after ${timeoutSec}s`
