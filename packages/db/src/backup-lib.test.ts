@@ -15,6 +15,10 @@ const cleanups: Array<() => Promise<void> | void> = [];
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
+function permissions(pathname: string): number {
+  return fs.statSync(pathname).mode & 0o777;
+}
+
 function createTempDir(prefix: string): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   cleanups.push(() => {
@@ -75,6 +79,45 @@ describe("createBufferedTextFileWriter", () => {
 });
 
 describeEmbeddedPostgres("runDatabaseBackup", () => {
+  it("writes owner-only archives through the pg_dump writer", async () => {
+    const sourceConnectionString = await createTempDatabase();
+    const backupDir = createTempDir("paperclip-db-pg-dump-permissions-");
+    const pgDumpProgram = path.join(backupDir, "pg-dump-stub.cjs");
+    const pgDumpStub = path.join(
+      backupDir,
+      process.platform === "win32" ? "pg-dump-stub.cmd" : "pg-dump-stub",
+    );
+    const originalPgDumpPath = process.env.PAPERCLIP_PG_DUMP_PATH;
+    fs.writeFileSync(pgDumpProgram, "process.stdout.write('SELECT 1;\\n')\n");
+    fs.writeFileSync(
+      pgDumpStub,
+      process.platform === "win32"
+        ? `@echo off\r\n\"${process.execPath}\" \"${pgDumpProgram}\"\r\n`
+        : `#!/bin/sh\nexec \"${process.execPath}\" \"${pgDumpProgram}\"\n`,
+      { mode: 0o700 },
+    );
+    if (process.platform !== "win32") fs.chmodSync(pgDumpStub, 0o700);
+    process.env.PAPERCLIP_PG_DUMP_PATH = pgDumpStub;
+
+    try {
+      const result = await runDatabaseBackup({
+        connectionString: sourceConnectionString,
+        backupDir,
+        retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+        filenamePrefix: "paperclip-pg-dump-permissions",
+        backupEngine: "pg_dump",
+      });
+
+      expect(permissions(result.backupFile)).toBe(0o600);
+    } finally {
+      if (originalPgDumpPath === undefined) {
+        delete process.env.PAPERCLIP_PG_DUMP_PATH;
+      } else {
+        process.env.PAPERCLIP_PG_DUMP_PATH = originalPgDumpPath;
+      }
+    }
+  });
+
   it(
     "keeps the newest backup for each retained calendar month",
     async () => {
@@ -188,6 +231,7 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
         expect(result.backupFile).toMatch(/paperclip-test-.*\.sql\.gz$/);
         expect(result.sizeBytes).toBeGreaterThan(0);
         expect(fs.existsSync(result.backupFile)).toBe(true);
+        expect(permissions(result.backupFile)).toBe(0o600);
 
         await runDatabaseRestore({
           connectionString: restoreConnectionString,
