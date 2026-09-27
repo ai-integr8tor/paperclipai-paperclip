@@ -56,6 +56,7 @@ It looks like a task manager. Under the hood: org charts, budgets, governance, g
     <td align="center"><img src="doc/assets/logos/cursor.svg" width="32" alt="Cursor" /><br/><sub>Cursor</sub></td>
     <td align="center"><img src="doc/assets/logos/bash.svg" width="32" alt="Bash" /><br/><sub>Bash</sub></td>
     <td align="center"><img src="doc/assets/logos/http.svg" width="32" alt="HTTP" /><br/><sub>HTTP</sub></td>
+    <td align="center"><img src="doc/assets/logos/agentbridge.svg" width="32" alt="AgentBridge" /><br/><sub>AgentBridge</sub></td>
   </tr>
 </table>
 
