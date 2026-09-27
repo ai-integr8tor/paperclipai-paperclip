@@ -17,6 +17,39 @@ export interface LocalProcessSandboxPathAlias {
   target: string;
 }
 
+export type SandboxNetworkDecisionOutcome = "allow" | "deny";
+
+export type SandboxNetworkDecisionReason =
+  | "allowlist_match"
+  | "trusted_url_match"
+  | "network_target_denied"
+  | "invalid_request_url"
+  | "invalid_connect_target"
+  | "https_requires_connect";
+
+/**
+ * One allow/deny decision made by the sandbox egress proxy.
+ *
+ * Deliberately carries only the inputs to the decision. The request path, query string, headers and
+ * body are attacker-influenced and never included, so a reviewer can trust every field here.
+ */
+export interface SandboxNetworkDecision {
+  /** Host clock at the moment of the decision, ISO 8601 UTC. */
+  ts: string;
+  decision: SandboxNetworkDecisionOutcome;
+  reason: SandboxNetworkDecisionReason;
+  /**
+   * Hostname normalized by the same helper the policy check uses, so the event and the decision
+   * cannot disagree. Null only when the request URL could not be parsed at all.
+   */
+  hostname: string | null;
+  port: string | null;
+  /** Literal "CONNECT" on the tunnel path; the client's method on the plain HTTP path. */
+  method: string | null;
+  /** Null on the CONNECT path: the proxy does not terminate TLS and must not infer a scheme. */
+  scheme: string | null;
+}
+
 export interface LocalProcessSandboxOptions {
   workspaceDir: string;
   filesystemScope?: "workspace" | null;
@@ -28,6 +61,11 @@ export interface LocalProcessSandboxOptions {
   networkScope?: LocalProcessNetworkScope | null;
   networkAllowlist?: string[];
   networkTrustedUrls?: string[];
+  /**
+   * Observer for every egress decision. Runs in the host process, never inside the sandbox.
+   * Throwing from it is contained: it cannot change a policy outcome or stop the proxy.
+   */
+  onNetworkDecision?: (event: SandboxNetworkDecision) => void;
   command?: string;
 }
 
@@ -42,6 +80,8 @@ export interface LocalProcessSandboxSpawnTarget {
 interface NetworkAllowlistRule {
   hostname: string;
   port: string | null;
+  /** Which configuration surface contributed the rule, so a match can say why it matched. */
+  source: "allowlist" | "trusted_url";
 }
 
 interface NetworkAllowlistProxy {
@@ -136,7 +176,7 @@ function parseNetworkAllowlistEntry(entry: string, index: number): NetworkAllowl
   if (!hostname || hostname === "*" || hostname.startsWith("*.")) {
     throw new Error(`networkAllowlist[${index}] must use an exact hostname; wildcards are not supported.`);
   }
-  return { hostname, port };
+  return { hostname, port, source: "allowlist" };
 }
 
 export function parseLocalProcessNetworkAllowlist(value: unknown): string[] {
@@ -160,9 +200,26 @@ export function parseLocalProcessFilesystemScope(value: unknown): "workspace" | 
   throw new Error('filesystemScope must be "workspace".');
 }
 
+/**
+ * Single source of truth for hostname normalization. The policy check and the decision event both
+ * call this, so an emitted hostname is always the exact value the allowlist was compared against.
+ */
+function normalizeNetworkHostname(hostname: string): string {
+  return hostname.toLowerCase().replace(/^\[|\]$/g, "");
+}
+
+/** Returns the rule that permitted the target, or null when policy denies it. */
+function matchNetworkTarget(
+  hostname: string,
+  port: string,
+  rules: NetworkAllowlistRule[],
+): NetworkAllowlistRule | null {
+  const normalizedHostname = normalizeNetworkHostname(hostname);
+  return rules.find((rule) => rule.hostname === normalizedHostname && (rule.port === null || rule.port === port)) ?? null;
+}
+
 function isNetworkTargetAllowed(hostname: string, port: string, rules: NetworkAllowlistRule[]): boolean {
-  const normalizedHostname = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  return rules.some((rule) => rule.hostname === normalizedHostname && (rule.port === null || rule.port === port));
+  return matchNetworkTarget(hostname, port, rules) !== null;
 }
 
 function assertUnixSocketPathLength(socketPath: string): void {
@@ -201,9 +258,26 @@ function parseTrustedNetworkUrl(value: string): NetworkAllowlistRule | null {
     return {
       hostname: parsed.hostname.toLowerCase(),
       port: parsed.port || (parsed.protocol === "https:" ? "443" : "80"),
+      source: "trusted_url",
     };
   } catch {
     return null;
+  }
+}
+
+/**
+ * Hands one decision to the observer without letting it affect egress. A sink that throws is an
+ * observability bug; it must never become a policy bug or take the proxy down.
+ */
+function emitNetworkDecision(
+  onNetworkDecision: ((event: SandboxNetworkDecision) => void) | undefined,
+  event: Omit<SandboxNetworkDecision, "ts">,
+): void {
+  if (!onNetworkDecision) return;
+  try {
+    onNetworkDecision({ ts: new Date().toISOString(), ...event });
+  } catch {
+    // Intentionally swallowed: see the doc comment above.
   }
 }
 
@@ -231,6 +305,7 @@ async function startNetworkAllowlistProxy(
   allowlist: string[],
   trustedUrls: string[],
   socketPath: string,
+  onNetworkDecision?: (event: SandboxNetworkDecision) => void,
 ): Promise<NetworkAllowlistProxy> {
   assertUnixSocketPathLength(socketPath);
   const rules = [
@@ -243,22 +318,58 @@ async function startNetworkAllowlistProxy(
     );
   }
   const server = http.createServer((request, response) => {
+    const method = request.method ?? null;
     let target: URL;
     try {
       target = new URL(request.url ?? "");
     } catch {
+      emitNetworkDecision(onNetworkDecision, {
+        decision: "deny",
+        reason: "invalid_request_url",
+        hostname: null,
+        port: null,
+        method,
+        scheme: null,
+      });
       writeProxyError(response, 400, "invalid_request_url", "Paperclip sandbox proxy requires an absolute request URL.");
       return;
     }
     const port = target.port || (target.protocol === "https:" ? "443" : "80");
+    const hostname = normalizeNetworkHostname(target.hostname);
+    const scheme = target.protocol.replace(/:$/, "");
     if (target.protocol !== "http:") {
+      emitNetworkDecision(onNetworkDecision, {
+        decision: "deny",
+        reason: "https_requires_connect",
+        hostname,
+        port,
+        method,
+        scheme,
+      });
       writeProxyError(response, 400, "https_requires_connect", "HTTPS targets must use CONNECT through the Paperclip sandbox proxy.");
       return;
     }
-    if (!isNetworkTargetAllowed(target.hostname, port, rules)) {
+    const matchedRule = matchNetworkTarget(target.hostname, port, rules);
+    if (!matchedRule) {
+      emitNetworkDecision(onNetworkDecision, {
+        decision: "deny",
+        reason: "network_target_denied",
+        hostname,
+        port,
+        method,
+        scheme,
+      });
       writeProxyError(response, 403, "network_target_denied", "Network target denied by Paperclip sandbox policy.");
       return;
     }
+    emitNetworkDecision(onNetworkDecision, {
+      decision: "allow",
+      reason: matchedRule.source === "trusted_url" ? "trusted_url_match" : "allowlist_match",
+      hostname,
+      port,
+      method,
+      scheme,
+    });
     const upstream = http.request(target, {
       method: request.method,
       headers: { ...request.headers, host: target.host },
@@ -273,13 +384,37 @@ async function startNetworkAllowlistProxy(
     const separator = request.url?.lastIndexOf(":") ?? -1;
     const hostname = separator > 0 ? request.url!.slice(0, separator).replace(/^\[|\]$/g, "") : "";
     const port = separator > 0 ? request.url!.slice(separator + 1) : "443";
-    if (!hostname || !/^\d+$/.test(port) || !isNetworkTargetAllowed(hostname, port, rules)) {
+    // The proxy tunnels CONNECT opaquely, so the method is always the literal verb and the scheme is
+    // unknowable. Neither is ever inferred.
+    const connectEvent = {
+      method: "CONNECT",
+      scheme: null,
+      hostname: hostname ? normalizeNetworkHostname(hostname) : null,
+      port: port || null,
+    } as const;
+    const malformedTarget = !hostname || !/^\d+$/.test(port);
+    const matchedRule = malformedTarget ? null : matchNetworkTarget(hostname, port, rules);
+    if (malformedTarget || !matchedRule) {
+      emitNetworkDecision(onNetworkDecision, {
+        ...connectEvent,
+        decision: "deny",
+        // A malformed CONNECT line and a real policy miss are different signals for alerting, even
+        // though the wire response stays identical so egress behaviour does not change.
+        reason: malformedTarget ? "invalid_connect_target" : "network_target_denied",
+      });
       clientSocket.end(connectProxyError(
         "network_target_denied",
         "Network target denied by Paperclip sandbox policy.",
       ));
       return;
     }
+    // Emitted at the decision point, not in the net.connect callback: this records the policy
+    // outcome, which is independent of whether the upstream TCP connection later succeeds.
+    emitNetworkDecision(onNetworkDecision, {
+      ...connectEvent,
+      decision: "allow",
+      reason: matchedRule.source === "trusted_url" ? "trusted_url_match" : "allowlist_match",
+    });
     const upstream = net.connect(Number(port), hostname, () => {
       clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
       if (head.length > 0) upstream.write(head);
@@ -436,6 +571,7 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
         input.options.networkAllowlist ?? [],
         input.options.networkTrustedUrls ?? [],
         socketPath,
+        input.options.onNetworkDecision,
       ).catch(async (error) => {
         await fs.rm(tempDir, { recursive: true, force: true });
         throw error;
@@ -459,6 +595,7 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
         input.options.networkAllowlist ?? [],
         input.options.networkTrustedUrls ?? [],
         socketPath,
+        input.options.onNetworkDecision,
       ).catch(async (error) => {
         await fs.rm(tempDir, { recursive: true, force: true });
         throw error;

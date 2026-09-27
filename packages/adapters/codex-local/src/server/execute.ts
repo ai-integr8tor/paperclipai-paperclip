@@ -1011,6 +1011,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
               paperclipBaseEnv.PAPERCLIP_API_URL,
               ...runtimeMcpGateways.map((gateway) => gateway.endpointPath),
             ],
+            // Fire-and-forget by design: the proxy must not await a log write. Rejections are swallowed
+            // here because a failed observability write must never become an unhandled rejection that
+            // takes down the run or changes an egress outcome.
+            onNetworkDecision: (event) => {
+              void onLog("stdout", `${JSON.stringify({
+                event: "sandbox.network.decision",
+                ...event,
+                runId,
+                agentId: agent.id,
+                companyId: agent.companyId,
+              })}\n`).catch(() => {});
+            },
             command: asString(config.filesystemSandboxCommand, "bwrap"),
           }
         : null;

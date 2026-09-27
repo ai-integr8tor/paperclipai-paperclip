@@ -583,6 +583,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             env.PAPERCLIP_API_URL,
             ...runtimeMcpServers.map((server) => server.url),
           ].filter((value): value is string => typeof value === "string" && value.length > 0),
+          // Fire-and-forget by design: the proxy must not await a log write. Rejections are swallowed
+          // here because a failed observability write must never become an unhandled rejection that
+          // takes down the run or changes an egress outcome.
+          onNetworkDecision: (event) => {
+            void onLog("stdout", `${JSON.stringify({
+              event: "sandbox.network.decision",
+              ...event,
+              runId,
+              agentId: agent.id,
+              companyId: agent.companyId,
+            })}\n`).catch(() => {});
+          },
           command: asString(config.filesystemSandboxCommand, "bwrap"),
         }
       : null;
