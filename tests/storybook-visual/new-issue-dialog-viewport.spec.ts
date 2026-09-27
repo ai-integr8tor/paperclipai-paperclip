@@ -1,5 +1,9 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
 
+// Phones have a device pixel ratio of 2-3. Floating UI adds will-change: transform to
+// the popper wrapper only at 1.5 or more, and that changes how fixed sheets lay out.
+test.use({ deviceScaleFactor: 3 });
+
 const STORY_ID = "product-dialogs-modals--new-issue-prefilled";
 
 type ViewportCase = {
@@ -120,6 +124,8 @@ for (const { pickerName, triggerName, query, selectionName } of [
       const inputRect = element.querySelector("input")!.getBoundingClientRect();
       const dialogElement = document.querySelector('[data-slot="dialog-content"]');
       return {
+        pickerLeft: pickerRect.left,
+        pickerRight: pickerRect.right,
         pickerTop: pickerRect.top,
         pickerBottom: pickerRect.bottom,
         inputTop: inputRect.top,
@@ -134,6 +140,11 @@ for (const { pickerName, triggerName, query, selectionName } of [
     expect(geometry.inputTop).toBeGreaterThanOrEqual(visibleTop);
     expect(geometry.inputBottom).toBeLessThanOrEqual(visibleBottom);
     expect(geometry.portalledOutsideDialog).toBe(true);
+    // The sheet spans the viewport minus its side gutters. A containing block on the
+    // popper wrapper (transform or will-change) collapses it to a sliver instead.
+    expect(geometry.pickerLeft).toBeGreaterThanOrEqual(0);
+    expect(geometry.pickerRight).toBeLessThanOrEqual(viewport.width);
+    expect(geometry.pickerRight - geometry.pickerLeft).toBeGreaterThan(viewport.width / 2);
 
     const searchInput = picker.locator("input");
     await searchInput.fill(query);
