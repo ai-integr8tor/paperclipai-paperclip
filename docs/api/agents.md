@@ -144,7 +144,8 @@ Returns selectable models for an adapter type.
 
 - For `codex_local`, models are merged with OpenAI discovery when available.
 - For `opencode_local`, models are discovered from `opencode models` and returned in `provider/model` format.
-- `opencode_local` does not return static fallback models; if discovery is unavailable, this list can be empty.
+- `refresh=1` asks the adapter to re-read its model catalog. For `opencode_local` this runs `opencode models --refresh`, which re-reads the on-disk models.dev cache that `opencode models` serves. A failed refresh is soft: the endpoint falls back to the last discovered catalog.
+- If `opencode_local` discovery fails, the endpoint returns the adapter's static model list and logs the discovery error.
 
 ## Config Revisions
 
