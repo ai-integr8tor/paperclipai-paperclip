@@ -24,7 +24,7 @@
  * @see PLUGIN_SPEC.md §10 — Package Contract
  * @see PLUGIN_SPEC.md §12 — Process Model
  */
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { readdir, readFile, rm, stat } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import os from "node:os";
@@ -50,7 +50,7 @@ import type { PluginJobStore } from "./plugin-job-store.js";
 import type { PluginToolDispatcher } from "./plugin-tool-dispatcher.js";
 import type { PluginLifecycleManager } from "./plugin-lifecycle.js";
 import { pluginDatabaseService } from "./plugin-database.js";
-import { isTrustedBundledKubernetesProvider, resolveBundledCatalogRoot } from "./bundled-plugins.js";
+import { resolveBundledCatalogRoot, trustedBundledKubernetesProviderPath } from "./bundled-plugins.js";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -59,6 +59,19 @@ export const BUNDLED_LOCAL_PLUGIN_ROOT = path.join(REPO_ROOT, "packages", "plugi
 export const STANDALONE_BUNDLED_PLUGIN_ROOT = path.join(BUNDLED_LOCAL_PLUGIN_ROOT, "sandbox-providers");
 export const LOCAL_PLUGIN_AUTOBUILD_TIMEOUT_MS = 120_000;
 const STANDALONE_BUNDLED_PLUGIN_SDK_PACKAGE = "@paperclipai/plugin-sdk";
+const KUBERNETES_PLUGIN_KEY = "paperclip.kubernetes-sandbox-provider";
+const KUBERNETES_PACKAGE_NAME = "@paperclipai/plugin-kubernetes";
+const ISOLATED_KUBERNETES_ERROR = "Isolated local secrets require the bundled Kubernetes sandbox provider.";
+
+function requiresIsolatedKubernetesProvider(): boolean {
+  return process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true";
+}
+
+function requireTrustedKubernetesPath(packagePath: string): string {
+  const trustedPath = trustedBundledKubernetesProviderPath(packagePath);
+  if (!trustedPath) throw new Error(ISOLATED_KUBERNETES_ERROR);
+  return trustedPath;
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -1216,9 +1229,9 @@ export function pluginLoader(
 
     // npm manifests are executable modules. Reject the unverified provider
     // before npm install or manifest import when local-key isolation is active.
-    if (process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true" &&
-        !localPath && packageName === "@paperclipai/plugin-kubernetes") {
-      throw new Error("Isolated local secrets require the bundled Kubernetes sandbox provider.");
+    if (requiresIsolatedKubernetesProvider() &&
+        !localPath && packageName === KUBERNETES_PACKAGE_NAME) {
+      throw new Error(ISOLATED_KUBERNETES_ERROR);
     }
 
     const targetInstallDir = installDir ?? localPluginDir;
@@ -1233,12 +1246,19 @@ export function pluginLoader(
       if (!existsSync(absLocalPath)) {
         throw new Error(`Local plugin path does not exist: ${absLocalPath}`);
       }
-      resolvedPackagePath = absLocalPath;
-      const pkgJson = await readPackageJson(absLocalPath);
+      // Pin a local alias before reading metadata or running its build step.
+      const localPackagePath = requiresIsolatedKubernetesProvider()
+        ? realpathSync(absLocalPath)
+        : absLocalPath;
+      const pkgJson = await readPackageJson(localPackagePath);
       resolvedPackageName =
         typeof pkgJson?.["name"] === "string"
           ? pkgJson["name"]
-          : path.basename(absLocalPath);
+          : path.basename(localPackagePath);
+      resolvedPackagePath = requiresIsolatedKubernetesProvider() &&
+        (packageName === KUBERNETES_PACKAGE_NAME || resolvedPackageName === KUBERNETES_PACKAGE_NAME)
+        ? requireTrustedKubernetesPath(localPackagePath)
+        : localPackagePath;
 
       log.info(
         { localPath: absLocalPath, packageName: resolvedPackageName },
@@ -1305,7 +1325,11 @@ export function pluginLoader(
       );
     }
 
-    const manifest = await loadManifestFromPath(manifestPath);
+    const trustedManifestPath = requiresIsolatedKubernetesProvider() &&
+      (packageName === KUBERNETES_PACKAGE_NAME || resolvedPackageName === KUBERNETES_PACKAGE_NAME)
+      ? resolveTrustedBundleEntrypoint(resolvedPackagePath, manifestPath)
+      : manifestPath;
+    const manifest = await loadManifestFromPath(trustedManifestPath);
     assertPackageActivation?.({ packageRoot: resolvedPackagePath, pluginKey: manifest.id, manifest });
 
     // Step 4: Reject incompatible plugin API versions
@@ -1378,6 +1402,7 @@ export function pluginLoader(
 
   async function loadManifestFromPackageRoot(
     packageRoot: string,
+    strictBundleRoot?: string,
   ): Promise<PaperclipPluginManifestV1 | null> {
     const pkgJson = await readPackageJson(packageRoot);
     if (!pkgJson) return null;
@@ -1385,14 +1410,19 @@ export function pluginLoader(
     const manifestPath = resolveManifestPath(packageRoot, pkgJson);
     if (!manifestPath || !existsSync(manifestPath)) return null;
 
-    return loadManifestFromPath(manifestPath);
+    return loadManifestFromPath(strictBundleRoot
+      ? resolveTrustedBundleEntrypoint(strictBundleRoot, manifestPath)
+      : manifestPath);
   }
 
   async function refreshPluginManifestFromPackage(
     plugin: PluginRecord,
     packageRoot: string,
   ): Promise<PluginRecord> {
-    const manifest = await loadManifestFromPackageRoot(packageRoot);
+    const manifest = await loadManifestFromPackageRoot(packageRoot,
+      requiresIsolatedKubernetesProvider() && plugin.pluginKey === KUBERNETES_PLUGIN_KEY
+        ? packageRoot
+        : undefined);
     if (!manifest) {
       throw new Error(`Plugin package ${plugin.packageName} no longer exposes a Paperclip manifest`);
     }
@@ -1430,11 +1460,15 @@ export function pluginLoader(
     packagePath: string,
     source: PluginSource,
   ): Promise<DiscoveredPlugin | null> {
-    assertPackageActivation?.({ packageRoot: packagePath });
-    const pkgJson = await readPackageJson(packagePath);
+    const packageRoot = requiresIsolatedKubernetesProvider() ? realpathSync(packagePath) : packagePath;
+    const pkgJson = await readPackageJson(packageRoot);
     if (!pkgJson) return null;
 
     const packageName = typeof pkgJson["name"] === "string" ? pkgJson["name"] : "";
+    if (requiresIsolatedKubernetesProvider() && packageName === KUBERNETES_PACKAGE_NAME) {
+      requireTrustedKubernetesPath(packageRoot);
+    }
+    assertPackageActivation?.({ packageRoot });
     const version = typeof pkgJson["version"] === "string" ? pkgJson["version"] : "0.0.0";
 
     // Determine if this is a plugin package at all
@@ -1445,12 +1479,12 @@ export function pluginLoader(
       return null;
     }
 
-    const manifestPath = resolveManifestPath(packagePath, pkgJson);
+    const manifestPath = resolveManifestPath(packageRoot, pkgJson);
     if (!manifestPath || !existsSync(manifestPath)) {
       // Found a potential plugin package but no manifest entry point — treat
       // as a discovery-only result with no manifest
       return {
-        packagePath,
+        packagePath: packageRoot,
         packageName,
         version,
         source,
@@ -1459,10 +1493,13 @@ export function pluginLoader(
     }
 
     try {
-      const manifest = await loadManifestFromPath(manifestPath);
-      assertPackageActivation?.({ packageRoot: packagePath, pluginKey: manifest.id, manifest });
+      const manifest = await loadManifestFromPath(
+        requiresIsolatedKubernetesProvider() && packageName === KUBERNETES_PACKAGE_NAME
+          ? resolveTrustedBundleEntrypoint(packageRoot, manifestPath)
+          : manifestPath);
+      assertPackageActivation?.({ packageRoot, pluginKey: manifest.id, manifest });
       return {
-        packagePath,
+        packagePath: packageRoot,
         packageName,
         version,
         source,
@@ -1713,23 +1750,30 @@ export function pluginLoader(
     // -----------------------------------------------------------------------
 
     async loadManifest(packagePath: string): Promise<PaperclipPluginManifestV1 | null> {
-      assertPackageActivation?.({ packageRoot: packagePath });
-      const pkgJson = await readPackageJson(packagePath);
+      const packageRoot = requiresIsolatedKubernetesProvider() ? realpathSync(packagePath) : packagePath;
+      const pkgJson = await readPackageJson(packageRoot);
       if (!pkgJson) return null;
 
       const hasPaperclipPlugin = "paperclipPlugin" in pkgJson;
       const packageName = typeof pkgJson["name"] === "string" ? pkgJson["name"] : "";
+      if (requiresIsolatedKubernetesProvider() && packageName === KUBERNETES_PACKAGE_NAME) {
+        requireTrustedKubernetesPath(packageRoot);
+      }
+      assertPackageActivation?.({ packageRoot });
       const nameMatchesConvention = isPluginPackageName(packageName);
 
       if (!hasPaperclipPlugin && !nameMatchesConvention) {
         return null;
       }
 
-      const manifestPath = resolveManifestPath(packagePath, pkgJson);
+      const manifestPath = resolveManifestPath(packageRoot, pkgJson);
       if (!manifestPath || !existsSync(manifestPath)) return null;
 
-      const manifest = await loadManifestFromPath(manifestPath);
-      assertPackageActivation?.({ packageRoot: packagePath, pluginKey: manifest.id, manifest });
+      const manifest = await loadManifestFromPath(
+        requiresIsolatedKubernetesProvider() && packageName === KUBERNETES_PACKAGE_NAME
+          ? resolveTrustedBundleEntrypoint(packageRoot, manifestPath)
+          : manifestPath);
+      assertPackageActivation?.({ packageRoot, pluginKey: manifest.id, manifest });
       return manifest;
     },
 
@@ -1822,9 +1866,17 @@ export function pluginLoader(
         // For local-path installs, fall back to the stored packagePath so
         // `upgradePlugin` can re-read the manifest from disk without needing
         // the caller to re-supply the path every time.
-        localPath = plugin.packagePath ?? undefined,
+        localPath: requestedLocalPath = plugin.packagePath ?? undefined,
         version,
       } = upgradeOptions;
+      const kubernetesUpgrade = requiresIsolatedKubernetesProvider() &&
+        (oldManifest.id === KUBERNETES_PLUGIN_KEY || plugin.packageName === KUBERNETES_PACKAGE_NAME);
+      if (kubernetesUpgrade && (packageName !== KUBERNETES_PACKAGE_NAME || !requestedLocalPath)) {
+        throw new Error(ISOLATED_KUBERNETES_ERROR);
+      }
+      const localPath = kubernetesUpgrade
+        ? requireTrustedKubernetesPath(requestedLocalPath!)
+        : requestedLocalPath;
 
       log.info(
         { pluginId, packageName, version, localPath },
@@ -2265,11 +2317,12 @@ export function pluginLoader(
     try {
       // A persisted npm record may predate isolation mode. Check its actual
       // bundled path before manifest import, migrations, or worker startup.
-      if (process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true" &&
-          pluginKey === "paperclip.kubernetes-sandbox-provider" &&
-          !isTrustedBundledKubernetesProvider(activePlugin)) {
-        throw new Error("Isolated local secrets require the bundled Kubernetes sandbox provider.");
-      }
+      const isolatedKubernetes = requiresIsolatedKubernetesProvider() && pluginKey === KUBERNETES_PLUGIN_KEY;
+      const trustedBundlePath = isolatedKubernetes && activePlugin.packageName === KUBERNETES_PACKAGE_NAME && activePlugin.packagePath
+        ? trustedBundledKubernetesProviderPath(activePlugin.packagePath) ?? undefined
+        : undefined;
+      if (isolatedKubernetes && !trustedBundlePath) throw new Error(ISOLATED_KUBERNETES_ERROR);
+      if (trustedBundlePath) activePlugin = { ...activePlugin, packagePath: trustedBundlePath };
       log.info(
         { pluginId, pluginKey, version: plugin.version },
         "plugin-loader: activating plugin",
@@ -2278,12 +2331,12 @@ export function pluginLoader(
       // ------------------------------------------------------------------
       // 1. Resolve worker entrypoint
       // ------------------------------------------------------------------
-      const packageRoot = resolvePluginPackageRoot(activePlugin, localPluginDir);
+      const packageRoot = trustedBundlePath ?? resolvePluginPackageRoot(activePlugin, localPluginDir);
       assertPackageActivation?.({ pluginKey, packageRoot, installedPackagePath: activePlugin.packagePath });
       activePlugin = await refreshPluginManifestFromPackage(activePlugin, packageRoot);
       manifest = activePlugin.manifestJson;
       assertPackageActivation?.({ pluginKey, packageRoot, installedPackagePath: activePlugin.packagePath, manifest });
-      const workerEntrypoint = resolveWorkerEntrypoint(activePlugin, localPluginDir);
+      const workerEntrypoint = resolveWorkerEntrypoint(activePlugin, localPluginDir, trustedBundlePath);
 
       // ------------------------------------------------------------------
       // 2. Apply restricted database migrations before worker startup
@@ -2581,9 +2634,15 @@ export function pluginLoader(
 function resolveWorkerEntrypoint(
   plugin: PluginRecord & { packagePath?: string | null },
   localPluginDir: string,
+  strictBundleRoot?: string,
 ): string {
   const manifest = plugin.manifestJson;
   const workerRelPath = manifest.entrypoints.worker;
+
+  if (strictBundleRoot) {
+    // A missing bundle or worker must fail instead of trying node_modules.
+    return resolveTrustedBundleEntrypoint(strictBundleRoot, workerRelPath);
+  }
 
   // For local-path installs we persist the resolved package path; use it first
   if (plugin.packagePath && existsSync(plugin.packagePath)) {
@@ -2634,6 +2693,18 @@ function resolveWorkerEntrypoint(
       `Checked: ${path.resolve(packageDir, workerRelPath)}, ` +
       `${path.resolve(directDir, workerRelPath)}`,
   );
+}
+
+function resolveTrustedBundleEntrypoint(bundleRoot: string, entrypoint: string): string {
+  const candidate = path.resolve(bundleRoot, entrypoint);
+  if (!isPathInsideDir(candidate, bundleRoot)) {
+    throw new Error("Bundled Kubernetes provider entrypoint escapes its package root");
+  }
+  const actual = realpathSync(candidate);
+  if (!isPathInsideDir(actual, bundleRoot)) {
+    throw new Error("Bundled Kubernetes provider entrypoint escapes its package root");
+  }
+  return actual;
 }
 
 function resolvePluginPackageRoot(

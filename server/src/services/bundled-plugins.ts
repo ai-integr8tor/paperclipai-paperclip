@@ -121,29 +121,37 @@ export function resolveBundledCatalogRoot(
   return override ? override : DEFAULT_BUNDLED_CATALOG_ROOT;
 }
 
-/** Registry metadata is not proof that an npm artifact is the bundled provider. */
-export function isTrustedBundledKubernetesProvider(
-  plugin: { pluginKey: string; packageName: string; packagePath: string | null },
+/** Return the canonical path to the release-owned bundle, never a caller's alias. */
+export function trustedBundledKubernetesProviderPath(
+  packagePath: string,
   env: Record<string, string | undefined> = process.env,
-): boolean {
-  if (plugin.pluginKey !== "paperclip.kubernetes-sandbox-provider" ||
-      plugin.packageName !== "@paperclipai/plugin-kubernetes" ||
-      !plugin.packagePath) return false;
-
+): string | null {
   const repoBundle = path.resolve(
     path.dirname(fileURLToPath(import.meta.url)),
     "../../../packages/plugins/sandbox-providers/kubernetes",
   );
   const imageBundle = path.join(resolveBundledCatalogRoot(env), "sandbox-providers/kubernetes");
   try {
-    const actual = fs.realpathSync(plugin.packagePath);
-    return [repoBundle, imageBundle].some((expected) => {
-      try { return actual === fs.realpathSync(expected); }
-      catch { return false; }
-    });
+    const actual = fs.realpathSync(packagePath);
+    for (const expected of [repoBundle, imageBundle]) {
+      try {
+        if (actual === fs.realpathSync(expected)) return actual;
+      } catch { /* This bundle is absent in the current deployment. */ }
+    }
   } catch {
-    return false;
+    // A removed path must never fall back to npm.
   }
+  return null;
+}
+
+/** Registry metadata is not proof that an npm artifact is the bundled provider. */
+export function isTrustedBundledKubernetesProvider(
+  plugin: { pluginKey: string; packageName: string; packagePath: string | null },
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  return plugin.pluginKey === "paperclip.kubernetes-sandbox-provider" &&
+    plugin.packageName === "@paperclipai/plugin-kubernetes" &&
+    !!plugin.packagePath && !!trustedBundledKubernetesProviderPath(plugin.packagePath, env);
 }
 
 export interface ResolvedBundledPlugin {
@@ -216,9 +224,19 @@ export function resolveBundledPluginInstalls(
     const override = entry.pathOverrideEnvVar
       ? opts.env[entry.pathOverrideEnvVar]?.trim()
       : undefined;
-    const localPath = override
+    let localPath = override
       ? path.resolve(override)
       : path.resolve(opts.catalogRoot, entry.relativePath);
+    if (entry.key === "kubernetes" && opts.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true") {
+      const trustedPath = trustedBundledKubernetesProviderPath(localPath, {
+        ...opts.env,
+        [BUNDLED_CATALOG_ROOT_ENV_VAR]: opts.catalogRoot,
+      });
+      if (!trustedPath) {
+        throw new Error("Isolated local secrets require the bundled Kubernetes sandbox provider; refusing to start");
+      }
+      localPath = trustedPath;
+    }
     if (opts.enforceCatalogRoot && !isInsideRoot(canonicalize(localPath), canonicalRoot)) {
       throw new Error(
         `bundled plugin "${key}" resolves to "${localPath}", outside the bundled catalog root "${opts.catalogRoot}"; refusing to start`,
