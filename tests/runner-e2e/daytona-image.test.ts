@@ -75,15 +75,19 @@ describe("runner E2E Daytona image contract", () => {
       "packages/paperclip-runner/devtools",
       "packages/paperclip-runner/docs",
       "packages/paperclip-runner/examples",
-      "packages/paperclip-runner/test",
-      "packages/paperclip-runner/test-fixtures",
-      "packages/paperclip-runner/test-support",
       "packages/paperclip-runner/**/*.md",
       "packages/paperclip-runner/**/*.test.ts",
       "packages/paperclip-runner/runner/crates/*/tests",
       "packages/paperclip-runner/scripts/*-smoke.mjs",
     ]) {
       expect(dockerignore).toContain(developmentOnlyInput);
+    }
+    for (const shippedTestInput of [
+      "packages/paperclip-runner/test\n",
+      "packages/paperclip-runner/test-fixtures\n",
+      "packages/paperclip-runner/test-support\n",
+    ]) {
+      expect(dockerignore).not.toContain(shippedTestInput);
     }
     expect(workflow).toContain("--platform linux/amd64");
     expect(workflow).toContain(
@@ -383,16 +387,23 @@ describe("runner E2E Daytona image contract", () => {
         "second TypeScript test\n",
       );
       await writeFile(
-        path.join(runnerRoot, "test-fixtures/provider.json"),
-        '{"fixture":"two"}\n',
-      );
-      await writeFile(
         path.join(runnerRoot, "scripts/capability-clean-room-smoke.mjs"),
         "second smoke probe\n",
       );
       await writeFile(
         path.join(runnerRoot, "runner/crates/runner-core/tests/recovery.rs"),
         "// second Rust integration test\n",
+      );
+      expect(await computeDaytonaImageContentId(options)).toBe(baseline);
+
+      await writeFile(
+        path.join(runnerRoot, "test-fixtures/provider.json"),
+        '{"fixture":"two"}\n',
+      );
+      expect(await computeDaytonaImageContentId(options)).not.toBe(baseline);
+      await writeFile(
+        path.join(runnerRoot, "test-fixtures/provider.json"),
+        '{"fixture":"one"}\n',
       );
       expect(await computeDaytonaImageContentId(options)).toBe(baseline);
 
