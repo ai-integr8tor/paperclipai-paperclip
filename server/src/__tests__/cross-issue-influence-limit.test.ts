@@ -199,6 +199,10 @@ describe("cross-issue influence limit rollout", () => {
     expect(fake.inserted).toEqual([]);
   });
 
+  // This case still reports `_required`, and that is deliberate. The run id here
+  // was supplied and did resolve, so the header advice is also wrong — but the
+  // line that throws is rewritten by #13776, so changing the code would conflict
+  // with it. See the Risks section of the PR.
   it("fails closed when the persisted run has no source issue", async () => {
     const fake = counterDb(0, { contextSnapshot: {} });
 
