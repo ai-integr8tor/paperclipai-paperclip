@@ -3652,6 +3652,16 @@ function normalizeMaxConcurrentRuns(value: unknown) {
 interface WakeupOptions {
   /** Set only by authenticated board wake routes; never copied from caller payloads. */
   manualUserWake?: boolean;
+  /**
+   * Set only by control-plane paths that committed a new assignment decision for
+   * the issue — today the issue update route, when it recorded that this issue's
+   * assignee changed. Never derived from the caller-declared `source`,
+   * `triggerDetail`, reason or payload: `POST /agents/:id/wakeup` reads `source`
+   * from the request body, and a plugin wake claims `assignment` for an agent
+   * that is already assigned, so a wake that merely names `assignment` is not
+   * evidence that an assignment happened.
+   */
+  recordedAssignmentDecision?: boolean;
   /** Internal resume of a queue with persisted board interruption intent. */
   queuedCommentInterruptId?: string;
   /** Internal delivery of an existing undelivered user comment. */
@@ -27153,12 +27163,17 @@ export function heartbeatService(
           // verdict, so the fallback must not overrule it.
           let continuationRefusedByLiveObligation = false;
           const canReleaseStrandedNoReplayHold = async () => {
-            // Only a fresh assignment of this issue to this agent is a new
-            // execution decision. Every continuation of the parked execution —
-            // an automation wake, a comment, a queued interrupt — stays parked,
-            // so the one-time release can never grant the automatic retry the
-            // no-replay hold refuses.
+            // A new assignment decision is the only thing that retires the hold.
+            // `recordedAssignmentDecision` is set by the control-plane path that
+            // committed the assignment change itself, so a wake that only claims
+            // `source: "assignment"` — `POST /agents/:id/wakeup` takes `source`
+            // from the request body — cannot release a hold for an issue whose
+            // assignment never changed. Every continuation of the parked
+            // execution — an automation wake, a comment, a queued interrupt —
+            // stays parked, so the one-time release can never grant the
+            // automatic retry the no-replay hold refuses.
             if (source !== "assignment") return false;
+            if (opts.recordedAssignmentDecision !== true) return false;
             // A mention can wake an agent who does not own the issue; only the
             // agent the issue is assigned to may retire its hold.
             if (!issue.assigneeAgentId || issue.assigneeAgentId !== agentId) return false;
@@ -27166,12 +27181,11 @@ export function heartbeatService(
             // continuation contract; the release must not overrule that verdict.
             // Only a message-less assignment decision retires the hold.
             if (durableRequest || wakeCommentId) return false;
-            // The declared `assignment` source is not evidence of a new
-            // assignment decision: `POST /agents/:id/wakeup` lets an agent wake
-            // itself with it, and a plugin requests the same source for an agent
-            // that is already assigned. Only a decision made by a person — a
-            // board user assigning or resuming this issue — retires the hold;
-            // system, plugin and agent wakes keep parking as before.
+            // Reassigning the issue is not by itself a person's decision: the
+            // update route can also commit an assignment on an agent's behalf.
+            // Only a decision made by a person — a board user assigning or
+            // resuming this issue — retires the hold; system, plugin and agent
+            // wakes keep parking as before.
             if (opts.requestedByActorType !== "user") return false;
             if (continuationRefusedByLiveObligation) return false;
             // Only a plainly re-runnable issue may lose the hold: an open task

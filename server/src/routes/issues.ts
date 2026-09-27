@@ -14678,6 +14678,11 @@ export function issueRoutes(
           addWakeup(issue.assigneeAgentId, {
             source: "assignment",
             triggerDetail: "system",
+            // This is the only place the control plane records an assignment
+            // decision for an existing issue, so it is the only wake allowed to
+            // retire a settled no-replay hold (see heartbeat's
+            // `recordedAssignmentDecision`).
+            recordedAssignmentDecision: true,
             reason: "issue_assigned",
             payload: {
               issueId: issue.id,

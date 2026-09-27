@@ -11,6 +11,11 @@
  *      wake itself) stays parked: an agent cannot retire its own hold
  *  T1c the same wake requested by a plugin for the already-assigned agent stays
  *      parked: a system wake is not a new assignment decision
+ *  T1d a user-attributed wake that only *claims* the `assignment` source — the
+ *      shape `POST /agents/:id/wakeup` builds from its request body — stays
+ *      parked: a declared source is not evidence that the assignment changed
+ *  T1e an assignee change committed by the issue update route releases the hold
+ *      and creates the run for the new assignee
  *  T2  an open (`active`) action still parks the wake
  *  T3  a human owner (`assigneeUserId`) still parks the wake — a person decides
  *  T4  an issue that is not `todo`/`blocked` still parks the wake
@@ -29,7 +34,7 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { eq, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agentWakeupRequests,
   agents,
@@ -193,7 +198,7 @@ describeEmbeddedPostgres("issue stranded by a settled no-replay hold", () => {
     issueId: string,
     requestedByActorType: "user" | "agent" | "system" = "user",
     requestedByActorId = requestedByActorType === "user" ? "blocker-owner" : "assignment",
-    opts: { reason?: string } = {},
+    opts: { reason?: string; recordedAssignmentDecision?: boolean } = {},
   ) =>
     heartbeatService(db).wakeup(agentId, {
       source: "assignment",
@@ -203,6 +208,9 @@ describeEmbeddedPostgres("issue stranded by a settled no-replay hold", () => {
       contextSnapshot: { issueId },
       requestedByActorType,
       requestedByActorId,
+      // The issue update route sets this when it commits an assignee change.
+      // A wake that only claims `source: "assignment"` does not.
+      recordedAssignmentDecision: opts.recordedAssignmentDecision === true,
     });
 
   const runsForIssue = async (issueId: string) =>
@@ -226,7 +234,11 @@ describeEmbeddedPostgres("issue stranded by a settled no-replay hold", () => {
     const seed = await seedBlockedIssue({ issueStatus: "todo", replay: "blocked" });
     expect(await getExecutionBlocker(db, seed.companyId, seed.issueId)).not.toBeNull();
 
-    const run = await wakeIssue(seed.agentId, seed.issueId);
+    // The shape the issue update route emits after it commits an assignee
+    // change: a person's fresh assignment decision for this issue.
+    const run = await wakeIssue(seed.agentId, seed.issueId, "user", "blocker-owner", {
+      recordedAssignmentDecision: true,
+    });
 
     // The wake produced a real run instead of a parked receipt.
     expect(run).toMatchObject({ status: "queued", agentId: seed.agentId });
@@ -299,6 +311,69 @@ describeEmbeddedPostgres("issue stranded by a settled no-replay hold", () => {
       .where(eq(issueRecoveryActions.id, seed.actionId));
     expect(action!.evidence.settledNoReplayHoldReleasedAt).toBeUndefined();
     expect(await getExecutionBlocker(db, seed.companyId, seed.issueId)).not.toBeNull();
+  });
+
+  it("T1d: a wake that only claims an assignment source cannot retire the hold", async () => {
+    const seed = await seedBlockedIssue({ issueStatus: "todo", replay: "blocked" });
+
+    // The shape `POST /agents/:id/wakeup` produces: the caller declares
+    // `source: "assignment"` (and even the `issue_assigned` reason) in the
+    // request body, but the control plane never recorded an assignment decision
+    // for this issue — its assignment did not change.
+    await wakeIssue(seed.agentId, seed.issueId, "user", "blocker-owner", {
+      reason: "issue_assigned",
+    });
+
+    const waits = await executionWaits(seed.agentId);
+    expect(waits).toHaveLength(1);
+    expect(waits[0]).toMatchObject({ status: "skipped", reason: "execution_reconciliation_required" });
+    expect(await runsForIssue(seed.issueId)).toHaveLength(0);
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, seed.actionId));
+    expect(action!.evidence.settledNoReplayHoldReleasedAt).toBeUndefined();
+    expect(await getExecutionBlocker(db, seed.companyId, seed.issueId)).not.toBeNull();
+  });
+
+  it("T1e: an assignee change committed by the issue route releases the hold", async () => {
+    const seed = await seedBlockedIssue({ issueStatus: "todo", replay: "blocked" });
+    const replacementAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: replacementAgentId,
+      companyId: seed.companyId,
+      name: "Replacement",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+
+    // A person assigning the issue to another agent is the new execution
+    // decision the hold waits for; the route's own wake must carry it.
+    const response = await request(app(seed.companyId))
+      .patch(`/api/issues/${seed.issueId}`)
+      .send({ assigneeAgentId: replacementAgentId });
+    expect(response.status).toBe(200);
+
+    await vi.waitFor(async () => {
+      expect(await getExecutionBlocker(db, seed.companyId, seed.issueId)).toBeNull();
+    });
+    const [issue] = await db.select().from(issues).where(eq(issues.id, seed.issueId));
+    expect(issue!.assigneeAgentId).toBe(replacementAgentId);
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, seed.actionId));
+    expect(action!.evidence.settledNoReplayHoldRelease).toMatchObject({
+      agentId: replacementAgentId,
+      actorType: "user",
+    });
+    const replacementRuns = (await runsForIssue(seed.issueId))
+      .filter(run => run.agentId === replacementAgentId);
+    expect(replacementRuns).toHaveLength(1);
   });
 
   it("T2: an open recovery action still parks the wake", async () => {
