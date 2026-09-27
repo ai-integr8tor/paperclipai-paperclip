@@ -270,3 +270,73 @@ describe("hired agents sharing a subscription", () => {
     }
   });
 });
+
+describe("save-time binding validation names the real failing check", () => {
+  it("names the failing environment check instead of blaming the AI connection", async () => {
+    const f = await fixture("anthropic");
+    // The save path also checks the responsible user's grant, so this test
+    // needs the direct change permission a real operator would hold.
+    await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "user", principalId: f.userId, permissionKey: "agents:configure" });
+    // A clean temp cwd keeps the project-auth file scan away from the host's
+    // real `.claude/settings.json`, which would raise its own verdict here.
+    await db.update(agents).set({ runtimeConfig: {}, adapterConfig: { cwd: home } }).where(eq(agents.id, f.agentId));
+    const previous = getServerAdapter("claude_local");
+    unregisterServerAdapter("claude_local");
+    registerServerAdapter({
+      ...previous,
+      type: "claude_local",
+      testEnvironment: async () => ({
+        adapterType: "claude_local",
+        status: "fail" as const,
+        checks: [{ code: "claude_cwd_invalid", level: "error" as const, message: 'Could not create working directory "/paperclip/instances/default/projects/acme/site/_default"' }],
+        testedAt: new Date(0).toISOString(),
+      }),
+    });
+    try {
+      const response = await request(f.app)
+        .patch(`/api/agents/${f.agentId}`)
+        .send({ runtimeConfig: { aiConnection: f.binding } });
+      expect(response.status, JSON.stringify(response.body)).toBe(422);
+      expect(response.body.error).toContain("claude_cwd_invalid");
+      expect(response.body.error).toContain("Could not create working directory");
+      expect(response.body.error).not.toContain("The selected AI connection failed validation");
+      expect(response.body.details.code).toBe("ai_connection_validation_failed");
+      expect(response.body.details.checks).toEqual([{ code: "claude_cwd_invalid", level: "error" }]);
+    } finally {
+      unregisterServerAdapter("claude_local");
+      if (previous) registerServerAdapter(previous);
+    }
+  });
+
+  it("keeps the AI-connection wording when the connection itself is unauthenticated", async () => {
+    const f = await fixture("anthropic");
+    await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "user", principalId: f.userId, permissionKey: "agents:configure" });
+    await db.update(agents).set({ runtimeConfig: {}, adapterConfig: { cwd: home } }).where(eq(agents.id, f.agentId));
+    const previous = getServerAdapter("claude_local");
+    unregisterServerAdapter("claude_local");
+    registerServerAdapter({
+      ...previous,
+      type: "claude_local",
+      testEnvironment: async () => ({
+        adapterType: "claude_local",
+        status: "fail" as const,
+        checks: [
+          { code: "claude_hello_probe_auth_required", level: "error" as const, message: "Authentication required." },
+          { code: "adapter_auth_missing", level: "warn" as const, message: "This environment has no ready authentication for this adapter." },
+        ],
+        testedAt: new Date(0).toISOString(),
+      }),
+    });
+    try {
+      const response = await request(f.app)
+        .patch(`/api/agents/${f.agentId}`)
+        .send({ runtimeConfig: { aiConnection: f.binding } });
+      expect(response.status, JSON.stringify(response.body)).toBe(422);
+      expect(response.body.error).toContain("The selected AI connection failed validation in this agent’s environment");
+      expect(response.body.details.code).toBe("ai_connection_validation_failed");
+    } finally {
+      unregisterServerAdapter("claude_local");
+      if (previous) registerServerAdapter(previous);
+    }
+  });
+});
