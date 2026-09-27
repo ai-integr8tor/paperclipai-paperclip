@@ -267,6 +267,7 @@ export function environmentRunOrchestrator(
     localEnvironmentId: string;
     adapterType: string;
     adapterConfig?: Record<string, unknown>;
+    admittedLifecycleMode?: "warm" | "per_turn";
     issueId: string | null;
     heartbeatRunId: string;
     agentId: string;
@@ -281,7 +282,7 @@ export function environmentRunOrchestrator(
     });
 
     const environment = resolveRunnerEnvironmentForRun(
-      selectedEnvironment, input.adapterType, input.adapterConfig,
+      selectedEnvironment, input.adapterType, input.adapterConfig, input.admittedLifecycleMode,
     );
 
     // Step 2: Acquire lease

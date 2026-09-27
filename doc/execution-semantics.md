@@ -1253,8 +1253,9 @@ warm therefore acquires a reusable lease through the normal provider path,
 instead of starting warm execution on an ephemeral lease. Provider capability,
 ownership, cleanup, and verified restore checks still apply; an unsupported
 provider must not be treated as reusable. Existing active runs retain their
-admitted lifecycle.
-
+admitted lifecycle, including when recovery acquires a lease after the agent or
+environment lifecycle setting changes. Recovery uses the persisted execution
+input for both lease acquisition and lifecycle validation.
 
 A warm sandbox's shared workspace binding persists independently of the
 experimental isolated-workspaces UI. Ordinary workspace updates remain gated;

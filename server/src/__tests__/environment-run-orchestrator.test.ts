@@ -794,3 +794,24 @@ describe("native runner lifecycle changes before lease acquisition", () => {
     expect(acquireRunLease.mock.calls[0][0].environment.config.reuseLease).toBe(expectedReuse);
   });
 });
+
+
+describe("admitted native lifecycle recovery", () => {
+  it.each([
+    ["warm", "per_turn", "per_turn", true],
+    ["per_turn", "warm", "warm", false],
+  ] as const)("preserves admitted %s over changed agent/environment settings", async (admittedLifecycleMode, lifecycleMode, runnerLifecycleMode, expectedReuse) => {
+    const environment = { ...makeEnvironment("sandbox"), config: { provider: "daytona", reuseLease: false, runnerLifecycleMode } };
+    mockGetEnvironment.mockResolvedValue(environment);
+    const acquireRunLease = vi.fn(async (input) => ({ environment: input.environment, lease: makeLease(), leaseContext: {} }));
+    const orchestrator = environmentRunOrchestrator({} as never, { environmentRuntime: makeMockRuntime({ acquireRunLease }) });
+    await orchestrator.acquireForRun({
+      companyId: "company-1", selectedEnvironmentId: "env-1", localEnvironmentId: "local",
+      adapterType: "paperclip_runner", adapterConfig: { lifecycleMode }, admittedLifecycleMode,
+      issueId: "task-1", heartbeatRunId: "run-1", agentId: "agent-1",
+      persistedExecutionWorkspace: null, executionWorkspaceSettings: null,
+    });
+    expect(acquireRunLease.mock.calls[0][0].environment.config.reuseLease).toBe(expectedReuse);
+    expect(environment.config.reuseLease).toBe(false);
+  });
+});
