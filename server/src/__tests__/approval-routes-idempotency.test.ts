@@ -32,6 +32,7 @@ const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockAccessService = vi.hoisted(() => ({
   decide: vi.fn(),
 }));
+const mockDecisionBriefGuard = vi.hoisted(() => ({ assertAllowed: vi.fn() }));
 
 function registerModuleMocks() {
   vi.doMock("../services/index.js", () => ({
@@ -41,6 +42,7 @@ function registerModuleMocks() {
     issueApprovalService: () => mockIssueApprovalService,
     logActivity: mockLogActivity,
     secretService: () => mockSecretService,
+    decisionBriefGuard: () => mockDecisionBriefGuard,
   }));
 }
 
@@ -134,6 +136,8 @@ describe("approval routes idempotent retries", () => {
       reason: "allow_test",
       explanation: "Allowed by test mock.",
     });
+    mockDecisionBriefGuard.assertAllowed.mockReset();
+    mockDecisionBriefGuard.assertAllowed.mockResolvedValue(undefined);
     mockHeartbeatService.wakeup.mockResolvedValue({ id: "wake-1" });
     mockIssueApprovalService.listIssuesForApproval.mockResolvedValue([{ id: "issue-1" }]);
     mockLogActivity.mockResolvedValue(undefined);
@@ -437,5 +441,30 @@ describe("approval routes idempotent retries", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     expect(res.body.error).toContain("Status-only recovery runs cannot create or modify approvals");
     expect(mockApprovalService.addComment).not.toHaveBeenCalled();
+  });
+
+  it("passes the brief to the guard and persists it on approval create", async () => {
+    const brief = { version: 1, whatIsHappening: "a", whyStopped: "b", whatWeNeed: "c" };
+    mockApprovalService.create.mockResolvedValue({
+      id: "approval-b", companyId: "company-1", type: "request_board_approval", requestedByAgentId: "agent-1",
+      requestedByUserId: null, status: "pending", payload: { title: "Spend" }, brief, decisionNote: null,
+      decidedByUserId: null, decidedAt: null, createdAt: new Date(), updatedAt: new Date(),
+    });
+    const res = await request(await createAgentApp())
+      .post("/api/companies/company-1/approvals")
+      .send({ type: "request_board_approval", payload: { title: "Spend" }, brief });
+    expect([200, 201], JSON.stringify(res.body)).toContain(res.status);
+    expect(mockDecisionBriefGuard.assertAllowed).toHaveBeenCalledWith({ companyId: "company-1", brief, humanFacing: true });
+    expect(mockApprovalService.create).toHaveBeenCalledWith("company-1", expect.objectContaining({ brief }));
+  });
+
+  it("returns 422 and does not create when the guard rejects", async () => {
+    const { unprocessable } = await import("../errors.js");
+    mockDecisionBriefGuard.assertAllowed.mockRejectedValue(unprocessable("This company requires a decision brief for human-facing questions. Add brief.whatIsHappening, brief.whyStopped and brief.whatWeNeed."));
+    const res = await request(await createAgentApp())
+      .post("/api/companies/company-1/approvals")
+      .send({ type: "request_board_approval", payload: { title: "Spend" } });
+    expect(res.status).toBe(422);
+    expect(mockApprovalService.create).not.toHaveBeenCalled();
   });
 });

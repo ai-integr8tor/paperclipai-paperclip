@@ -1,4 +1,5 @@
 import type { ApprovalStatus, ApprovalType } from "../constants.js";
+import type { DecisionBrief } from "./decision-brief.js";
 
 export interface Approval {
   id: string;
@@ -8,6 +9,7 @@ export interface Approval {
   requestedByUserId: string | null;
   status: ApprovalStatus;
   payload: Record<string, unknown>;
+  brief?: DecisionBrief | null;
   decisionNote: string | null;
   decidedByUserId: string | null;
   decidedAt: Date | null;

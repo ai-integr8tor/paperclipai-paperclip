@@ -13,6 +13,7 @@ import { logger } from "../middleware/logger.js";
 import {
   approvalService,
   accessService,
+  decisionBriefGuard,
   heartbeatService,
   issueApprovalService,
   logActivity,
@@ -230,6 +231,11 @@ export function approvalRoutes(
       : [];
     const uniqueIssueIds = Array.from(new Set(issueIds));
     const { issueIds: _issueIds, ...approvalInput } = req.body;
+    await decisionBriefGuard(db).assertAllowed({
+      companyId,
+      brief: approvalInput.brief ?? null,
+      humanFacing: true,
+    });
     const normalizedPayload =
       approvalInput.type === "hire_agent"
         ? await secretsSvc.normalizeHireApprovalPayloadForPersistence(
