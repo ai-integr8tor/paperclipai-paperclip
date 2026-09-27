@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { userEvent, within } from "storybook/test";
+import { expect, userEvent, within } from "storybook/test";
 import type {
   DocumentRevision,
   ExecutionWorkspaceCloseReadiness,
@@ -720,7 +720,7 @@ export const NewIssuePrefilled: Story = {
 export const NewIssueMobileAssigneePicker: Story = {
   name: "New Issue - Mobile Assignee Picker",
   parameters: {
-    viewport: { defaultViewport: "iphone14" },
+    viewport: { defaultViewport: "mobile" },
   },
   render: () => (
     <DialogStory
@@ -735,13 +735,18 @@ export const NewIssueMobileAssigneePicker: Story = {
   play: async () => {
     const page = within(document.body);
     await userEvent.click(await page.findByRole("button", { name: "Assignee" }));
+    const search = await page.findByPlaceholderText("Search assignees...");
+    await userEvent.click(search);
+    const bounds = search.closest<HTMLElement>("[data-mobile-entity-picker]")?.getBoundingClientRect();
+    await expect(bounds?.top).toBeGreaterThanOrEqual(0);
+    await expect(bounds?.bottom).toBeLessThanOrEqual(window.visualViewport?.height ?? window.innerHeight);
   },
 };
 
 export const NewIssueMobileProjectPicker: Story = {
   name: "New Issue - Mobile Project Picker",
   parameters: {
-    viewport: { defaultViewport: "iphone14" },
+    viewport: { defaultViewport: "mobile" },
   },
   render: () => (
     <DialogStory
@@ -756,6 +761,11 @@ export const NewIssueMobileProjectPicker: Story = {
   play: async () => {
     const page = within(document.body);
     await userEvent.click(await page.findByRole("button", { name: "Project" }));
+    const search = await page.findByPlaceholderText("Search projects...");
+    await userEvent.click(search);
+    const bounds = search.closest<HTMLElement>("[data-mobile-entity-picker]")?.getBoundingClientRect();
+    await expect(bounds?.top).toBeGreaterThanOrEqual(0);
+    await expect(bounds?.bottom).toBeLessThanOrEqual(window.visualViewport?.height ?? window.innerHeight);
   },
 };
 
