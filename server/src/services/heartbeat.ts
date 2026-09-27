@@ -25537,7 +25537,13 @@ export function heartbeatService(
               ...(workspaceValidationFailure?.resultJson ??
                 configurationIncompleteFailure?.resultJson ??
                 {}),
-              ...(!legacyAdapterEntered && run.runtimeMode !== "native"
+              // Entering the adapter is not provider work. A missing command
+              // throws before spawn, so processPid stays null — stamp bootstrap
+              // evidence so stranded recovery cannot invent an action-outcome hold.
+              ...((!legacyAdapterEntered ||
+                (!(stopSnapshot?.processPid ?? run.processPid) &&
+                  !(stopSnapshot?.processStartedAt ?? run.processStartedAt))) &&
+              run.runtimeMode !== "native"
                 ? {
                     executionRecovery: {
                       kind: "bootstrap",
