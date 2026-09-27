@@ -16,7 +16,7 @@ describe("runner API against real HTTP routes", () => {
   const oldEnabled = process.env.PAPERCLIP_RUNNER_API_TOOLS_ENABLED;
   beforeAll(async () => {
     process.env.PAPERCLIP_AGENT_JWT_SECRET = randomUUID();
-    process.env.PAPERCLIP_RUNNER_API_TOOLS_ENABLED = "true";
+    delete process.env.PAPERCLIP_RUNNER_API_TOOLS_ENABLED;
     server = await startRunnerApiTestServer();
   }, 60_000);
   afterAll(async () => {
@@ -92,16 +92,16 @@ else if(m.id!==undefined) send({id:m.id,result:{}});
     } finally { await bundle.transport.close(); }
   }, 30_000);
 
-  it("cannot opt into API tools through a binding when the operator flag is absent", async () => {
+  it("cannot opt into API tools through a binding when the operator flag is false", async () => {
     const fixture = await server.fixture({ apiToolsEnabled: true });
-    delete process.env.PAPERCLIP_RUNNER_API_TOOLS_ENABLED;
+    process.env.PAPERCLIP_RUNNER_API_TOOLS_ENABLED = "false";
     try {
       const names = (await fixture.authority.definitions()).map(tool => tool.name);
       expect(names).toContain("get_task_context");
       expect(names).not.toContain("search_api");
       expect(names).not.toContain("call_api");
       await expect(fixture.authority.execute({ tool: "call_api", callId: "disabled", arguments: { operationId: "GET /api/companies/{companyId}/projects" } })).rejects.toThrow("not_advertised");
-    } finally { process.env.PAPERCLIP_RUNNER_API_TOOLS_ENABLED = "true"; }
+    } finally { delete process.env.PAPERCLIP_RUNNER_API_TOOLS_ENABLED; }
   });
 
   it("rejects credential calls before any durable receipt or secret result exists", async () => {
