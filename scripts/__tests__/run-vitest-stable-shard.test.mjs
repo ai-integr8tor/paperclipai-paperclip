@@ -12,6 +12,7 @@ import {
 } from "../general-server-shard.mjs";
 
 import { assertSelectedTests, partitionTestLines } from "../test-line-shard.mjs";
+import { spawnVitest } from "../vitest-process.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const script = path.join(repoRoot, "scripts", "run-vitest-stable.mjs");
@@ -21,6 +22,37 @@ const serializedDurationsManifest = path.join(
   "scripts",
   "serialized-shard-durations.json",
 );
+const vitestCliProbe = fileURLToPath(new URL("./fixtures/vitest-cli-probe.mjs", import.meta.url));
+
+test("the Vitest launcher does not require a pnpm executable in PATH", () => {
+  const result = spawnVitest(["list", "example.test.ts"], {
+    cwd: repoRoot,
+    // A pnpm-based launcher would fail on every supported platform here. Node's
+    // absolute process.execPath must still launch the supplied CLI.
+    env: { ...process.env, PATH: "", Path: "" },
+    encoding: "utf8",
+  }, vitestCliProbe);
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), ["list", "example.test.ts"]);
+});
+
+let vitestInstalled = true;
+try { import.meta.resolve("vitest/package.json"); }
+catch { vitestInstalled = false; }
+test("the installed Vitest CLI supports both list and run", { timeout: 120_000,
+  skip: vitestInstalled ? false : "Vitest is not installed in the policy-only CI job" }, () => {
+  for (const command of ["list", "run"]) {
+    const result = spawnVitest([command, "packages/shared/src/validators/issue.test.ts", "--silent"], {
+      cwd: repoRoot,
+      env: { ...process.env, NODE_ENV: "test" },
+      encoding: "utf8",
+      timeout: 90_000,
+    });
+    assert.equal(result.error, undefined, `${command} failed to start: ${result.error?.message}`);
+    assert.equal(result.status, 0, `${command} failed:\n${result.stdout}\n${result.stderr}`);
+  }
+});
 
 // Membership of general-server-without-chat depends on GITHUB_WORKFLOW (see
 // prWorkflowName in run-vitest-stable.mjs), so strip the ambient value and
