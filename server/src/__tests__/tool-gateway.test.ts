@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage } from "node:http";
 import os from "node:os";
@@ -5267,41 +5267,59 @@ rl.on("line", (line) => {
     });
   });
 
-  it("calls bundled Cognee in public mode and recovers from provider errors without runtime backoff", async () => {
-    const company = await createCompany(db);
-    const agent = await createAgent(db, company.id);
-    const { run } = await createIssueAndRun(db, company.id, agent.id);
-    const refs = await Promise.all(Object.entries({
-      COGNEE_BASE_URL: "https://fixture.aws.cognee.ai",
-      COGNEE_API_KEY: "fixture-key",
-    }).map(async ([key, value]) => {
-      const secret = await secretService(db).create(company.id, {
-        name: key, key: `${key}_${randomUUID().replace(/-/g, "")}`,
-        provider: "local_encrypted", value,
+  const cogneeIsolationModes = process.platform === "linux" && process.getuid?.() !== 0
+    ? [false, true] : [false];
+  it.each(cogneeIsolationModes)("calls bundled Cognee in public mode with isolation=%s and recovers without runtime backoff", async (isolationRequired) => {
+    const keyRoot = mkdtempSync(path.join(process.cwd(), ".paperclip-cognee-isolation-"));
+    try {
+      const keyPath = path.join(keyRoot, "master.key");
+      writeFileSync(keyPath, randomBytes(32).toString("base64"), { mode: 0o600 });
+      vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY", undefined);
+      vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY_FILE", keyPath);
+      vi.stubEnv("PAPERCLIP_SECRETS_HOST_AGENT_UID", String(process.getuid?.() === 1000 ? 1001 : 1000));
+      vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "false");
+      const company = await createCompany(db);
+      const agent = await createAgent(db, company.id);
+      const { run } = await createIssueAndRun(db, company.id, agent.id);
+      const refs = await Promise.all(Object.entries({
+        COGNEE_BASE_URL: "https://fixture.aws.cognee.ai",
+        COGNEE_API_KEY: "fixture-key",
+      }).map(async ([key, value]) => {
+        const secret = await secretService(db).create(company.id, {
+          name: key, key: `${key}_${randomUUID().replace(/-/g, "")}`,
+          provider: "local_encrypted", value,
+        });
+        return { secretId: secret.id, versionSelector: "latest", configPath: `env.${key}`, required: true };
+      }));
+      const local = await createLocalStdioMcpTool(db, company.id, {
+        applicationKey: "cognee", toolName: "recall",
+        connectionConfig: { templateId: "paperclip.cognee-cloud" }, credentialSecretRefs: refs,
       });
-      return { secretId: secret.id, versionSelector: "latest", configPath: `env.${key}`, required: true };
-    }));
-    const local = await createLocalStdioMcpTool(db, company.id, {
-      applicationKey: "cognee", toolName: "recall",
-      connectionConfig: { templateId: "paperclip.cognee-cloud" }, credentialSecretRefs: refs,
-    });
-    await allowAllToolsForAgent(db, company.id, agent.id);
-    const bridge = vi.spyOn(cogneeBridge, "callCogneeCloud")
-      .mockRejectedValueOnce(new Error("Cloud temporarily unavailable"))
-      .mockResolvedValue({ content: [{ type: "text", text: "recalled synthetic memory" }],
-        structuredContent: { result: "recalled synthetic memory" }, isError: false });
-    const gateway = createTestToolGatewayService(db, {
-      deploymentMode: "authenticated", deploymentExposure: "public", trustedLocalStdioRuntimeHost: null,
-    });
-    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
-    const tool = (await gateway.listToolsForSession(session.token)).find(t => t.connectionId === local.connection.id)!;
-    await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name,
-      parameters: { message: "synthetic" } })).rejects.toThrow("Cloud temporarily unavailable");
-    await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name,
-      parameters: { message: "synthetic" } })).resolves.toMatchObject({ status: "completed" });
-    expect(bridge).toHaveBeenCalledTimes(2);
-    expect(await db.select().from(toolRuntimeSlots).where(eq(toolRuntimeSlots.connectionId, local.connection.id))).toHaveLength(0);
-    bridge.mockRestore();
+      await allowAllToolsForAgent(db, company.id, agent.id);
+      const bridge = vi.spyOn(cogneeBridge, "callCogneeCloud")
+        .mockRejectedValueOnce(new Error("Cloud temporarily unavailable"))
+        .mockResolvedValue({ content: [{ type: "text", text: "recalled synthetic memory" }],
+          structuredContent: { result: "recalled synthetic memory" }, isError: false });
+      const gateway = createTestToolGatewayService(db, {
+        deploymentMode: "authenticated", deploymentExposure: "public", trustedLocalStdioRuntimeHost: null,
+      });
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const tool = (await gateway.listToolsForSession(session.token)).find(t => t.connectionId === local.connection.id)!;
+      vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", String(isolationRequired));
+      try {
+        await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name,
+          parameters: { message: "synthetic" } })).rejects.toThrow("Cloud temporarily unavailable");
+        await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name,
+          parameters: { message: "synthetic" } })).resolves.toMatchObject({ status: "completed" });
+        expect(bridge).toHaveBeenCalledTimes(2);
+        expect(await db.select().from(toolRuntimeSlots).where(eq(toolRuntimeSlots.connectionId, local.connection.id))).toHaveLength(0);
+      } finally {
+        bridge.mockRestore();
+      }
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(keyRoot, { recursive: true, force: true });
+    }
   });
 
   it("fails closed for hosted public local stdio unless a trusted runtime host is configured", async () => {
