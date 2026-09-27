@@ -1,5 +1,7 @@
 import type { ConnectionIntentInteraction } from "./issue.js";
 import type { ToolConnection } from "./tool-access.js";
+import type { AskUserQuestionsQuestion } from "./issue.js";
+import type { RemoteMcpConnectorId } from "../remote-mcp-connectors.js";
 
 export type ConnectionAvailabilityState =
   | "ready"
@@ -9,6 +11,16 @@ export type ConnectionAvailabilityState =
 
 export interface ConnectionSearchResultItem {
   service: string;
+  source?: "catalog" | "configured" | "aggregator";
+  aggregator?: {
+    provider: RemoteMcpConnectorId;
+    targetService: string;
+    targetName: string;
+    evidenceUrl: string | null;
+    verifiedAt: string;
+    readiness: "requires_provider_setup" | "requires_app_verification";
+  };
+  reason?: string;
   name: string;
   description: string | null;
   logoUrl: string | null;
@@ -25,6 +37,10 @@ export interface ConnectionsSearchResult {
   version: 1;
   query: string;
   results: ConnectionSearchResultItem[];
+  /** Paperclip-authored next step; provider content must never supply this field. */
+  instruction?: string;
+  providerQuestion?: AskUserQuestionsQuestion;
+  selectionInteractionId?: string;
 }
 
 export interface ConnectionRequestResult {
@@ -36,11 +52,20 @@ export interface ConnectionRequestResult {
   instruction: string;
 }
 
+/** Safe metadata for selecting a connection; never includes credential or transport configuration. */
+export type ConnectionIntentSetupConnection = Pick<ToolConnection, "id" | "applicationId" | "name" | "status" | "enabled">;
+
 export interface ConnectionIntentSetupOptions {
+  aiConnection?: import("../ai-connections.js").AiConnectionBinding;
+  /** Selected account, including an unavailable default. Reconnect must preserve its identity. */
+  aiRepair?: {
+    connection: import("../ai-connections.js").AiManagedConnectionSummary;
+    canReconnect: boolean;
+  };
   version: 1;
   interaction: ConnectionIntentInteraction;
   service: ConnectionSearchResultItem;
-  existingConnections: ToolConnection[];
+  existingConnections: ConnectionIntentSetupConnection[];
   requestedAgentId: string;
 }
 

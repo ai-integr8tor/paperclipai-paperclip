@@ -53,8 +53,8 @@ import {
   summarizeToolValue,
 } from "../services/tool-content-guards.js";
 import { createToolGatewayService, ToolGatewayHttpError } from "../services/tool-gateway.js";
-import type { ComposioClient } from "../services/composio.js";
 import { secretService } from "../services/secrets.js";
+import * as cogneeBridge from "../services/cognee-connection.js";
 import { createKvDemoHttpServer, type KvDemoHttpServer } from "../../../packages/kv-demo-mcp-server/src/http.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -583,12 +583,78 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
     await tempDb?.cleanup();
   });
 
-  it("exposes a named gateway with scoped bearer-token auth and revocation", async () => {
+  it("preserves provider tool errors in MCP responses and failed invocation audits", async () => {
     const company = await createCompany(db);
-    const remote = await startFakeRemoteMcpServer(async () => ({
+    const remote = await startFakeRemoteMcpServer(({ body }) => ({
       body: {
         jsonrpc: "2.0",
-        id: "test",
+        id: body?.id,
+        result: { content: [{ type: "text", text: "Search denied: outside consented tag" }], isError: true },
+      },
+    }));
+    try {
+      const { application, connection, catalogEntry } = await createRemoteMcpTool(db, company.id, {
+        url: remote.url, toolName: "search_memory", riskLevel: "read",
+      });
+      await db.update(toolCatalogEntries).set({
+        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      }).where(eq(toolCatalogEntries.id, catalogEntry.id));
+      const toolName = expectedConnectedToolName({
+        applicationKey: application.applicationKey,
+        connectionId: connection.id,
+        toolName: catalogEntry.toolName,
+      });
+      const [profile] = await db.insert(toolProfiles).values({
+        companyId: company.id, profileKey: `error-${randomUUID()}`,
+        name: "Provider error test", defaultAction: "deny",
+      }).returning();
+      await db.insert(toolProfileEntries).values({
+        companyId: company.id, profileId: profile.id,
+        selectorType: "tool_name", effect: "include", toolName,
+      });
+      const gateway = createTestToolGatewayService(db);
+      const named = await gateway.createNamedGateway({
+        companyId: company.id, body: { name: "Provider error test", profileId: profile.id },
+      });
+      const token = await gateway.createNamedGatewayToken({
+        companyId: company.id, gatewayId: named.id, body: { name: "Test" },
+      });
+      const response = await request(createGatewayRouteApp(db, gateway))
+        .post(named.endpointPath)
+        .set("authorization", `Bearer ${token.token}`)
+        .send({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: toolName, arguments: {} } })
+        .expect(200);
+      expect(response.body.result).toEqual({
+        content: [{ type: "text", text: "Search denied: outside consented tag" }], isError: true,
+      });
+      expect(await db.select().from(toolInvocations).where(eq(toolInvocations.companyId, company.id)))
+        .toEqual([expect.objectContaining({ status: "failed", errorCode: "tool_error" })]);
+      const events = await db.select().from(toolCallEvents).where(eq(toolCallEvents.companyId, company.id));
+      expect(events).toContainEqual(expect.objectContaining({ eventType: "call_failed", outcome: "failure", reasonCode: "tool_error" }));
+      expect(events.some((event) => event.eventType === "call_completed")).toBe(false);
+      const agent = await createAgent(db, company.id);
+      await allowAllToolsForAgent(db, company.id, agent.id);
+      await db.insert(companyMemberships).values({ companyId: company.id, principalType: "user",
+        principalId: "test-user", status: "active", membershipRole: "member" });
+      const testCall = await gateway.executeTestCall({ companyId: company.id, connectionId: connection.id,
+        agentId: agent.id, userId: "test-user", toolName, parameters: {} });
+      expect(testCall).toMatchObject({ decision: "allowed", error: { reasonCode: "tool_error" } });
+      expect(await db.select().from(toolInvocations).where(eq(toolInvocations.id, testCall.invocationId)))
+        .toEqual([expect.objectContaining({ status: "failed", errorCode: "tool_error" })]);
+      const testEvents = await db.select().from(toolCallEvents).where(eq(toolCallEvents.invocationId, testCall.invocationId));
+      expect(testEvents.some(event => event.eventType === "call_failed")).toBe(true);
+      expect(testEvents.some(event => event.eventType === "call_completed")).toBe(false);
+    } finally {
+      await remote.close();
+    }
+  });
+
+  it("exposes a named gateway with scoped bearer-token auth and revocation", async () => {
+    const company = await createCompany(db);
+    const remote = await startFakeRemoteMcpServer(async ({ body }) => ({
+      body: {
+        jsonrpc: "2.0",
+        id: body?.id,
         result: { content: [{ type: "text", text: "read ok" }], structuredContent: { ok: true } },
       },
     }));
@@ -729,6 +795,104 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
     } finally {
       await remote.close();
     }
+  });
+
+  it("keeps additive app-gallery assignments out of gateway-only runtimes", async () => {
+    const company = await createCompany(db);
+    const assigned = await createRemoteMcpTool(db, company.id, {
+      applicationKey: "gateway-assigned-app",
+      connectionName: "Dedicated GitHub identity",
+      toolName: "get_me",
+      riskLevel: "read",
+    });
+    const unassigned = await createRemoteMcpTool(db, company.id, {
+      applicationKey: "gateway-unassigned-app",
+      connectionName: "Personal GitHub identity",
+      toolName: "get_me",
+      riskLevel: "read",
+    });
+    const assignedToolName = expectedConnectedToolName({
+      applicationKey: assigned.application.applicationKey,
+      connectionId: assigned.connection.id,
+      toolName: assigned.catalogEntry.toolName,
+    });
+    const unassignedToolName = expectedConnectedToolName({
+      applicationKey: unassigned.application.applicationKey,
+      connectionId: unassigned.connection.id,
+      toolName: unassigned.catalogEntry.toolName,
+    });
+    const [gatewayProfile] = await db.insert(toolProfiles).values({
+      companyId: company.id,
+      profileKey: `runtime-gateway-${randomUUID()}`,
+      name: "Resolved runtime identity",
+      defaultAction: "deny",
+    }).returning();
+    await db.insert(toolProfileEntries).values({
+      companyId: company.id,
+      profileId: gatewayProfile.id,
+      selectorType: "connection",
+      effect: "include",
+      connectionId: assigned.connection.id,
+    });
+    const [appProfile] = await db.insert(toolProfiles).values({
+      companyId: company.id,
+      profileKey: `app:${unassigned.connection.id}`,
+      name: "Personal GitHub",
+      defaultAction: "deny",
+      metadata: { source: "app_gallery_finish", connectionId: unassigned.connection.id },
+    }).returning();
+    await db.insert(toolProfileEntries).values({
+      companyId: company.id,
+      profileId: appProfile.id,
+      selectorType: "connection",
+      effect: "include",
+      connectionId: unassigned.connection.id,
+    });
+    await db.insert(toolProfileBindings).values({
+      companyId: company.id,
+      profileId: appProfile.id,
+      targetType: "company",
+      targetId: company.id,
+      priority: 100,
+      metadata: { source: "app_gallery_finish" },
+    });
+
+    const gateway = createTestToolGatewayService(db);
+    const created = await gateway.createNamedGateway({
+      companyId: company.id,
+      body: {
+        name: "Resolved runtime GitHub",
+        profileId: gatewayProfile.id,
+        defaultProfileMode: "gateway_only",
+      },
+    });
+    const token = await gateway.createNamedGatewayToken({
+      companyId: company.id,
+      gatewayId: created.id,
+      body: { name: "Runtime token" },
+    });
+    const app = createGatewayRouteApp(db, gateway);
+
+    const listed = await request(app)
+      .post(`/api/tool-gateway/gateways/${created.id}/mcp`)
+      .set("authorization", `Bearer ${token.token}`)
+      .send({ jsonrpc: "2.0", id: 1, method: "tools/list" })
+      .expect(200);
+    const visibleToolNames = listed.body.result.tools.map((tool: { name: string }) => tool.name);
+    expect(visibleToolNames).toContain(assignedToolName);
+    expect(visibleToolNames).not.toContain(unassignedToolName);
+
+    const denied = await request(app)
+      .post(`/api/tool-gateway/gateways/${created.id}/mcp`)
+      .set("authorization", `Bearer ${token.token}`)
+      .send({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: unassignedToolName, arguments: {} },
+      })
+      .expect(403);
+    expect(denied.body.error.data.reasonCode).toBe("deny_default");
   });
 
   it("proxies namespaced resources and prompts only for fully assigned MCP connections", async () => {
@@ -1029,10 +1193,10 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
 
   it("rate limits public named gateway session setup, discovery, and calls with redacted audits", async () => {
     const company = await createCompany(db);
-    const remote = await startFakeRemoteMcpServer(async () => ({
+    const remote = await startFakeRemoteMcpServer(async ({ body }) => ({
       body: {
         jsonrpc: "2.0",
-        id: "test",
+        id: body?.id,
         result: { content: [{ type: "text", text: "read ok" }], structuredContent: { ok: true } },
       },
     }));
@@ -1366,141 +1530,24 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
     expect(otherTools.map((tool) => tool.catalogEntryId)).not.toContain(remoteTool.catalogEntry.id);
   });
 
-  it("invokes an installed Composio child through a tool-scoped session and re-mints once on 401", async () => {
+
+  it("hides retired Composio child tools and denies a previously discovered tool without upstream traffic", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
     const { run } = await createIssueAndRun(db, company.id, agent.id);
-    const remoteTool = await createRemoteMcpTool(db, company.id, {
-      applicationKey: "composio",
-      connectionName: "GitHub (via Composio)",
-      toolName: "GITHUB_LIST_REPOS",
-      title: "List repositories",
-      riskLevel: "read",
-    });
-    const apiKey = await secretService(db).create(company.id, {
-      name: "Composio API key",
-      key: `tool_app.${randomUUID()}.composio_api_key`,
-      provider: "local_encrypted",
-      value: "ak_composio_gateway_fixture",
-    });
-    const [parent] = await db.insert(toolConnections).values({
-      companyId: company.id,
-      applicationId: remoteTool.application.id,
-      name: "Composio",
-      uid: `composio/${randomUUID()}`,
-      transport: "rest_api",
-      authKind: "api_key",
-      status: "active",
-      enabled: true,
-      config: { sourceTemplateKey: "composio" },
-      transportConfig: { sourceTemplateKey: "composio" },
-      credentialRefs: [{
-        name: "credentials.apiKey",
-        secretId: apiKey.id,
-        version: "latest",
-        placement: "header",
-        key: "x-api-key",
-        prefix: null,
-      }],
-      credentialSecretRefs: [{
-        secretId: apiKey.id,
-        versionSelector: "latest",
-        configPath: "credentials.apiKey",
-        required: true,
-        label: "Composio API key",
-      }],
-    }).returning();
-    await db.insert(companySecretBindings).values({
-      companyId: company.id,
-      secretId: apiKey.id,
-      targetType: "tool_connection",
-      targetId: parent!.id,
-      configPath: "credentials.apiKey",
-    });
-    const childConfig = {
-      provider: "composio",
-      parentConnectionId: parent!.id,
-      toolkitSlug: "github",
-      connectedAccountId: "ca_github_fixture",
-    };
-    await db.update(toolConnections).set({ config: childConfig, transportConfig: childConfig })
-      .where(eq(toolConnections.id, remoteTool.connection.id));
-    await db.insert(toolConnectionInstalls).values({
-      companyId: company.id,
-      connectionId: remoteTool.connection.id,
-      targetType: "agent",
-      targetId: agent.id,
-    });
+    const remote = await createRemoteMcpTool(db, company.id, { applicationKey: "composio", connectionName: "Old toolkit", toolName: "read", title: "Read" });
     const profile = await allowToolsForAgent(db, company.id, agent.id, []);
-    await db.insert(toolProfileEntries).values({
-      companyId: company.id,
-      profileId: profile.id,
-      selectorType: "catalog_entry",
-      effect: "include",
-      catalogEntryId: remoteTool.catalogEntry.id,
-    });
-
-    const sessionRequests: Array<{ apiKey: string; userId: string; options: unknown }> = [];
-    let upstreamCalls = 0;
-    const gateway = createTestToolGatewayService(db, {
-      composioClientFactory: (resolvedApiKey) => ({
-        createSession: async (userId, sessionOptions) => {
-          sessionRequests.push({ apiKey: resolvedApiKey, userId, options: sessionOptions });
-          const suffix = sessionRequests.length;
-          return {
-            session_id: `composio-session-${suffix}`,
-            mcp: {
-              url: `https://mcp.composio.test/session-${suffix}`,
-              headers: { Authorization: `Bearer composio-session-token-${suffix}` },
-            },
-          };
-        },
-      }) as unknown as ComposioClient,
-      remoteHttpRequest: async (url, init) => {
-        upstreamCalls += 1;
-        expect(url).toBe(`https://mcp.composio.test/session-${upstreamCalls}`);
-        expect(new Headers(init.headers).get("authorization")).toBe(`Bearer composio-session-token-${upstreamCalls}`);
-        if (upstreamCalls === 1) return new Response("unauthorized", { status: 401 });
-        return new Response(JSON.stringify({
-          jsonrpc: "2.0",
-          id: "fixture",
-          result: { content: [{ type: "text", text: "repo-a" }], structuredContent: { repositories: ["repo-a"] } },
-        }), { status: 200, headers: { "content-type": "application/json" } });
-      },
-    });
+    await db.insert(toolProfileEntries).values({ companyId: company.id, profileId: profile.id, selectorType: "catalog_entry", effect: "include", catalogEntryId: remote.catalogEntry.id });
+    const remoteHttpRequest = vi.fn();
+    const gateway = createTestToolGatewayService(db, { remoteHttpRequest });
     const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
-    const tool = (await gateway.listToolsForSession(session.token)).find((candidate) => candidate.connectionId === remoteTool.connection.id);
+    const listed = await gateway.listToolsForSession(session.token);
+    const tool = listed.find((entry) => entry.connectionId === remote.connection.id)!;
     expect(tool).toBeDefined();
-    await expect(gateway.executeTool({ sessionToken: session.token, tool: tool!.name, parameters: {} })).resolves.toMatchObject({
-      status: "completed",
-      result: { content: "repo-a", data: { structuredContent: { repositories: ["repo-a"] } } },
-    });
-    await db.update(connectionGrants).set({ updatedAt: new Date(Date.now() + 1_000) })
-      .where(eq(connectionGrants.connectionId, remoteTool.connection.id));
-    await expect(gateway.executeTool({ sessionToken: session.token, tool: tool!.name, parameters: {} })).resolves.toMatchObject({
-      status: "completed",
-      result: { content: "repo-a" },
-    });
-    expect(sessionRequests).toEqual([
-      expect.objectContaining({
-        apiKey: "ak_composio_gateway_fixture",
-        userId: `paperclip:${company.id}`,
-        options: expect.objectContaining({
-          mcp: true,
-          toolkits: ["github"],
-          tools: { github: { enable: ["GITHUB_LIST_REPOS"] } },
-        }),
-      }),
-      expect.objectContaining({ options: expect.objectContaining({ tools: { github: { enable: ["GITHUB_LIST_REPOS"] } } }) }),
-      expect.objectContaining({ options: expect.objectContaining({ tools: { github: { enable: ["GITHUB_LIST_REPOS"] } } }) }),
-    ]);
-    const [persistedChild] = await db.select().from(toolConnections).where(eq(toolConnections.id, remoteTool.connection.id));
-    expect(JSON.stringify(persistedChild!.config)).not.toContain("session-");
-    expect(JSON.stringify(persistedChild!.transportConfig)).not.toContain("mcp.composio.test");
-    expect(persistedChild!.credentialSecretRefs.map((ref) => ref.configPath)).toEqual(expect.arrayContaining([
-      expect.stringMatching(/^composio\.session\.[a-f0-9]+\.url$/),
-      expect.stringMatching(/^composio\.session\.[a-f0-9]+\.header\.[a-f0-9]+$/),
-    ]));
+    await db.update(toolConnections).set({ config: { provider: "composio", parentConnectionId: randomUUID(), toolkitSlug: "github", url: "https://legacy.example/mcp" } }).where(eq(toolConnections.id, remote.connection.id));
+    expect((await gateway.listToolsForSession(session.token)).some((entry) => entry.connectionId === remote.connection.id)).toBe(false);
+    await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} })).rejects.toThrow();
+    expect(remoteHttpRequest).not.toHaveBeenCalled();
   });
 
   it("lists and executes connected local stdio MCP catalog tools through the gateway", async () => {
@@ -1678,6 +1725,54 @@ rl.on("line", (line) => {
       else process.env.DATABASE_URL = previousDatabaseUrl;
     }
   });
+
+  it.each(["credentials.authorization", "headers.X-Api-Key", "oauth.access_token"])(
+    "resolves a personal remote credential using its declared %s path",
+    async (configPath) => {
+      const company = await createCompany(db);
+      const agent = await createAgent(db, company.id);
+      const { run } = await createIssueAndRun(db, company.id, agent.id);
+      await createActiveMember(db, company.id, "alice");
+      await db.update(heartbeatRuns).set({ responsibleUserId: "alice" }).where(eq(heartbeatRuns.id, run.id));
+      const secrets = secretService(db);
+      const definition = await secrets.createUserSecretDefinition(company.id, {
+        name: "Personal remote token",
+        key: `personal_remote_${randomUUID().replace(/-/g, "")}`,
+        provider: "local_encrypted",
+      });
+      const secret = await secrets.createCurrentUserSecretValue(company.id, "alice", {
+        definitionId: definition.id, value: "personal-remote-test-token",
+      });
+      const remote = await createRemoteMcpTool(db, company.id);
+      await db.update(toolConnections).set({
+        credentialPolicy: "per_user",
+        credentialRefs: [{ name: configPath, secretId: secret.id, placement: "header", key: "Authorization", prefix: "Bearer " }],
+      }).where(eq(toolConnections.id, remote.connection.id));
+      await secrets.syncUserSecretDeclarationsForTarget(company.id,
+        { targetType: "tool_connection", targetId: remote.connection.id },
+        [{ definitionKey: definition.key, configPath, envKey: "Authorization", versionSelector: "latest", required: true }],
+        { replaceAll: true });
+      await db.insert(connectionGrants).values({
+        companyId: company.id, connectionId: remote.connection.id, kind: "user", subjectUserId: "alice",
+        credentialSecretRefs: [{ secretId: secret.id, configPath, versionSelector: "latest" }],
+        status: "active", isDefault: false,
+      });
+      await allowAllToolsForAgent(db, company.id, agent.id);
+      const headers: string[] = [];
+      const gateway = createTestToolGatewayService(db, { remoteHttpRequest: async (_url, init) => {
+        headers.push(new Headers(init.headers).get("authorization") ?? "");
+        const body = JSON.parse(String(init.body)) as { id: string };
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id,
+          result: { content: [{ type: "text", text: "retrieved synthetic memory" }] } }),
+        { headers: { "content-type": "application/json" } });
+      } });
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const tool = (await gateway.listToolsForSession(session.token)).find(t => t.connectionId === remote.connection.id)!;
+      expect((await gateway.executeTool({ sessionToken: session.token, tool: tool.name,
+        parameters: { key: "test", value: "synthetic" } })).status).toBe("completed");
+      expect(headers).toEqual(["Bearer personal-remote-test-token"]);
+    },
+  );
 
   it("passes only the selected grant identity to local stdio MCP processes", async () => {
     const company = await createCompany(db);
@@ -2017,6 +2112,56 @@ rl.on("line", (line) => {
     }
   });
 
+  it.each([
+    { connectionMethodKey: "managed", transportConfigOnly: false },
+    { connectionMethodKey: "mcp-key", transportConfigOnly: false },
+    { connectionMethodKey: "managed", transportConfigOnly: true },
+    { connectionMethodKey: "mcp-key", transportConfigOnly: true },
+  ])("sends the GitHub Actions toolset for $connectionMethodKey (legacy config: $transportConfigOnly)", async ({ connectionMethodKey, transportConfigOnly }) => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const parameters = { method: "run_workflow", owner: "example", repo: "release", workflow_id: "nightly.yml", ref: "main" };
+    const fake = await startFakeRemoteMcpServer((fakeRequest) => {
+      expect(fakeRequest.headers["x-mcp-toolsets"]).toBe("default,actions");
+      expect(fakeRequest.body).toMatchObject({
+        method: "tools/call",
+        params: { name: "actions_run_trigger", arguments: parameters },
+      });
+      return { body: { jsonrpc: "2.0", id: fakeRequest.body?.id, result: { content: [{ type: "text", text: "Workflow dispatched" }] } } };
+    });
+    try {
+      const { connection, catalogEntry } = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "github",
+        url: fake.url,
+        toolName: "actions_run_trigger",
+        riskLevel: "destructive",
+        connectionConfig: { sourceTemplateKey: "github", connectionMethodKey },
+      });
+      if (transportConfigOnly) {
+        await db.update(toolConnections).set({ config: { url: fake.url } }).where(eq(toolConnections.id, connection.id));
+      }
+      await db.update(toolCatalogEntries).set({
+        inputSchema: {
+          type: "object",
+          properties: Object.fromEntries(Object.keys(parameters).map((key) => [key, { type: "string" }])),
+          required: Object.keys(parameters),
+          additionalProperties: false,
+        },
+      }).where(eq(toolCatalogEntries.id, catalogEntry.id));
+      await allowAllToolsForAgent(db, company.id, agent.id);
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const tool = (await gateway.listToolsForSession(session.token)).find((entry) => entry.catalogEntryId === catalogEntry.id);
+      expect(tool).toBeTruthy();
+      const result = await gateway.executeTool({ sessionToken: session.token, tool: tool!.name, parameters });
+      expect(result.status).toBe("completed");
+      expect(fake.requests).toHaveLength(1);
+    } finally {
+      await fake.close();
+    }
+  });
+
   it("executes a connected remote HTTP MCP tool with stored credentials and redacted audit state", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
@@ -2290,7 +2435,7 @@ rl.on("line", (line) => {
     }
   });
 
-  it("requires an explicit named-agent delegation for autonomous personal-identity runs", async () => {
+  it("uses the responsible user's identity directly and requires delegation only without one", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
     const { issue, run } = await createIssueAndRun(db, company.id, agent.id);
@@ -2328,14 +2473,21 @@ rl.on("line", (line) => {
       const tool = (await gateway.listToolsForSession(session.token)).find((item) => item.providerType === "mcp_remote_http")!;
 
       await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} }))
-        .rejects.toMatchObject({ status: 409, reasonCode: "standing_delegation_required" });
-      expect(fake.requests).toHaveLength(0);
+        .resolves.toMatchObject({ status: "completed", result: { content: "delegated" } });
+      expect(fake.requests).toHaveLength(1);
       expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issue.id)))
-        .toEqual([expect.objectContaining({
-          status: "pending",
-          addresseeUserId: "alice",
-          idempotencyKey: `connection-delegation:${connection.id}:alice:${agent.id}`,
-        })]);
+        .toEqual([]);
+
+      await db.update(heartbeatRuns).set({ responsibleUserId: null }).where(eq(heartbeatRuns.id, run.id));
+      const unattendedSession = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const unattendedTool = (await gateway.listToolsForSession(unattendedSession.token))
+        .find((item) => item.providerType === "mcp_remote_http")!;
+      await expect(gateway.executeTool({
+        sessionToken: unattendedSession.token,
+        tool: unattendedTool.name,
+        parameters: {},
+      })).rejects.toMatchObject({ status: 409, reasonCode: "user_authorization_required" });
+      expect(fake.requests).toHaveLength(1);
 
       await db.insert(connectionGrantDelegations).values({
         companyId: company.id,
@@ -2343,17 +2495,25 @@ rl.on("line", (line) => {
         agentId: agent.id,
         createdByUserId: "alice",
       });
-      await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} }))
+      await expect(gateway.executeTool({
+        sessionToken: unattendedSession.token,
+        tool: unattendedTool.name,
+        parameters: {},
+      }))
         .resolves.toMatchObject({ status: "completed", result: { content: "delegated" } });
-      expect(fake.requests).toHaveLength(1);
+      expect(fake.requests).toHaveLength(2);
 
       await db.update(companyMemberships).set({ status: "suspended" }).where(and(
         eq(companyMemberships.companyId, company.id),
         eq(companyMemberships.principalId, "alice"),
       ));
-      await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} }))
+      await expect(gateway.executeTool({
+        sessionToken: unattendedSession.token,
+        tool: unattendedTool.name,
+        parameters: {},
+      }))
         .rejects.toMatchObject({ status: 403, reasonCode: "grant_owner_membership_inactive" });
-      expect(fake.requests).toHaveLength(1);
+      expect(fake.requests).toHaveLength(2);
     } finally {
       await fake.close();
     }
@@ -2870,7 +3030,7 @@ rl.on("line", (line) => {
         issueId: issue.id,
         interactionId: actionRequest.interactionId!,
         actionRequestId: actionRequest.id,
-        actor: { agentId: agent.id },
+        actor: { userId: "board-user" },
       })).resolves.toMatchObject({ status: "expired" });
 
       expect(fake.requests).toHaveLength(0);
@@ -3224,7 +3384,7 @@ rl.on("line", (line) => {
         continuationPolicy: "wake_assignee",
         payload: {
           version: 1,
-          prompt: `Approve ${approvalToolName}?`,
+          prompt: "Approve KV Set?",
           detailsMarkdown: expect.stringContaining('"value":"original"'),
           target: {
             type: "custom",
@@ -3408,7 +3568,7 @@ rl.on("line", (line) => {
       await gateway.declineActionRequest({
         companyId: company.id,
         actionRequestId: rejectedRequest.id,
-        actor: { agentId: agent.id },
+        actor: { userId: "board-user" },
       });
       await gateway.executeTool({
         sessionToken: session.token,
@@ -5042,6 +5202,43 @@ rl.on("line", (line) => {
       outcome: "failure",
       reasonCode: "runtime_host_capacity_exhausted",
     });
+  });
+
+  it("calls bundled Cognee in public mode and recovers from provider errors without runtime backoff", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const refs = await Promise.all(Object.entries({
+      COGNEE_BASE_URL: "https://fixture.aws.cognee.ai",
+      COGNEE_API_KEY: "fixture-key",
+    }).map(async ([key, value]) => {
+      const secret = await secretService(db).create(company.id, {
+        name: key, key: `${key}_${randomUUID().replace(/-/g, "")}`,
+        provider: "local_encrypted", value,
+      });
+      return { secretId: secret.id, versionSelector: "latest", configPath: `env.${key}`, required: true };
+    }));
+    const local = await createLocalStdioMcpTool(db, company.id, {
+      applicationKey: "cognee", toolName: "recall",
+      connectionConfig: { templateId: "paperclip.cognee-cloud" }, credentialSecretRefs: refs,
+    });
+    await allowAllToolsForAgent(db, company.id, agent.id);
+    const bridge = vi.spyOn(cogneeBridge, "callCogneeCloud")
+      .mockRejectedValueOnce(new Error("Cloud temporarily unavailable"))
+      .mockResolvedValue({ content: [{ type: "text", text: "recalled synthetic memory" }],
+        structuredContent: { result: "recalled synthetic memory" }, isError: false });
+    const gateway = createTestToolGatewayService(db, {
+      deploymentMode: "authenticated", deploymentExposure: "public", trustedLocalStdioRuntimeHost: null,
+    });
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    const tool = (await gateway.listToolsForSession(session.token)).find(t => t.connectionId === local.connection.id)!;
+    await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name,
+      parameters: { message: "synthetic" } })).rejects.toThrow("Cloud temporarily unavailable");
+    await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name,
+      parameters: { message: "synthetic" } })).resolves.toMatchObject({ status: "completed" });
+    expect(bridge).toHaveBeenCalledTimes(2);
+    expect(await db.select().from(toolRuntimeSlots).where(eq(toolRuntimeSlots.connectionId, local.connection.id))).toHaveLength(0);
+    bridge.mockRestore();
   });
 
   it("fails closed for hosted public local stdio unless a trusted runtime host is configured", async () => {

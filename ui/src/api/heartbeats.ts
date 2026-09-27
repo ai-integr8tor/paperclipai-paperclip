@@ -1,3 +1,5 @@
+import type { AgentAppearance } from "@paperclipai/shared";
+import type { IssueRecoveryAction } from "@paperclipai/shared";
 import type {
   HeartbeatRun,
   HeartbeatRunEvent,
@@ -5,7 +7,8 @@ import type {
   ProviderTraceFrame,
   ProviderTraceMetadata,
 } from "@paperclipai/shared";
-import { api } from "./client";
+import { tenantSessionRecovery } from "@/lib/tenant-session-recovery";
+import { api, type RequestOptions } from "./client";
 
 export interface RunLivenessFields {
   livenessState: HeartbeatRun["livenessState"];
@@ -16,6 +19,7 @@ export interface RunLivenessFields {
 }
 
 export interface ActiveRunForIssue {
+  execution?: HeartbeatRun["execution"];
   id: string;
   runtimeMode?: "legacy" | "native";
   status: string;
@@ -28,6 +32,8 @@ export interface ActiveRunForIssue {
   createdAt: string | Date;
   agentId: string;
   agentName: string;
+  agentAppearance?: AgentAppearance | null;
+  avatarUrl?: string;
   adapterType: string;
   logBytes?: number | null;
   lastOutputBytes?: number | null;
@@ -46,6 +52,7 @@ export interface ActiveRunForIssue {
 }
 
 export interface LiveRunForIssue {
+  execution?: HeartbeatRun["execution"];
   id: string;
   runtimeMode?: "legacy" | "native";
   status: string;
@@ -58,6 +65,8 @@ export interface LiveRunForIssue {
   createdAt: string;
   agentId: string;
   agentName: string;
+  agentAppearance?: AgentAppearance | null;
+  avatarUrl?: string;
   adapterType: string;
   logBytes?: number | null;
   lastOutputBytes?: number | null;
@@ -107,6 +116,7 @@ export interface ProviderTraceInspection {
 }
 
 export const heartbeatsApi = {
+  executionForIssue: (issueId: string) => api.get<{ runId: string; agentId: string; recoveryAction: IssueRecoveryAction | null; execution: HeartbeatRun["execution"] } | null>(`/issues/${issueId}/execution`),
   list: (
     companyId: string,
     agentId?: string,
@@ -123,11 +133,12 @@ export const heartbeatsApi = {
     );
   },
   get: (runId: string) => api.get<HeartbeatRun>(`/heartbeat-runs/${runId}`),
-  events: (runId: string, afterSeq = 0, limit = 200) =>
+  events: (runId: string, afterSeq = 0, limit = 200, options?: RequestOptions) =>
     api.get<HeartbeatRunEvent[]>(
       `/heartbeat-runs/${runId}/events?afterSeq=${encodeURIComponent(String(afterSeq))}&limit=${encodeURIComponent(String(limit))}`,
+      options,
     ),
-  log: (runId: string, offset = 0, limitBytes = 256000) =>
+  log: (runId: string, offset = 0, limitBytes = 256000, options?: RequestOptions) =>
     api.get<{
       runId: string;
       store: string;
@@ -136,6 +147,7 @@ export const heartbeatsApi = {
       nextOffset?: number;
     }>(
       `/heartbeat-runs/${runId}/log?offset=${encodeURIComponent(String(offset))}&limitBytes=${encodeURIComponent(String(limitBytes))}`,
+      options,
     ),
   workspaceOperations: (runId: string) =>
     api.get<WorkspaceOperation[]>(
@@ -168,6 +180,8 @@ export const heartbeatsApi = {
       const body = (await response.json().catch(() => null)) as {
         error?: string;
       } | null;
+      const recovery = tenantSessionRecovery.recoverIfNeeded(response.status, body);
+      if (recovery) return recovery;
       throw new Error(
         body?.error ?? `Trace download failed: ${response.status}`,
       );

@@ -12,6 +12,8 @@ import type {
 
 const NAMESPACE: Readonly<Record<PaperclipSemanticActionId, string>> =
   Object.freeze({
+    search_api: "api_fallback",
+    call_api: "api_fallback",
     get_task_context: "active_task",
     get_task_history: "active_task",
     list_documents: "documents",
@@ -26,6 +28,7 @@ const NAMESPACE: Readonly<Record<PaperclipSemanticActionId, string>> =
     block_task: "active_task",
     request_review: "active_task",
     list_agents: "discovery",
+    hire_agent: "delegation",
     get_agent: "discovery",
     search_tasks: "discovery",
     list_approvals: "governance",
@@ -33,8 +36,8 @@ const NAMESPACE: Readonly<Record<PaperclipSemanticActionId, string>> =
     get_approval_context: "governance",
     get_workspace_runtime: "workspace",
     control_workspace_service: "workspace",
-    set_dependencies: "delegation",
-    create_task: "delegation",
+    set_dependencies: "delegation", reassign_task: "delegation",
+    create_skill: "skills", create_task: "delegation", create_project: "projects", list_project_repositories: "projects", list_projects: "projects",
     request_approval: "governance",
     decide_approval: "governance",
     comment_on_approval: "governance",

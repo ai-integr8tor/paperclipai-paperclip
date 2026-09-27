@@ -5,7 +5,7 @@ import path from "node:path";
 import { shouldExcludePath } from "./exclude-patterns.js";
 import { resolvePaperclipInstanceRootForAdapter } from "./server-utils.js";
 
-type SnapshotEntry =
+export type SnapshotEntry =
   | { kind: "dir" }
   | { kind: "file"; mode: number; hash: string }
   | { kind: "symlink"; target: string };
@@ -13,6 +13,87 @@ type SnapshotEntry =
 export interface DirectorySnapshot {
   exclude: string[];
   entries: Map<string, SnapshotEntry>;
+}
+
+export interface SerializedDirectorySnapshot {
+  version: 1;
+  exclude: string[];
+  entries: Array<[string, SnapshotEntry]>;
+}
+
+function isSafeSnapshotRelativePath(value: string): boolean {
+  if (!value || path.posix.isAbsolute(value) || path.win32.isAbsolute(value)) {
+    return false;
+  }
+  return !value.split(/[\\/]/).some((segment) => segment === "..");
+}
+
+function parseSnapshotEntry(value: unknown): SnapshotEntry | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const candidate = value as Record<string, unknown>;
+  if (candidate.kind === "dir") return { kind: "dir" };
+  if (candidate.kind === "symlink" && typeof candidate.target === "string") {
+    return { kind: "symlink", target: candidate.target };
+  }
+  if (
+    candidate.kind === "file" &&
+    typeof candidate.mode === "number" &&
+    Number.isInteger(candidate.mode) &&
+    candidate.mode >= 0 &&
+    typeof candidate.hash === "string" &&
+    /^[0-9a-f]{64}$/.test(candidate.hash)
+  ) {
+    return { kind: "file", mode: candidate.mode, hash: candidate.hash };
+  }
+  return null;
+}
+
+export function serializeDirectorySnapshot(
+  snapshot: DirectorySnapshot,
+): SerializedDirectorySnapshot {
+  return {
+    version: 1,
+    exclude: [...snapshot.exclude],
+    entries: [...snapshot.entries.entries()].sort(([left], [right]) =>
+      left.localeCompare(right),
+    ),
+  };
+}
+
+export function parseDirectorySnapshot(
+  value: unknown,
+): DirectorySnapshot | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const candidate = value as Record<string, unknown>;
+  if (
+    candidate.version !== 1 ||
+    !Array.isArray(candidate.exclude) ||
+    !candidate.exclude.every((entry) => typeof entry === "string") ||
+    !Array.isArray(candidate.entries)
+  ) {
+    return null;
+  }
+  const entries = new Map<string, SnapshotEntry>();
+  for (const rawEntry of candidate.entries) {
+    if (!Array.isArray(rawEntry) || rawEntry.length !== 2) return null;
+    const [relative, rawSnapshotEntry] = rawEntry;
+    if (typeof relative !== "string" || !isSafeSnapshotRelativePath(relative)) {
+      return null;
+    }
+    const entry = parseSnapshotEntry(rawSnapshotEntry);
+    if (!entry || entries.has(relative)) return null;
+    entries.set(relative, entry);
+  }
+  return {
+    exclude: [...new Set(candidate.exclude as string[])],
+    entries,
+  };
+}
+
+export function directorySnapshotSha256(snapshot: DirectorySnapshot): string {
+  return createHash("sha256")
+    .update(JSON.stringify(serializeDirectorySnapshot(snapshot)))
+    .digest("hex");
 }
 
 async function hashFile(filePath: string): Promise<string> {
@@ -125,6 +206,7 @@ export const WORKSPACE_RESTORE_LOCK_TIMEOUT_CODE = "ERR_WORKSPACE_RESTORE_LOCK_T
 export type WorkspaceRestoreFailureCode =
   | "restore_permission_denied"
   | "restore_lock_timeout"
+  | "restore_unsafe_archive"
   | "restore_failed";
 
 /**
@@ -141,13 +223,24 @@ export type WorkspaceRestoreOutcome =
  * `EACCES` and `EPERM` to a permission failure, the merge-lock timeout
  * (matched by {@link WORKSPACE_RESTORE_LOCK_TIMEOUT_CODE}, never by the error
  * message text) to a lock-timeout failure, and every other error to a generic
- * failure. Never reads or returns `Error.message`, a filesystem path, or a
- * process id.
+ * failure. The known Daytona confinement diagnostic also identifies unsafe
+ * archives across plugin transports that retain only a message. Never returns
+ * raw messages, paths or process IDs.
  */
 export function classifyWorkspaceRestoreFailure(error: unknown): WorkspaceRestoreFailureCode {
   const code = error && typeof error === "object" ? (error as NodeJS.ErrnoException).code : undefined;
   if (code === "EACCES" || code === "EPERM") return "restore_permission_denied";
   if (code === WORKSPACE_RESTORE_LOCK_TIMEOUT_CODE) return "restore_lock_timeout";
+  const message = error instanceof Error ? error.message : "";
+  const archiveRefused = /Daytona syncOut refusing (?:tarball (?:with an unparseable entry listing|(?:link whose target|member that) escapes the extraction dir)|unparseable or ambiguous (?:sym|hard)link entry)/.test(message);
+  const outboundPathRefused = /Daytona sync source path (?:is not a confined absolute path|escapes the workspace remote dir):/.test(message);
+  // These are the fail-closed guard's own exit codes. Transport/command failures
+  // with other exit codes retain the existing transient failure policy.
+  const outboundGuardRefused = /Daytona outbound symlink-escape guard command failed \(exit (?:40|41|42|44|45)\)/.test(message);
+  if (code === "WORKSPACE_RESTORE_UNSAFE_ARCHIVE" ||
+      archiveRefused || outboundPathRefused || outboundGuardRefused) {
+    return "restore_unsafe_archive";
+  }
   return "restore_failed";
 }
 
@@ -165,6 +258,8 @@ export function describeWorkspaceRestoreFailure(code: WorkspaceRestoreFailureCod
       return "the restore could not write to the workspace (permission denied)";
     case "restore_lock_timeout":
       return "the restore timed out waiting for the workspace merge lock";
+    case "restore_unsafe_archive":
+      return "the archive contains an unsafe link or path; workspace repair is required";
     case "restore_failed":
       return "the restore failed";
   }

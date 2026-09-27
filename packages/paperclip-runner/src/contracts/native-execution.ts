@@ -29,6 +29,7 @@ export interface StrictCompletionContractInput {
 export interface NativeInteractionResponseEnvelope {
   interactionId: string;
   kind:
+    | "connection_intent"
     | "suggest_tasks"
     | "ask_user_questions"
     | "request_confirmation"
@@ -79,7 +80,7 @@ export interface NativeAwsAgentCoreProfileSnapshot {
 export type NativeAcpxAgent = "pi" | "claude" | "codex";
 export type NativeCodexApprovalPolicy = "never" | "on-request" | "untrusted";
 export type NativeOpenCodePermissionMode = "allow" | "ask" | "deny";
-export type NativeAcpxPermissionMode = "approve-all" | "approve-reads" | "deny-all";
+export type NativeAcpxPermissionMode = "approve-all" | "approve-paperclip" | "approve-reads" | "deny-all";
 
 export interface NativeAcpxProfileSnapshot {
   driverKind: "acpx_runtime";
@@ -193,6 +194,10 @@ export interface NativeExecutionInputV3 extends Omit<NativeExecutionInputV2, "sc
 export interface NativeExecutionInputV4 extends Omit<NativeExecutionInputV3, "schema" | "provider"> {
   schema: typeof NATIVE_EXECUTION_INPUT_SCHEMA;
   provider: NativeProviderConfigV4;
+  /** Used only after the runtime proves provider-session recovery succeeded. */
+  continuationPrompt?: string | null;
+  /** Restored only when starting a fresh provider session, never on a resume. */
+  initialCommunicationGuidance?: string | null;
 }
 
 export type NativeExecutionInput = NativeExecutionInputV1 | NativeExecutionInputV2 | NativeExecutionInputV3 | NativeExecutionInputV4;
@@ -228,6 +233,8 @@ export interface NativeSessionExecutionResult {
   nativeEventCount: number;
   highestContiguousSourceSeq: number;
   usage: Record<string, unknown> | null;
+  /** The active durable goal reached a safe turn boundary for run rollover. */
+  goalRolloverRequired?: boolean;
 }
 
 export class NativeExecutionInputError extends Error {
@@ -287,6 +294,7 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
     "credentialBindings",
     ...(isV2 ? ["executionMode", "planningContext"] : []),
     ...(isV3 ? ["runtimeContext"] : []),
+    ...(isV4 ? ["continuationPrompt", "initialCommunicationGuidance"] : []),
   ], "input");
   if (!isV2 && input.schema !== NATIVE_EXECUTION_INPUT_SCHEMA_V1) {
     throw new NativeExecutionInputError(
@@ -528,8 +536,8 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
       throw new NativeExecutionInputError("input.provider.agent must be pi, claude, or codex");
     }
     if (isV4) {
-      if (provider.permissionMode !== "approve-all" && provider.permissionMode !== "approve-reads" && provider.permissionMode !== "deny-all") {
-        throw new NativeExecutionInputError("input.provider.permissionMode must be approve-all, approve-reads, or deny-all");
+      if (provider.permissionMode !== "approve-all" && provider.permissionMode !== "approve-paperclip" && provider.permissionMode !== "approve-reads" && provider.permissionMode !== "deny-all") {
+        throw new NativeExecutionInputError("input.provider.permissionMode must be approve-all, approve-paperclip, approve-reads, or deny-all");
       }
     } else if (provider.permissionPolicy !== "interactive") {
       throw new NativeExecutionInputError("input.provider.permissionPolicy must be interactive");
@@ -620,6 +628,7 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
     const response = record(entry, `input.interactionResponses[${index}]`);
     exactKeys(response, ["interactionId", "kind", "response"], `input.interactionResponses[${index}]`);
     if (![
+      "connection_intent",
       "suggest_tasks",
       "ask_user_questions",
       "request_confirmation",
@@ -709,11 +718,31 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
   return {
     ...withRuntimeContext,
     schema: NATIVE_EXECUTION_INPUT_SCHEMA,
+    ...(input.continuationPrompt !== undefined ? { continuationPrompt: nullableText(input.continuationPrompt, "input.continuationPrompt") } : {}),
+    ...(input.initialCommunicationGuidance !== undefined ? { initialCommunicationGuidance: nullableText(input.initialCommunicationGuidance, "input.initialCommunicationGuidance") } : {}),
     provider: parsedProvider as NativeProviderConfigV4,
   };
 }
 
-export function buildNativeModelEnvelope(input: NativeExecutionInput): NativeModelEnvelopeV1 | NativeModelEnvelopeV2 {
+export interface NativeContinuationEnvelope {
+  schema: "paperclip.native-continuation.v1";
+  events: string;
+  completion: { revision: string; criterionIds: string[] };
+}
+
+export function buildNativeModelEnvelope(input: NativeExecutionInput, options: { resumedSession: true }): NativeModelEnvelopeV1 | NativeModelEnvelopeV2 | NativeContinuationEnvelope;
+export function buildNativeModelEnvelope(input: NativeExecutionInput): NativeModelEnvelopeV1 | NativeModelEnvelopeV2;
+export function buildNativeModelEnvelope(input: NativeExecutionInput, options?: { resumedSession: boolean }): NativeModelEnvelopeV1 | NativeModelEnvelopeV2 | NativeContinuationEnvelope {
+  if (options?.resumedSession && "continuationPrompt" in input && input.continuationPrompt) {
+    return {
+      schema: "paperclip.native-continuation.v1",
+      events: input.continuationPrompt,
+      completion: {
+        revision: input.completionContract.contract.revision,
+        criterionIds: input.completionContract.contract.criteria.map((criterion) => criterion.id),
+      },
+    };
+  }
   if (input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V1) {
     return {
       schema: NATIVE_MODEL_ENVELOPE_SCHEMA_V1,
@@ -727,7 +756,12 @@ export function buildNativeModelEnvelope(input: NativeExecutionInput): NativeMod
   }
   return {
     schema: NATIVE_MODEL_ENVELOPE_SCHEMA,
-    task: structuredClone(input.task),
+    task: {
+      ...structuredClone(input.task),
+      prompt: !options?.resumedSession && "initialCommunicationGuidance" in input && input.initialCommunicationGuidance
+        ? `${input.initialCommunicationGuidance}\n\n${input.task.prompt}`
+        : input.task.prompt,
+    },
     executionMode: input.executionMode,
     planningContext: structuredClone(input.planningContext),
     workspace: input.provider.kind === "claude_managed" || input.provider.kind === "aws_agentcore"

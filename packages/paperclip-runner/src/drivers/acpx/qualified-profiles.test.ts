@@ -18,9 +18,30 @@ describe("qualified ACPX profiles", () => {
     }
   });
 
+  it.each(["claude-opus-5-5", "claude-fable-5-1", "custom-model-not-in-catalog"])("accepts the exact Claude model %s", (model) => {
+    expect(resolveQualifiedAcpxProfile("claude", model)).toMatchObject({
+      qualificationModel: model, reportedModelId: model,
+      commandDigest: QUALIFIED_ACPX_PROFILES.claude.commandDigest,
+    });
+  });
+
   it("rejects unqualified model substitutions", () => {
     expect(() =>
       resolveQualifiedAcpxProfile("codex", "some-other-model"),
     ).toThrow("requires exact model");
+  });
+
+  it("binds Codex ACP to the CLI runtime it launches", () => {
+    expect(QUALIFIED_ACPX_PROFILES.codex).toMatchObject({
+      agentRuntimePackage: "@openai/codex",
+      agentRuntimeVersion: "0.156.0",
+    });
+  });
+
+  it("binds Claude ACP to the SDK and native CLI runtime it launches", () => {
+    expect(QUALIFIED_ACPX_PROFILES.claude).toMatchObject({
+      agentRuntimePackage: "@anthropic-ai/claude-agent-sdk",
+      agentRuntimeVersion: "0.3.280",
+    });
   });
 });

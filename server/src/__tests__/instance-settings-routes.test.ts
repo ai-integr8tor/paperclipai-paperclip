@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { hoistModuleGraph } from "./helpers/hoist-module-graph.js";
 
 const mockInstanceSettingsService = vi.hoisted(() => ({
   get: vi.fn(),
@@ -22,11 +23,16 @@ const mockEnvironmentService = vi.hoisted(() => ({
   findManagedSandboxEnvironment: vi.fn(),
   update: vi.fn(),
 }));
+const mockCompanyService = vi.hoisted(() => ({
+  getById: vi.fn(),
+  update: vi.fn(),
+}));
 const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockPublishActivity = vi.hoisted(() => vi.fn());
 
 function registerModuleMocks() {
   vi.doMock("../services/index.js", () => ({
+    companyService: () => mockCompanyService,
     heartbeatService: () => mockHeartbeatService,
     instanceSettingsService: () => mockInstanceSettingsService,
     logActivity: mockLogActivity,
@@ -40,41 +46,55 @@ function registerModuleMocks() {
 // Identity object the mocked db.transaction hands to writers; tests assert
 // both the marker clear and the settings update receive THIS same tx.
 const TX_SENTINEL = { __tx: true };
+// Runs the callback with a sentinel tx and propagates throws, so a failing
+// write inside rejects the whole request exactly like a real transaction
+// rollback. This is the default mockDb.transaction implementation; a test
+// that installs its own mockImplementation loses this default, so
+// beforeEach below reinstalls it before every test.
+function defaultTransactionImplementation(fn: (tx: unknown) => Promise<unknown>) {
+  return fn(TX_SENTINEL);
+}
 // Module-scoped (not rebuilt per createApp call) so a test can assert how
 // many times a request opened a transaction — the task-drain audit writes
 // for every company must share ONE transaction, not one each.
+// Rows the lifecycle read-back's plain `db.select().from(companies)` sees;
+// tests assign per case.
+let mockCompanyRows: Array<{ id: string; status: string }> = [];
 const mockDb = {
-  // Runs the callback with a sentinel tx and propagates throws, so a
-  // failing write inside rejects the whole request exactly like a real
-  // transaction rollback.
-  transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn(TX_SENTINEL)),
+  transaction: vi.fn(defaultTransactionImplementation),
+  select: vi.fn(() => ({ from: () => Promise.resolve(mockCompanyRows) })),
 };
 
-async function createApp(actor: any) {
-  const [{ errorHandler }, { instanceSettingsRoutes }] = await Promise.all([
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-    vi.importActual<typeof import("../routes/instance-settings.js")>("../routes/instance-settings.js"),
-  ]);
-  const app = express();
-  app.use(express.json());
-  app.use((req, _res, next) => {
-    req.actor = actor;
-    next();
-  });
-  app.use("/api", instanceSettingsRoutes(mockDb as any));
-  app.use(errorHandler);
-  return app;
-}
-
 describe("instance settings routes", () => {
+  const routeModules = hoistModuleGraph(registerModuleMocks, async () => {
+    const [{ errorHandler }, { instanceSettingsRoutes }] = await Promise.all([
+      vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
+      vi.importActual<typeof import("../routes/instance-settings.js")>("../routes/instance-settings.js"),
+    ]);
+    return { errorHandler, instanceSettingsRoutes };
+  });
+
+  function createApp(actor: any) {
+    const { errorHandler, instanceSettingsRoutes } = routeModules.value;
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = actor;
+      next();
+    });
+    app.use("/api", instanceSettingsRoutes(mockDb as any));
+    app.use(errorHandler);
+    return app;
+  }
+
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../routes/instance-settings.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
     vi.clearAllMocks();
+    // vi.clearAllMocks() clears recorded calls only; it does not remove a
+    // mockImplementation a prior test installed. Reinstall the default here
+    // so a stateful implementation from one test can never leak into the
+    // next one.
+    mockDb.transaction.mockReset();
+    mockDb.transaction.mockImplementation(defaultTransactionImplementation);
     mockInstanceSettingsService.get.mockReset();
     mockInstanceSettingsService.getGeneral.mockReset();
     mockInstanceSettingsService.getExperimental.mockReset();
@@ -268,6 +288,36 @@ describe("instance settings routes", () => {
       .post("/api/instance/settings/experimental/issue-graph-liveness-auto-recovery/run")
       .send({ lookbackHours: 24 })
       .expect(404);
+  });
+
+  it.each([true, false])("allows only instance admins to change chat connector visibility (%s)", async (isInstanceAdmin) => {
+    const app = createApp({ type: "board", userId: "user-1", source: "session", isInstanceAdmin, companyIds: ["company-1"] });
+    const response = await request(app).patch("/api/instance/settings/experimental").send({ enableChatConnectors: true });
+    expect(response.status).toBe(isInstanceAdmin ? 200 : 403);
+    if (isInstanceAdmin) {
+      expect(mockInstanceSettingsService.updateExperimental).toHaveBeenCalledWith({ enableChatConnectors: true });
+      expect(mockLogActivity).toHaveBeenCalled();
+    } else {
+      expect(mockInstanceSettingsService.updateExperimental).not.toHaveBeenCalled();
+    }
+  });
+
+  it("accepts the instance-wide Streamlined UI preference", async () => {
+    const app = await createApp({
+      type: "board",
+      userId: "local-board",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+    });
+
+    await request(app)
+      .patch("/api/instance/settings/experimental")
+      .send({ enableStreamlinedUi: false })
+      .expect(200);
+
+    expect(mockInstanceSettingsService.updateExperimental).toHaveBeenCalledWith({
+      enableStreamlinedUi: false,
+    });
   });
 
   it("strips server-managed worktree run execution fields before updating experimental settings", async () => {
@@ -803,6 +853,40 @@ describe("instance settings routes", () => {
       expect(mockInstanceSettingsService.updateExperimental).not.toHaveBeenCalled();
     });
 
+    it("enforces a wildcard allowlist at the API and preserves hidden values", async () => {
+      process.env.PAPERCLIP_HIDDEN_SETTINGS =
+        "instance.experimental.*,!instance.experimental.enableIsolatedWorkspaces";
+      const app = await createApp(adminActor);
+
+      const rejected = await request(app)
+        .patch("/api/instance/settings/experimental")
+        .send({ enableEnvironments: true, enableIsolatedWorkspaces: true });
+      expect(rejected.status).toBe(403);
+      expect(rejected.body.details).toMatchObject({ code: "settings_operator_managed" });
+      expect(mockInstanceSettingsService.updateExperimental).not.toHaveBeenCalled();
+
+      // Existing full-form clients may echo hidden values without changing them.
+      const allowed = await request(app)
+        .patch("/api/instance/settings/experimental")
+        .send({ enableEnvironments: false, enableIsolatedWorkspaces: true });
+      expect(allowed.status).toBe(200);
+      expect(mockInstanceSettingsService.updateExperimental).toHaveBeenCalledWith({
+        enableEnvironments: false, enableIsolatedWorkspaces: true,
+      });
+    });
+
+    it("does not let an allowlist exception bypass an explicit API restriction", async () => {
+      process.env.PAPERCLIP_HIDDEN_SETTINGS =
+        "instance.experimental.*,!instance.experimental.enableEnvironments,instance.experimental.enableEnvironments";
+      const app = await createApp(adminActor);
+      const res = await request(app)
+        .patch("/api/instance/settings/experimental")
+        .send({ enableEnvironments: true });
+      expect(res.status).toBe(403);
+      expect(res.body.details).toMatchObject({ code: "settings_operator_managed" });
+      expect(mockInstanceSettingsService.updateExperimental).not.toHaveBeenCalled();
+    });
+
     it("allows writes to non-hidden experimental toggles while others are hidden", async () => {
       process.env.PAPERCLIP_HIDDEN_SETTINGS =
         "instance.experimental.enableEnvironments,instance.experimental.enableServerInfoDebugView";
@@ -1133,10 +1217,19 @@ describe("instance settings routes", () => {
       const transactionCalls: string[] = [];
       let releasePostTransaction: (() => void) | undefined;
       let sawFirstCall = false;
+      // Resolves the instant the first (blocked) transaction call starts.
+      // The test then waits for this real event, not a fixed duration.
+      // Under CPU contention the event loop can take far longer than any
+      // fixed budget to reach this call, so a timer would flake here.
+      let notifyFirstTransactionStarted: (() => void) | undefined;
+      const firstTransactionStarted = new Promise<void>((resolve) => {
+        notifyFirstTransactionStarted = resolve;
+      });
       mockDb.transaction.mockImplementation((fn: (tx: unknown) => Promise<unknown>) => {
         if (!sawFirstCall) {
           sawFirstCall = true;
           transactionCalls.push("post-start");
+          notifyFirstTransactionStarted?.();
           return new Promise((resolve) => {
             releasePostTransaction = () => {
               transactionCalls.push("post-commit");
@@ -1148,19 +1241,44 @@ describe("instance settings routes", () => {
         return fn(TX_SENTINEL);
       });
 
+      // Each route handler awaits listCompanyIds as its last step before it
+      // enters the task-drain transition queue, so a second call proves the
+      // DELETE passed authorization and reached the queue — not merely that
+      // it has not arrived yet.
+      let listCompanyIdsCallCount = 0;
+      let notifySecondListCompanyIdsCall: (() => void) | undefined;
+      const secondListCompanyIdsCall = new Promise<void>((resolve) => {
+        notifySecondListCompanyIdsCall = resolve;
+      });
+      mockInstanceSettingsService.listCompanyIds.mockImplementation(async () => {
+        listCompanyIdsCallCount += 1;
+        if (listCompanyIdsCallCount === 2) notifySecondListCompanyIdsCall?.();
+        return ["company-1", "company-2"];
+      });
+
       const app = await createApp(adminActor);
 
-      // supertest only sends the request once something calls .then() on
-      // it, so kick both off eagerly instead of waiting for the final
-      // Promise.all below to do it — otherwise neither request would even
-      // reach the (still-pending) POST transaction during the wait.
+      // supertest only sends a request once something calls .then() on it,
+      // so force the POST to send now instead of waiting for the final
+      // Promise.all below to do it.
       const postPromise = request(app).post("/api/instance/task-drain").send({});
       postPromise.then(() => {}, () => {});
+      // Wait for the POST's transaction call to start before the test sends
+      // the DELETE. At that point the POST already called listCompanyIds,
+      // already entered the task-drain transition queue, and sits blocked
+      // inside the mocked db.transaction call — the POST holds the queue.
+      // Only a real event proves this; a fixed wait would not, because the
+      // event loop can take far longer than any fixed budget under CPU
+      // contention. Sending the DELETE only after this event fixes the
+      // request order by the queue, not by which socket the operating
+      // system happens to service first.
+      await firstTransactionStarted;
       const deletePromise = request(app).delete("/api/instance/task-drain");
       deletePromise.then(() => {}, () => {});
-      // Give both requests time to reach as far as they can go before the
-      // POST's transaction is released.
-      await new Promise((resolve) => setTimeout(resolve, 30));
+      // Wait for the DELETE's own listCompanyIds call. It proves the DELETE
+      // passed authorization and reached the transition queue behind the
+      // POST — not merely that it has not shown up yet.
+      await secondListCompanyIdsCall;
       expect(transactionCalls).toEqual(["post-start"]);
       expect(mockHeartbeatService.applyTaskDrain).not.toHaveBeenCalled();
       expect(mockHeartbeatService.stopTaskDrain).not.toHaveBeenCalled();
@@ -1212,6 +1330,159 @@ describe("instance settings routes", () => {
       expect(negativeRes.status).toBe(400);
 
       expect(mockHeartbeatService.applyTaskDrain).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("cloud lifecycle read-back and unarchive", () => {
+    const STACK_ID = "stack-lifecycle-routes";
+    const adminActor = {
+      type: "board",
+      userId: "paperclip-cloud",
+      source: "cloud_control",
+      isInstanceAdmin: true,
+      companyIds: [],
+    };
+    const memberActor = {
+      type: "board",
+      userId: "member-1",
+      source: "cloud_tenant",
+      isInstanceAdmin: false,
+      companyIds: ["company-1"],
+    };
+    // The pinned primary company id the routes derive from the stack id.
+    let primaryId: string;
+
+    beforeEach(async () => {
+      process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN = "test-server-token";
+      process.env.PAPERCLIP_CLOUD_STACK_ID = STACK_ID;
+      const { cloudTenantPrimaryCompanyId } = await vi.importActual<
+        typeof import("../services/cloud-instance.js")
+      >("../services/cloud-instance.js");
+      primaryId = cloudTenantPrimaryCompanyId(STACK_ID);
+      mockCompanyRows = [];
+    });
+    afterEach(() => {
+      delete process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN;
+      delete process.env.PAPERCLIP_CLOUD_STACK_ID;
+    });
+
+    it("reports the primary company status and how many other companies are not archived", async () => {
+      mockCompanyRows = [
+        { id: primaryId, status: "archived" },
+        { id: "company-sibling-live", status: "active" },
+        { id: "company-sibling-paused", status: "paused" },
+        { id: "company-sibling-archived", status: "archived" },
+      ];
+      const app = await createApp(adminActor);
+
+      const res = await request(app).get("/api/instance/lifecycle");
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({
+        primaryCompanyId: primaryId,
+        primaryCompanyStatus: "archived",
+        // paused counts: any non-archived sibling keeps the stack alive.
+        otherUnarchivedCompanyCount: 2,
+      });
+    });
+
+    it("reports a missing primary company without failing", async () => {
+      mockCompanyRows = [{ id: "company-other", status: "active" }];
+      const app = await createApp(adminActor);
+
+      const res = await request(app).get("/api/instance/lifecycle");
+
+      expect(res.status).toBe(200);
+      expect(res.body.primaryCompanyStatus).toBe("missing");
+    });
+
+    it("hides the cross-company lifecycle summary from non-admin board members", async () => {
+      mockCompanyRows = [{ id: primaryId, status: "archived" }];
+      const app = await createApp(memberActor);
+
+      const res = await request(app).get("/api/instance/lifecycle");
+
+      expect(res.status).toBe(403);
+    });
+
+    it("answers 404 when the instance is not cloud-managed", async () => {
+      delete process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN;
+      delete process.env.PAPERCLIP_CLOUD_STACK_ID;
+      const readRes = await request(await createApp(adminActor)).get("/api/instance/lifecycle");
+      expect(readRes.status).toBe(404);
+
+      // The admin gate runs first, so prove the 404 with an admin actor.
+      const unarchiveRes = await request(await createApp(adminActor))
+        .post("/api/instance/lifecycle/unarchive-primary")
+        .send({});
+      expect(unarchiveRes.status).toBe(404);
+      expect(mockCompanyService.update).not.toHaveBeenCalled();
+    });
+
+    it("unarchives an archived primary company as a system actor", async () => {
+      mockCompanyService.getById.mockResolvedValue({ id: "", status: "archived" });
+      mockCompanyService.update.mockImplementation(async (id: string) => ({ id, status: "active" }));
+      const app = await createApp(adminActor);
+
+      const res = await request(app)
+        .post("/api/instance/lifecycle/unarchive-primary")
+        .send({});
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ status: "active", changed: true });
+      expect(mockCompanyService.update).toHaveBeenCalledWith(
+        primaryId,
+        { status: "active" },
+        { actorType: "system", actorId: "paperclip-cloud", agentId: null, runId: null },
+      );
+    });
+
+    it("attributes a human admin's unarchive to that admin, not to Cloud", async () => {
+      mockCompanyService.getById.mockResolvedValue({ id: "", status: "archived" });
+      mockCompanyService.update.mockImplementation(async (id: string) => ({ id, status: "active" }));
+      const humanAdmin = {
+        type: "board",
+        userId: "human-admin",
+        source: "session",
+        isInstanceAdmin: true,
+        companyIds: ["company-1"],
+      };
+      const app = await createApp(humanAdmin);
+
+      const res = await request(app)
+        .post("/api/instance/lifecycle/unarchive-primary")
+        .send({});
+
+      expect(res.status).toBe(200);
+      expect(mockCompanyService.update).toHaveBeenCalledWith(
+        primaryId,
+        { status: "active" },
+        expect.objectContaining({ actorType: "user", actorId: "human-admin" }),
+      );
+    });
+
+    it("is idempotent: an unarchived primary company reports changed:false", async () => {
+      mockCompanyService.getById.mockResolvedValue({ id: "", status: "active" });
+      const app = await createApp(adminActor);
+
+      const res = await request(app)
+        .post("/api/instance/lifecycle/unarchive-primary")
+        .send({});
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ status: "active", changed: false });
+      expect(mockCompanyService.update).not.toHaveBeenCalled();
+    });
+
+    it("requires instance admin rights to unarchive", async () => {
+      const app = await createApp(memberActor);
+
+      const res = await request(app)
+        .post("/api/instance/lifecycle/unarchive-primary")
+        .send({});
+
+      expect(res.status).toBe(403);
+      expect(mockCompanyService.update).not.toHaveBeenCalled();
     });
   });
 });

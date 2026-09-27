@@ -1,3 +1,6 @@
+import { useWorkspaceIsolationControls } from "@/hooks/useWorkspaceIsolationControls";
+import { AgentAvatar } from "@/components/AgentAvatar";
+import { normalizeLegacyRunnerProvider } from "@paperclipai/adapter-utils";
 import { memo, useState, useEffect, useRef, useCallback, useMemo, type ChangeEvent, type CSSProperties, type DragEvent, type RefObject } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import type { AgentEnvConfig, EnvBinding, IssueWorkMode } from "@paperclipai/shared";
@@ -21,8 +24,10 @@ import {
   issueExecutionWorkspaceModeForExistingWorkspace,
 } from "../lib/project-workspace-defaults";
 import { useProjectOrder } from "../hooks/useProjectOrder";
+import { useStreamlinedUiEnabled } from "../hooks/useStreamlinedUiEnabled";
 import { getRecentAssigneeIds, sortAgentsByRecency, trackRecentAssignee } from "../lib/recent-assignees";
 import { getRecentProjectIds, trackRecentProject } from "../lib/recent-projects";
+import { recordRecentTask } from "../lib/recent-tasks";
 import { buildExecutionPolicy } from "../lib/issue-execution-policy";
 import { isIssueWorkMode, nextWorkMode, workModeMetaFor, workModeMetaList } from "../lib/work-mode-meta";
 import { useToastActions } from "../context/ToastContext";
@@ -74,11 +79,11 @@ import { extractProviderIdWithFallback } from "../lib/model-utils";
 import { issueStatusText, issueStatusTextDefault, priorityColor, priorityColorDefault } from "../lib/status-colors";
 import { SHOW_TASK_PRIORITY_UI } from "../lib/ui-flags";
 import { MarkdownEditor, type MarkdownEditorRef, type MentionOption } from "./MarkdownEditor";
-import { AgentIcon } from "./AgentIconPicker";
 import { InlineBanner } from "./InlineBanner";
 import { InlineEntitySelector, type InlineEntityOption } from "./InlineEntitySelector";
 import { getTrustPreset } from "../lib/trust-policy-ui";
 import { ReusableExecutionWorkspaceSelect } from "./ReusableExecutionWorkspaceSelect";
+import { codexReasoningEffortOptions } from "../lib/codex-reasoning-effort";
 
 const DRAFT_KEY = "paperclip:issue-draft";
 const DEBOUNCE_MS = 800;
@@ -96,9 +101,24 @@ type NewIssueDialogViewportStyle = CSSProperties & {
   "--new-issue-dialog-height"?: string;
 };
 
+type MobileEntityPickerViewportStyle = CSSProperties & {
+  "--mobile-entity-picker-visual-viewport-height"?: string;
+  "--mobile-entity-picker-visual-viewport-bottom"?: string;
+};
+
 function readVisualViewportLayout(): VisualViewportLayout | null {
   if (typeof window === "undefined" || !window.visualViewport) return null;
   const { height, offsetTop } = window.visualViewport;
+  // Mobile browsers can briefly report unusable geometry while the visual
+  // viewport initializes or animates. Applying it collapses the dialog.
+  if (
+    !Number.isFinite(height)
+    || height <= 0
+    || !Number.isFinite(offsetTop)
+    || offsetTop < 0
+  ) {
+    return null;
+  }
   return {
     height,
     offsetTop,
@@ -120,7 +140,11 @@ function useVisualViewportLayout(enabled: boolean) {
     const viewport = window.visualViewport;
     if (!viewport) return;
 
-    const updateLayout = () => setLayout(readVisualViewportLayout());
+    const updateLayout = () => {
+      const nextLayout = readVisualViewportLayout();
+      // Keep the last valid keyboard geometry during transient invalid readings.
+      if (nextLayout) setLayout(nextLayout);
+    };
     updateLayout();
     viewport.addEventListener("resize", updateLayout);
     viewport.addEventListener("scroll", updateLayout);
@@ -181,14 +205,6 @@ const ISSUE_THINKING_EFFORT_OPTIONS = {
     { value: "low", label: "Low" },
     { value: "medium", label: "Medium" },
     { value: "high", label: "High" },
-  ],
-  codex_local: [
-    { value: "", label: "Default" },
-    { value: "minimal", label: "Minimal" },
-    { value: "low", label: "Low" },
-    { value: "medium", label: "Medium" },
-    { value: "high", label: "High" },
-    { value: "xhigh", label: "X-High" },
   ],
   opencode_local: [
     { value: "", label: "Default" },
@@ -464,6 +480,7 @@ const IssueDescriptionEditor = memo(function IssueDescriptionEditor({
 });
 
 export function NewIssueDialog() {
+  const { visible: workspaceIsolationControlsVisible } = useWorkspaceIsolationControls();
   const { newIssueOpen, newIssueDefaults, closeNewIssue } = useDialog();
   const visualViewportLayout = useVisualViewportLayout(newIssueOpen);
   const dialogBodyRef = useRef<HTMLDivElement>(null);
@@ -472,6 +489,7 @@ export function NewIssueDialog() {
   const statuses = useMemo(() => buildStatusOptions(), []);
   const queryClient = useQueryClient();
   const { pushToast } = useToastActions();
+  const { enabled: streamlinedUiEnabled } = useStreamlinedUiEnabled();
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const titleRef = useRef("");
@@ -554,7 +572,7 @@ export function NewIssueDialog() {
         projectWorkspaceId: projectWorkspaceId || undefined,
         reuseEligible: true,
       }),
-    enabled: Boolean(effectiveCompanyId) && newIssueOpen && Boolean(projectId),
+    enabled: Boolean(effectiveCompanyId) && newIssueOpen && Boolean(projectId) && workspaceIsolationControlsVisible,
   });
   const { data: session } = useQuery({
     queryKey: queryKeys.auth.session,
@@ -591,6 +609,11 @@ export function NewIssueDialog() {
     [agents, selectedAssigneeAgentId],
   );
   const assigneeAdapterType = selectedAssigneeAgent?.adapterType ?? null;
+  const assigneePrimaryModel = isRecord(selectedAssigneeAgent?.adapterConfig)
+    && typeof selectedAssigneeAgent.adapterConfig.model === "string"
+    ? selectedAssigneeAgent.adapterConfig.model
+    : "";
+  const effectiveAssigneeModel = assigneeModelOverride || assigneePrimaryModel;
   const supportsAssigneeOverrides = Boolean(
     assigneeAdapterType && ISSUE_OVERRIDE_ADAPTER_TYPES.has(assigneeAdapterType),
   );
@@ -602,12 +625,13 @@ export function NewIssueDialog() {
     });
   }, [agents, companyMembers?.users, orderedProjects]);
 
+  const catalogProvider = assigneeAdapterType === "paperclip_runner" ? String(normalizeLegacyRunnerProvider(selectedAssigneeAgent?.adapterConfig ?? {}).provider ?? "codex") : undefined;
   const { data: assigneeAdapterModels } = useQuery({
     queryKey:
       effectiveCompanyId && assigneeAdapterType
-        ? queryKeys.agents.adapterModels(effectiveCompanyId, assigneeAdapterType)
+        ? queryKeys.agents.adapterModels(effectiveCompanyId, assigneeAdapterType, null, catalogProvider)
         : ["agents", "none", "adapter-models", assigneeAdapterType ?? "none"],
-    queryFn: () => agentsApi.adapterModels(effectiveCompanyId!, assigneeAdapterType!),
+    queryFn: () => agentsApi.adapterModels(effectiveCompanyId!, assigneeAdapterType!, { provider: catalogProvider }),
     enabled: Boolean(effectiveCompanyId) && newIssueOpen && supportsAssigneeOverrides,
   });
 
@@ -641,6 +665,7 @@ export function NewIssueDialog() {
       return { issue, companyId, failures };
     },
     onSuccess: ({ issue, companyId, failures }) => {
+      if (streamlinedUiEnabled) recordRecentTask(issue, currentUserId);
       queryClient.invalidateQueries({ queryKey: queryKeys.issues.list(companyId) });
       queryClient.invalidateQueries({ queryKey: queryKeys.issues.listMineByMe(companyId) });
       queryClient.invalidateQueries({ queryKey: queryKeys.issues.listTouchedByMe(companyId) });
@@ -934,7 +959,7 @@ export function NewIssueDialog() {
     }
     const validThinkingValues =
       assigneeAdapterType === "codex_local"
-        ? ISSUE_THINKING_EFFORT_OPTIONS.codex_local
+        ? codexReasoningEffortOptions(effectiveAssigneeModel)
         : assigneeAdapterType === "opencode_local"
           ? ISSUE_THINKING_EFFORT_OPTIONS.opencode_local
           : ISSUE_THINKING_EFFORT_OPTIONS.claude_local;
@@ -944,6 +969,7 @@ export function NewIssueDialog() {
   }, [
     supportsAssigneeOverrides,
     assigneeAdapterType,
+    effectiveAssigneeModel,
     assigneeThinkingEffort,
   ]);
 
@@ -1026,8 +1052,9 @@ export function NewIssueDialog() {
       chrome: assigneeChrome,
     });
     const selectedProject = orderedProjects.find((project) => project.id === projectId);
+    // Hidden selectors must not submit a restored draft over the managed default.
     const executionWorkspacePolicy =
-      experimentalSettings?.enableIsolatedWorkspaces === true
+      workspaceIsolationControlsVisible && experimentalSettings?.enableIsolatedWorkspaces === true
         ? selectedProject?.executionWorkspacePolicy ?? null
         : null;
     const selectedReusableExecutionWorkspace = selectableReusableWorkspaces.find(
@@ -1040,6 +1067,12 @@ export function NewIssueDialog() {
     const executionWorkspaceSettings = executionWorkspacePolicy?.enabled
       ? { mode: requestedExecutionWorkspaceMode }
       : null;
+    // A task launched from a workspace (or its parent task) keeps that explicit
+    // context. Draft-only choices are ignored while the selector is hidden.
+    const contextualWorkspaceId = !workspaceIsolationControlsVisible
+      && newIssueDefaults.projectId === projectId
+      ? newIssueDefaults.executionWorkspaceId
+      : undefined;
     const executionPolicy = buildExecutionPolicy({
       reviewerValues: reviewerValue ? [reviewerValue] : [],
       approverValues: approverValue ? [approverValue] : [],
@@ -1060,10 +1093,11 @@ export function NewIssueDialog() {
       ...(projectWorkspaceId ? { projectWorkspaceId } : {}),
       ...(assigneeAdapterOverrides ? { assigneeAdapterOverrides } : {}),
       ...(executionWorkspacePolicy?.enabled ? { executionWorkspacePreference: executionWorkspaceMode } : {}),
-      ...(executionWorkspaceMode === "reuse_existing" && selectedExecutionWorkspaceId
+      ...(workspaceIsolationControlsVisible && executionWorkspaceMode === "reuse_existing" && selectedExecutionWorkspaceId
         ? { executionWorkspaceId: selectedExecutionWorkspaceId }
         : {}),
       ...(executionWorkspaceSettings ? { executionWorkspaceSettings } : {}),
+      ...(contextualWorkspaceId ? { executionWorkspaceId: contextualWorkspaceId, executionWorkspacePreference: "reuse_existing" } : {}),
       ...(executionPolicy ? { executionPolicy } : {}),
       ...(watchdogAgentId
         ? { watchdog: { agentId: watchdogAgentId, instructions: watchdogInstructions.trim() || null } }
@@ -1190,7 +1224,7 @@ export function NewIssueDialog() {
         : "Agent options";
   const thinkingEffortOptions =
     assigneeAdapterType === "codex_local"
-      ? ISSUE_THINKING_EFFORT_OPTIONS.codex_local
+      ? codexReasoningEffortOptions(effectiveAssigneeModel)
       : assigneeAdapterType === "opencode_local"
         ? ISSUE_THINKING_EFFORT_OPTIONS.opencode_local
       : ISSUE_THINKING_EFFORT_OPTIONS.claude_local;
@@ -1312,6 +1346,13 @@ export function NewIssueDialog() {
         : {}),
     };
   }, [visualViewportLayout]);
+  const entityPickerViewportStyle = useMemo<MobileEntityPickerViewportStyle>(() => {
+    if (!visualViewportLayout) return {};
+    return {
+      "--mobile-entity-picker-visual-viewport-height": `${visualViewportLayout.height}px`,
+      "--mobile-entity-picker-visual-viewport-bottom": `${visualViewportLayout.offsetTop + visualViewportLayout.height}px`,
+    };
+  }, [visualViewportLayout]);
 
   useEffect(() => {
     if (!visualViewportLayout?.constrained) return;
@@ -1385,7 +1426,8 @@ export function NewIssueDialog() {
             <Popover open={companyOpen} onOpenChange={setCompanyOpen}>
               <PopoverTrigger asChild>
                 <button
-                  className="px-1.5 py-0.5 rounded bg-muted text-xs font-semibold cursor-pointer hover:opacity-80 transition-opacity"
+                  data-slot="new-issue-compact-control"
+                  className="rounded bg-muted p-1.5 text-xs font-semibold cursor-pointer hover:opacity-80 transition-opacity sm:px-1.5 sm:py-0.5"
                   disabled={isSubIssueMode}
                 >
                   {dialogCompany?.issuePrefix ?? ""}
@@ -1473,7 +1515,9 @@ export function NewIssueDialog() {
                 options={assigneeOptions}
                 recentOptionIds={recentAssigneeOptionIds}
                 placeholder="Assignee"
-                disablePortal
+                className="h-8 px-2.5 py-0 sm:h-auto sm:px-2 sm:py-1"
+                triggerDataSlot="new-issue-compact-control"
+                contentStyle={entityPickerViewportStyle}
                 noneLabel="No assignee"
                 searchPlaceholder="Search assignees..."
                 emptyMessage="No assignees found."
@@ -1499,7 +1543,7 @@ export function NewIssueDialog() {
                   option ? (
                     currentAssignee ? (
                       <>
-                        <AgentIcon icon={currentAssignee.icon} className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                        <AgentAvatar agent={currentAssignee} size={16} className="h-3.5 w-3.5 shrink-0 text-muted-foreground"/>
                         <span className="truncate">{option.label}</span>
                       </>
                     ) : (
@@ -1516,7 +1560,7 @@ export function NewIssueDialog() {
                     : null;
                   return (
                     <>
-                      {assignee ? <AgentIcon icon={assignee.icon} className="h-3.5 w-3.5 shrink-0 text-muted-foreground" /> : null}
+                      {assignee ? <AgentAvatar agent={assignee} size={16} className="h-3.5 w-3.5 shrink-0 text-muted-foreground"/> : null}
                       <span className="truncate">{option.label}</span>
                       {assignee && getTrustPreset(assignee.permissions) === "low_trust_review" ? (
                         <ShieldAlert className="ml-auto h-3.5 w-3.5 shrink-0 text-amber-600 dark:text-amber-300" aria-label="Low-trust review agent" />
@@ -1532,7 +1576,9 @@ export function NewIssueDialog() {
                 options={projectOptions}
                 recentOptionIds={recentProjectIds}
                 placeholder="Project"
-                disablePortal
+                className="h-8 px-2.5 py-0 sm:h-auto sm:px-2 sm:py-1"
+                triggerDataSlot="new-issue-compact-control"
+                contentStyle={entityPickerViewportStyle}
                 noneLabel="No project"
                 searchPlaceholder="Search projects..."
                 emptyMessage="No projects found."
@@ -1643,7 +1689,7 @@ export function NewIssueDialog() {
                 options={assigneeOptions}
                 recentOptionIds={recentAssigneeOptionIds}
                 placeholder="Reviewer"
-                disablePortal
+                contentStyle={entityPickerViewportStyle}
                 noneLabel="No reviewer"
                 searchPlaceholder="Search reviewers..."
                 emptyMessage="No reviewers found."
@@ -1655,7 +1701,7 @@ export function NewIssueDialog() {
                         const reviewer = parseAssigneeValue(option.id).assigneeAgentId
                           ? (agents ?? []).find((a) => a.id === parseAssigneeValue(option.id).assigneeAgentId)
                           : null;
-                        return reviewer ? <AgentIcon icon={reviewer.icon} className="h-3.5 w-3.5 shrink-0 text-muted-foreground" /> : null;
+                        return reviewer ? <AgentAvatar agent={reviewer} size={16} className="h-3.5 w-3.5 shrink-0 text-muted-foreground"/> : null;
                       })()}
                       <span className="truncate">{option.label}</span>
                     </>
@@ -1670,7 +1716,7 @@ export function NewIssueDialog() {
                     : null;
                   return (
                     <>
-                      {reviewer ? <AgentIcon icon={reviewer.icon} className="h-3.5 w-3.5 shrink-0 text-muted-foreground" /> : null}
+                      {reviewer ? <AgentAvatar agent={reviewer} size={16} className="h-3.5 w-3.5 shrink-0 text-muted-foreground"/> : null}
                       <span className="truncate">{option.label}</span>
                     </>
                   );
@@ -1688,7 +1734,7 @@ export function NewIssueDialog() {
                 options={assigneeOptions}
                 recentOptionIds={recentAssigneeOptionIds}
                 placeholder="Approver"
-                disablePortal
+                contentStyle={entityPickerViewportStyle}
                 noneLabel="No approver"
                 searchPlaceholder="Search approvers..."
                 emptyMessage="No approvers found."
@@ -1700,7 +1746,7 @@ export function NewIssueDialog() {
                         const approver = parseAssigneeValue(option.id).assigneeAgentId
                           ? (agents ?? []).find((a) => a.id === parseAssigneeValue(option.id).assigneeAgentId)
                           : null;
-                        return approver ? <AgentIcon icon={approver.icon} className="h-3.5 w-3.5 shrink-0 text-muted-foreground" /> : null;
+                        return approver ? <AgentAvatar agent={approver} size={16} className="h-3.5 w-3.5 shrink-0 text-muted-foreground"/> : null;
                       })()}
                       <span className="truncate">{option.label}</span>
                     </>
@@ -1715,7 +1761,7 @@ export function NewIssueDialog() {
                     : null;
                   return (
                     <>
-                      {approver ? <AgentIcon icon={approver.icon} className="h-3.5 w-3.5 shrink-0 text-muted-foreground" /> : null}
+                      {approver ? <AgentAvatar agent={approver} size={16} className="h-3.5 w-3.5 shrink-0 text-muted-foreground"/> : null}
                       <span className="truncate">{option.label}</span>
                     </>
                   );
@@ -1737,7 +1783,7 @@ export function NewIssueDialog() {
                     >
                       {selectedWatchdogAgent ? (
                         <>
-                          <AgentIcon icon={selectedWatchdogAgent.icon} className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                          <AgentAvatar agent={selectedWatchdogAgent} size={16} className="h-3.5 w-3.5 shrink-0 text-muted-foreground"/>
                           <span className="truncate text-foreground">{selectedWatchdogAgent.name}</span>
                           {watchdogInstructions.trim() ? (
                             <span className="truncate text-muted-foreground">· {watchdogInstructions.trim()}</span>
@@ -1763,7 +1809,7 @@ export function NewIssueDialog() {
                           option ? (
                             <>
                               {selectedWatchdogAgent ? (
-                                <AgentIcon icon={selectedWatchdogAgent.icon} className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                                <AgentAvatar agent={selectedWatchdogAgent} size={16} className="h-3.5 w-3.5 shrink-0 text-muted-foreground"/>
                               ) : null}
                               <span className="truncate">{option.label}</span>
                             </>
@@ -1775,7 +1821,7 @@ export function NewIssueDialog() {
                           const agent = (agents ?? []).find((a) => a.id === option.id);
                           return (
                             <>
-                              {agent ? <AgentIcon icon={agent.icon} className="h-3.5 w-3.5 shrink-0 text-muted-foreground" /> : null}
+                              {agent ? <AgentAvatar agent={agent} size={16} className="h-3.5 w-3.5 shrink-0 text-muted-foreground"/> : null}
                               <span className="truncate">{option.label}</span>
                             </>
                           );
@@ -1832,7 +1878,7 @@ export function NewIssueDialog() {
             </div>
           ) : null}
 
-          {currentProject && currentProjectSupportsExecutionWorkspace && (
+          {workspaceIsolationControlsVisible && currentProject && currentProjectSupportsExecutionWorkspace && (
             <div className="px-4 py-3 space-y-2">
             <div className="space-y-1.5">
               <div className="text-xs font-medium">Execution workspace</div>
@@ -1932,7 +1978,7 @@ export function NewIssueDialog() {
                       value={assigneeModelOverride}
                       options={modelOverrideOptions}
                       placeholder="Default model"
-                      disablePortal
+                      contentStyle={entityPickerViewportStyle}
                       noneLabel="Default model"
                       searchPlaceholder="Search models..."
                       emptyMessage="No models found."
@@ -2074,7 +2120,10 @@ export function NewIssueDialog() {
           {/* Status chip */}
           <Popover open={statusOpen} onOpenChange={setStatusOpen}>
             <PopoverTrigger asChild>
-              <button className="inline-flex items-center gap-1.5 rounded-md border border-border px-2 py-1 text-xs hover:bg-accent/50 transition-colors">
+              <button
+                data-slot="new-issue-compact-control"
+                className="inline-flex h-8 items-center gap-1.5 rounded-md border border-border px-2.5 py-0 text-xs hover:bg-accent/50 transition-colors sm:h-auto sm:px-2 sm:py-1"
+              >
                 <CircleDot className={cn("h-3 w-3", currentStatus.color)} />
                 {currentStatus.label}
               </button>
@@ -2156,7 +2205,8 @@ export function NewIssueDialog() {
             multiple
           />
           <button
-            className="inline-flex items-center gap-1.5 rounded-md border border-border px-2 py-1 text-xs hover:bg-accent/50 transition-colors text-muted-foreground"
+            data-slot="new-issue-compact-control"
+            className="inline-flex h-8 items-center gap-1.5 rounded-md border border-border px-2.5 py-0 text-xs hover:bg-accent/50 transition-colors text-muted-foreground sm:h-auto sm:px-2 sm:py-1"
             onClick={() => stageFileInputRef.current?.click()}
             disabled={createIssue.isPending}
           >
@@ -2170,9 +2220,10 @@ export function NewIssueDialog() {
               <button
                 type="button"
                 data-issue-work-mode-chip={workMode}
+                data-slot="new-issue-compact-control"
                 aria-keyshortcuts="Meta+Period Control+Period"
                 className={cn(
-                  "inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs transition-colors",
+                  "inline-flex h-8 items-center gap-1.5 rounded-md border px-2.5 py-0 text-xs transition-colors sm:h-auto sm:px-2 sm:py-1",
                   currentWorkMode.classes.chip,
                 )}
               >
@@ -2212,7 +2263,8 @@ export function NewIssueDialog() {
               <button
                 type="button"
                 data-testid="new-issue-more-menu-trigger"
-                className="inline-flex items-center justify-center rounded-md border border-border p-1 text-xs text-muted-foreground transition-colors hover:bg-accent/50"
+                data-slot="new-issue-compact-control"
+                className="inline-flex size-8 items-center justify-center rounded-md border border-border p-0 text-xs text-muted-foreground transition-colors hover:bg-accent/50 sm:size-auto sm:p-1"
               >
                 <MoreHorizontal className="h-3 w-3" />
               </button>

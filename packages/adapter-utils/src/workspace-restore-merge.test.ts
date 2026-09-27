@@ -9,9 +9,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { resolvePaperclipInstanceRootForAdapter } from "./server-utils.js";
 import {
   captureDirectorySnapshot,
+  directorySnapshotSha256,
   classifyWorkspaceRestoreFailure,
   describeWorkspaceRestoreFailure,
   mergeDirectoryWithBaseline,
+  parseDirectorySnapshot,
+  serializeDirectorySnapshot,
   withDirectoryMergeLock,
   WORKSPACE_RESTORE_LOCK_TIMEOUT_CODE,
 } from "./workspace-restore-merge.js";
@@ -25,6 +28,36 @@ describe("workspace restore merge", () => {
       if (!dir) continue;
       await rm(dir, { recursive: true, force: true }).catch(() => undefined);
     }
+  });
+
+  it("round-trips a deterministic durable snapshot and rejects traversal", async () => {
+    const rootDir = await mkdtemp(
+      path.join(os.tmpdir(), "paperclip-snapshot-"),
+    );
+    cleanupDirs.push(rootDir);
+    await mkdir(path.join(rootDir, "nested"), { recursive: true });
+    await writeFile(path.join(rootDir, "b.txt"), "bravo\n", "utf8");
+    await writeFile(path.join(rootDir, "nested", "a.txt"), "alpha\n", "utf8");
+
+    const snapshot = await captureDirectorySnapshot(rootDir, { exclude: [] });
+    const serialized = serializeDirectorySnapshot(snapshot);
+    const restored = parseDirectorySnapshot(serialized);
+
+    expect(serialized.entries.map(([relativePath]) => relativePath)).toEqual([
+      "b.txt",
+      "nested",
+      "nested/a.txt",
+    ]);
+    expect(restored).not.toBeNull();
+    expect(directorySnapshotSha256(restored!)).toBe(
+      directorySnapshotSha256(snapshot),
+    );
+    expect(
+      parseDirectorySnapshot({
+        ...serialized,
+        entries: [["../escape", serialized.entries[0]![1]]],
+      }),
+    ).toBeNull();
   });
 
   it("preserves sibling files when sequential stale-baseline restores create the same nested directory tree", async () => {
@@ -93,6 +126,24 @@ describe("workspace restore merge", () => {
   });
 
   describe("classifyWorkspaceRestoreFailure", () => {
+    it.each([
+      "Daytona syncOut refusing tarball with an unparseable entry listing: private listing",
+      "Daytona syncOut refusing unparseable or ambiguous symlink entry: private listing",
+      "Daytona syncOut refusing unparseable or ambiguous hardlink entry: private listing",
+      "Daytona syncOut refusing tarball member that escapes the extraction dir: ../private",
+      "Daytona syncOut refusing tarball link whose target escapes the extraction dir: link -> /private",
+      "Daytona sync source path is not a confined absolute path: ../private",
+      "Daytona sync source path escapes the workspace remote dir: /private",
+      ...[40, 41, 42, 44, 45].map((code) => `Daytona outbound symlink-escape guard command failed (exit ${code}): private detail`),
+    ])("holds the deterministic confinement refusal: %s", (message) => {
+      expect(classifyWorkspaceRestoreFailure(new Error(message))).toBe("restore_unsafe_archive");
+      expect(describeWorkspaceRestoreFailure(classifyWorkspaceRestoreFailure(new Error(message)))).not.toContain("private");
+    });
+
+    it("preserves the generic policy for other outbound command failures", () => {
+      expect(classifyWorkspaceRestoreFailure(new Error("Daytona outbound symlink-escape guard command failed (exit 1): transport failed"))).toBe("restore_failed");
+    });
+
     it("maps an EACCES error to restore_permission_denied", () => {
       const error: NodeJS.ErrnoException = new Error("permission denied");
       error.code = "EACCES";

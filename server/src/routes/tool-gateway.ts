@@ -204,6 +204,16 @@ async function handleMcpGatewayProtocol(
   } catch (err) {
     if (err instanceof ToolGatewayHttpError) {
       const id = (req.body as { id?: unknown } | undefined)?.id ?? null;
+      // Provider tool failures are MCP tool results, not successful calls or
+      // protocol errors. The service has already recorded the failed invocation.
+      if (req.body?.method === "tools/call" && err.reasonCode === "tool_error") {
+        res.json({
+          jsonrpc: "2.0",
+          id,
+          result: { content: [{ type: "text", text: err.message }], isError: true },
+        });
+        return;
+      }
       res.status(err.status).json({
         jsonrpc: "2.0",
         id,
@@ -585,7 +595,8 @@ export function toolGatewayRoutes(db: Db, toolGateway: ToolGatewayService) {
   router.post("/tool-gateway/action-requests/:id/approve", async (req, res) => {
     try {
       assertBoard(req);
-      const body = (req.body ?? {}) as { companyId?: string };
+      const body = (req.body ?? {}) as { companyId?: string; rememberAction?: boolean };
+      if (body.rememberAction !== undefined && typeof body.rememberAction !== "boolean") { res.status(400).json({ error: "rememberAction must be a boolean" }); return; }
       const companyId = body.companyId ?? (typeof req.query.companyId === "string" ? req.query.companyId : null);
       if (!companyId) {
         res.status(400).json({ error: "companyId is required" });
@@ -596,6 +607,7 @@ export function toolGatewayRoutes(db: Db, toolGateway: ToolGatewayService) {
       const actionRequest = await toolGateway.approveActionRequest({
         companyId,
         actionRequestId: req.params.id,
+        rememberAction: body.rememberAction,
         actor: {
           agentId: actor.agentId,
           userId: req.actor.type === "board" ? req.actor.userId : null,
@@ -610,17 +622,19 @@ export function toolGatewayRoutes(db: Db, toolGateway: ToolGatewayService) {
   router.post("/tool-gateway/action-requests/:id/decline", async (req, res) => {
     try {
       assertBoard(req);
-      const body = (req.body ?? {}) as { companyId?: string };
+      const body = (req.body ?? {}) as { companyId?: string; reason?: string };
       const companyId = body.companyId ?? (typeof req.query.companyId === "string" ? req.query.companyId : null);
       if (!companyId) {
         res.status(400).json({ error: "companyId is required" });
         return;
       }
+      if (body.reason !== undefined && (typeof body.reason !== "string" || body.reason.length > 4000)) { res.status(400).json({ error: "reason must be a string up to 4000 characters" }); return; }
       assertBoardMutationAccess(req, companyId);
       const actor = getActorInfo(req);
       const actionRequest = await toolGateway.declineActionRequest({
         companyId,
         actionRequestId: req.params.id,
+        reason: body.reason,
         actor: {
           agentId: actor.agentId,
           userId: req.actor.type === "board" ? req.actor.userId : null,

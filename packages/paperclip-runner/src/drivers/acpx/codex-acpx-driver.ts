@@ -134,6 +134,8 @@ export interface CodexAcpxDriverOptions {
   managedCodexCredentialSourcePath?: string;
   dynamicTools?: readonly Readonly<Record<string, unknown>>[];
   dynamicToolHandler?: (call: CodexAcpxDynamicToolCall) => Promise<unknown>;
+  /** Server-owned task completion validation, shared with Codex tool calls. */
+  completionFeedback?: (result: PrpStructuredRunResult) => Promise<string>;
   now?: () => Date;
 }
 
@@ -271,9 +273,7 @@ export class CodexAcpxDriver implements HarnessDriver {
         ? { dynamicTools: structuredClone(options.dynamicTools) }
         : {}),
     };
-    this.#openHost =
-      dependencies.openHost ??
-      openProductionAcpxHost;
+    this.#openHost = dependencies.openHost ?? openProductionAcpxHost;
     this.#closeSettlementTimeoutMs =
       dependencies.closeSettlementTimeoutMs ?? CLOSE_TURN_SETTLEMENT_TIMEOUT_MS;
     this.#terminalEventReserve = Math.max(
@@ -341,9 +341,8 @@ export class CodexAcpxDriver implements HarnessDriver {
     },
   ): Promise<HarnessSessionRecoveryResult> {
     try {
-      await runAbortableDriverAdmission(
-        options.signal,
-        () => this.#retryQuarantinedHostCleanups(),
+      await runAbortableDriverAdmission(options.signal, () =>
+        this.#retryQuarantinedHostCleanups(),
       );
       validateRecoverySnapshot(snapshot);
       const terminalTurnIds = new Set(
@@ -383,10 +382,12 @@ export class CodexAcpxDriver implements HarnessDriver {
       } catch (error) {
         await workspaceLease.close().catch(() => undefined);
         if (recoveredSession) {
-          await recoveredSession.close({
-            reason: "ACPX recovery workspace lease cleanup failed",
-            force: true,
-          }).catch(() => undefined);
+          await recoveredSession
+            .close({
+              reason: "ACPX recovery workspace lease cleanup failed",
+              force: true,
+            })
+            .catch(() => undefined);
         }
         throw error;
       }
@@ -434,7 +435,7 @@ export class CodexAcpxDriver implements HarnessDriver {
         workingDirectory: input.workingDirectory,
         agent: this.#options.agent ?? "codex",
         model: this.#options.model,
-        permissionMode: this.#options.permissionMode ?? "approve-reads",
+        permissionMode: this.#options.permissionMode ?? "approve-all",
         systemInstructions: this.#options.systemInstructions,
         environment: this.#options.environment,
         managedCodexCredentialSourcePath:
@@ -463,6 +464,7 @@ export class CodexAcpxDriver implements HarnessDriver {
         agent: this.#options.agent ?? "codex",
         input,
         dynamicToolHandler: this.#options.dynamicToolHandler,
+        completionFeedback: this.#options.completionFeedback,
         now: this.#options.now ?? (() => new Date()),
         closeSettlementTimeoutMs: this.#closeSettlementTimeoutMs,
         maxBufferedEvents: this.#maxBufferedEvents,
@@ -706,6 +708,7 @@ class CodexAcpxSession implements HarnessSession {
   readonly #agent: QualifiedAcpxAgent;
   readonly #input: OpenHarnessSessionInput;
   readonly #dynamicToolHandler?: CodexAcpxDriverOptions["dynamicToolHandler"];
+  readonly #completionFeedback?: CodexAcpxDriverOptions["completionFeedback"];
   readonly #now: () => Date;
   readonly #closeSettlementTimeoutMs: number;
   readonly #maxBufferedEvents: number;
@@ -762,6 +765,7 @@ class CodexAcpxSession implements HarnessSession {
     agent: QualifiedAcpxAgent;
     input: OpenHarnessSessionInput;
     dynamicToolHandler?: CodexAcpxDriverOptions["dynamicToolHandler"];
+    completionFeedback?: CodexAcpxDriverOptions["completionFeedback"];
     now: () => Date;
     closeSettlementTimeoutMs: number;
     maxBufferedEvents: number;
@@ -778,6 +782,7 @@ class CodexAcpxSession implements HarnessSession {
     this.#agent = input.agent;
     this.#input = structuredClone(input.input);
     this.#dynamicToolHandler = input.dynamicToolHandler;
+    this.#completionFeedback = input.completionFeedback;
     this.#now = input.now;
     this.#closeSettlementTimeoutMs = input.closeSettlementTimeoutMs;
     this.#maxBufferedEvents = input.maxBufferedEvents;
@@ -997,9 +1002,11 @@ class CodexAcpxSession implements HarnessSession {
     pending.cleanup();
     pending.settle({ action: "cancel" });
     const cleanup = Promise.resolve()
-      .then(() => this.#host.interruptActiveTurn(
-        "Paperclip parked the ACPX input on a durable wait.",
-      ))
+      .then(() =>
+        this.#host.interruptActiveTurn(
+          "Paperclip parked the ACPX input on a durable wait.",
+        ),
+      )
       .catch((error: unknown) => {
         if (
           this.#activeTurnId === input.turnId &&
@@ -1050,14 +1057,42 @@ class CodexAcpxSession implements HarnessSession {
         claimsLaterTurn &&
         this.#pendingSemanticTransfer?.fingerprint === fingerprint &&
         this.#pendingSemanticTransfer.turnId === turnId;
+      let feedback = "Completion report accepted. Task status is committed after this turn and workspace finalization finish.";
+      if (this.#semanticFingerprint === null || (claimsLaterTurn && !repeatsPendingTransfer)) {
+        try {
+          feedback = await this.#completionFeedback?.(validation.result) ?? feedback;
+        } catch (error) {
+          this.#emit(
+            "run.result.rejected",
+            {
+              result: validation.result,
+              reason: error instanceof Error ? error.message : String(error),
+              recovery: { required: true, recoverable: true },
+            },
+            { turnId, itemId: call.callId },
+          );
+          return {
+            accepted: false,
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+        if (this.#activeTurnId !== turnId) {
+          return {
+            accepted: false,
+            error: "The turn ended while checking completion. The result was not accepted.",
+          };
+        }
+      }
       if (
         this.#semanticFingerprint === null ||
         (claimsLaterTurn && !repeatsPendingTransfer)
       ) {
-        if (!this.#emit("run.result.proposed", validation.result, {
-          turnId,
-          itemId: call.callId,
-        })) {
+        if (
+          !this.#emit("run.result.proposed", validation.result, {
+            turnId,
+            itemId: call.callId,
+          })
+        ) {
           throw new HarnessCapabilityUnavailableError(
             "run.result.proposed",
             "the event consumer must drain provider events before a semantic result can be accepted",
@@ -1080,7 +1115,7 @@ class CodexAcpxSession implements HarnessSession {
           this.#semanticTurnId = turnId;
         }
       }
-      return { accepted: true };
+      return { accepted: true, feedback };
     }
     if (!this.#dynamicToolHandler) {
       throw new Error(`Unsupported Paperclip operation ${tool}`);
@@ -1151,6 +1186,8 @@ class CodexAcpxSession implements HarnessSession {
         requestedModel: identity.requestedModel,
         effectiveModel: identity.effectiveModel,
         permissionMode: identity.permissionMode,
+        providerLifetimeFenceCandidates:
+          identity.providerLifetimeFenceCandidates,
       },
       semanticResult:
         this.#semanticResult &&
@@ -1336,7 +1373,7 @@ class CodexAcpxSession implements HarnessSession {
           this.#emit(
             "item.completed",
             { kind: "agentMessage", channel: "final", text: finalText },
-            { turnId, itemId: `${turnId}:final-answer` },
+            { turnId, itemId: `${turnId}:assistant-message` },
           );
         }
         this.#publishTerminal(
@@ -1501,7 +1538,9 @@ class CodexAcpxSession implements HarnessSession {
     const fallbackItemId = `${turnId}:acp:${index}`;
     if (event.type === "text_delta") {
       const output = boundedText(event.text, 64 * 1024);
-      if (event.stream !== "thought" && event.tag !== "agent_thought_chunk") {
+      const isReasoning =
+        event.stream === "thought" || event.tag === "agent_thought_chunk";
+      if (!isReasoning) {
         this.#assistantText = boundedText(
           `${this.#assistantText}${output}`,
           256 * 1024,
@@ -1510,13 +1549,16 @@ class CodexAcpxSession implements HarnessSession {
       this.#emit(
         "item.delta",
         {
-          kind:
-            event.stream === "thought" || event.tag === "agent_thought_chunk"
-              ? "thinking"
-              : "agent_message",
+          kind: isReasoning ? "reasoning" : "agentMessage",
+          channel: isReasoning ? "summary" : "unknown",
           text: output,
         },
-        { turnId, itemId: fallbackItemId },
+        {
+          turnId,
+          itemId: isReasoning
+            ? `${turnId}:reasoning`
+            : `${turnId}:assistant-message`,
+        },
       );
     }
     if (event.type === "status" && event.tag === "usage_update") {
@@ -1861,9 +1903,12 @@ function validateRecoverySnapshot(snapshot: PersistedHarnessSession): void {
     !/^sha256:[a-f0-9]{64}$/.test(identity.profileDigest) ||
     !/^sha256:[a-f0-9]{64}$/.test(identity.workspaceDigest) ||
     (identity.permissionMode !== undefined &&
-      !["approve-all", "approve-reads", "deny-all"].includes(
+      !["approve-all", "approve-paperclip", "approve-reads", "deny-all"].includes(
         identity.permissionMode,
-      ))
+      )) ||
+    !validProviderLifetimeFenceCandidates(
+      identity.providerLifetimeFenceCandidates,
+    )
   ) {
     throw new Error("persisted Codex ACPX session identity is inconsistent");
   }
@@ -1958,10 +2003,7 @@ function validateRecoverySnapshot(snapshot: PersistedHarnessSession): void {
         "persisted Codex ACPX semantic result is not the latest terminal settlement",
       );
     }
-    if (
-      snapshot.activeTurnId !== undefined &&
-      snapshot.activeTurnId !== null
-    ) {
+    if (snapshot.activeTurnId !== undefined && snapshot.activeTurnId !== null) {
       const activeTerminal = terminalTurns.find(
         (terminal) => terminal.turnId === snapshot.activeTurnId,
       );
@@ -1985,9 +2027,9 @@ function validateRecoverySnapshot(snapshot: PersistedHarnessSession): void {
       (terminal) => terminal.turnId === settlementTurnId,
     );
     if (
-      settlementTurnId !== latestTerminalTurnId
-      || !settlement
-      || !isCompletedTerminal(settlement.fingerprint)
+      settlementTurnId !== latestTerminalTurnId ||
+      !settlement ||
+      !isCompletedTerminal(settlement.fingerprint)
     ) {
       throw new Error(
         "persisted Codex ACPX resultless recovery requires a completed terminal turn",
@@ -1996,13 +2038,28 @@ function validateRecoverySnapshot(snapshot: PersistedHarnessSession): void {
   }
 }
 
+function validProviderLifetimeFenceCandidates(
+  value: unknown,
+): value is readonly [number, number, number] {
+  return (
+    Array.isArray(value) &&
+    value.length === 3 &&
+    value.every(
+      (port) => Number.isSafeInteger(port) && port >= 49_152 && port <= 65_535,
+    ) &&
+    new Set(value).size === 3
+  );
+}
+
 function isCompletedTerminal(terminalFingerprint: string): boolean {
   try {
     const value: unknown = JSON.parse(terminalFingerprint);
-    return typeof value === "object"
-      && value !== null
-      && !Array.isArray(value)
-      && (value as Record<string, unknown>).status === "completed";
+    return (
+      typeof value === "object" &&
+      value !== null &&
+      !Array.isArray(value) &&
+      (value as Record<string, unknown>).status === "completed"
+    );
   } catch {
     return false;
   }

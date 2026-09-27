@@ -128,14 +128,35 @@ const STEP_TIMEOUT_MS = 15_000;
  * from the wait above. The wizard re-renders as those queries land, and a node
  * captured a moment earlier can be detached by the time it is clicked — a click
  * that raises no error and does nothing.
+ *
+ * Wait for the destination's accessible heading, since button labels repeat
+ * across steps and the heading's animated text lives inside a nested span.
+ * A direct text query restricted to h1/h2 misses that span and stops the story
+ * before it can pick a source or reach Review.
  */
-async function advance(from: string, to: string) {
+async function advance(to: string) {
   await waitFor(
-    () => expect(screen.getByRole("button", { name: from })).toBeEnabled(),
+    () => expect(screen.getByRole("button", { name: PRIMARY })).toBeEnabled(),
     { timeout: STEP_TIMEOUT_MS },
   );
-  await userEvent.click(screen.getByRole("button", { name: from }));
-  await screen.findByRole("button", { name: to }, { timeout: STEP_TIMEOUT_MS });
+  await userEvent.click(screen.getByRole("button", { name: PRIMARY }));
+  await screen.findByRole("heading", { name: to }, { timeout: STEP_TIMEOUT_MS });
+}
+
+/** Naming advances with Next; the selected model source advances with Connect. */
+const PRIMARY = /^(Next|Connect)$/;
+
+/**
+ * Pick a model source, which the connect step needs before it will go forward.
+ *
+ * Nothing is selected on arrival — deliberately, so the row reads as a question
+ * rather than a confirmation — and the CTA stays disabled until one is pressed.
+ * Found by role rather than by label so the choice does not depend on which
+ * adapters the fixture registry happens to offer.
+ */
+async function pickFirstSource() {
+  const tiles = await screen.findAllByRole("radio", {}, { timeout: STEP_TIMEOUT_MS });
+  await userEvent.click(tiles[0]!);
 }
 
 /**
@@ -178,6 +199,26 @@ export const CreateYourAgent: StoryObj = {
 };
 
 /**
+ * The arrival a cloud-managed workspace makes: its organization was named in
+ * Cloud, so the wizard opens on a fresh page straight at the agent step and
+ * plays the hand-off's second half (hero room opening, content making room
+ * then filling) rather than mounting cold. Mounted on a press so the arrival
+ * can be watched — and measured — from its first frame.
+ */
+function ArrivalStage() {
+  const [mounted, setMounted] = useState(false);
+  if (mounted) return <WizardArc />;
+  return (
+    <button type="button" className="rounded-full border px-4 py-2 text-sm" onClick={() => setMounted(true)}>
+      Arrive at the agent step
+    </button>
+  );
+}
+export const ArriveFromCloud: StoryObj = {
+  render: () => <ArrivalStage />,
+};
+
+/**
  * The connect step as a signed-out cloud tenant meets it: a managed sandbox
  * resolves, and the provider sign-in panel is offered because the auth signal
  * comes back absent.
@@ -191,7 +232,14 @@ export const ConnectAModel: StoryObj = {
     return resetOnboardingFixtureState;
   },
   render: () => <WizardArc />,
-  play: () => advance("Next", "Connect"),
+  play: async () => {
+    const name = await screen.findByRole("textbox", { name: "Agent name" }, { timeout: STEP_TIMEOUT_MS });
+    await userEvent.clear(name);
+    await userEvent.type(name, " {Enter}");
+    await expect(screen.getByRole("button", { name: PRIMARY })).toBeDisabled();
+    await userEvent.type(name, "Chief of staff{Enter}");
+    await screen.findByRole("heading", { name: "Connect a model" }, { timeout: STEP_TIMEOUT_MS });
+  },
 };
 
 /**
@@ -208,7 +256,7 @@ export const ConnectAModelAlreadySignedIn: StoryObj = {
     return resetOnboardingFixtureState;
   },
   render: () => <WizardArc />,
-  play: () => advance("Next", "Connect"),
+  play: () => advance("Connect a model"),
 };
 
 /**
@@ -224,7 +272,7 @@ export const ConnectAModelNoSandbox: StoryObj = {
     return resetOnboardingFixtureState;
   },
   render: () => <WizardArc />,
-  play: () => advance("Next", "Connect"),
+  play: () => advance("Connect a model"),
 };
 
 /**
@@ -245,8 +293,9 @@ export const Review: StoryObj = {
   },
   render: () => <WizardArc />,
   play: async () => {
-    await advance("Next", "Connect");
-    await advance("Connect", "Get started");
+    await advance("Connect a model");
+    await pickFirstSource();
+    await advance("Let's get started...");
   },
 };
 
@@ -312,3 +361,159 @@ export const PillMorph: StoryObj = {
     );
   },
 };
+
+// These mount the shipped onboarding flow, not ConnectModelPreview. Selecting
+// a source opens its actual login panel against the Storybook API fixtures.
+function signedOutConnectionFixture() {
+  clearOnboardingDraft();
+  setOnboardingFixtureState({ environments: "managed-sandbox", authSignal: "absent" });
+  return () => { clearOnboardingDraft(); resetOnboardingFixtureState(); };
+}
+
+async function openProviderConnection(provider: "Claude" | "OpenAI", mode: "subscription" | "api") {
+  await advance("Connect a model");
+  await userEvent.click(await screen.findByRole("button", { name: "Use API key instead" }, { timeout: STEP_TIMEOUT_MS }));
+  if (mode === "subscription") {
+    await userEvent.click(await screen.findByRole("button", { name: "Use subscription instead" }, { timeout: STEP_TIMEOUT_MS }));
+  }
+  await userEvent.click(await screen.findByRole("radio", { name: new RegExp(`^${provider} `) }, { timeout: STEP_TIMEOUT_MS }));
+  if (mode === "api") {
+    await screen.findByLabelText("API key", {}, { timeout: STEP_TIMEOUT_MS });
+  } else if (provider === "Claude") {
+    await screen.findByLabelText("Authorization code", {}, { timeout: STEP_TIMEOUT_MS });
+  } else {
+    await screen.findByText("STORY-BOOK", {}, { timeout: STEP_TIMEOUT_MS });
+  }
+}
+
+export const ClaudeSubscription: StoryObj = {
+  name: "Connect · Claude subscription",
+  beforeEach: signedOutConnectionFixture,
+  render: () => <WizardArc />,
+  play: () => openProviderConnection("Claude", "subscription"),
+};
+export const CodexSubscription: StoryObj = {
+  name: "Connect · Codex / OpenAI subscription",
+  beforeEach: signedOutConnectionFixture,
+  render: () => <WizardArc />,
+  play: () => openProviderConnection("OpenAI", "subscription"),
+};
+export const ClaudeApiKey: StoryObj = {
+  name: "Connect · Claude API key",
+  beforeEach: signedOutConnectionFixture,
+  render: () => <WizardArc />,
+  play: () => openProviderConnection("Claude", "api"),
+};
+export const CodexApiKey: StoryObj = {
+  name: "Connect · Codex / OpenAI API key",
+  beforeEach: signedOutConnectionFixture,
+  render: () => <WizardArc />,
+  play: () => openProviderConnection("OpenAI", "api"),
+};
+
+/** Production onboarding, with the current user's previously saved provider key. */
+export const ConnectWithSavedApiKey: StoryObj = {
+  beforeEach: () => {
+    setOnboardingFixtureState({ savedApiKeys: true, authSignal: "absent" });
+    return resetOnboardingFixtureState;
+  },
+  render: () => <WizardArc />,
+  play: async () => {
+    await advance("Connect a model");
+    await pickFirstSource();
+    await screen.findByRole("combobox", { name: "Saved API key" }, { timeout: STEP_TIMEOUT_MS });
+    await expect(screen.getByRole("combobox", { name: "Saved API key" })).toHaveValue("user:ANTHROPIC_API_KEY");
+  },
+};
+
+export const ConnectWithSavedChatGptSubscription: StoryObj = {
+  beforeEach: () => {
+    setOnboardingFixtureState({ savedCodexLogin: true, authSignal: "unknown" });
+    return resetOnboardingFixtureState;
+  },
+  render: () => <WizardArc />,
+  play: async () => {
+    await advance("Connect a model");
+    await userEvent.click(screen.getByRole("radio", {name: /OpenAI/}));
+    await screen.findByRole("heading", { name: "Let's get started..." }, { timeout: STEP_TIMEOUT_MS });
+    await expect(screen.queryByRole("combobox", { name: "Saved subscription" })).not.toBeInTheDocument();
+  },
+};
+
+export const ConnectWithSavedClaudeSubscription: StoryObj = {
+  beforeEach: () => {
+    setOnboardingFixtureState({ savedClaudeLogin: true, savedApiKeys: true, authSignal: "absent" });
+    return resetOnboardingFixtureState;
+  },
+  render: () => <WizardArc />,
+  play: async () => {
+    await advance("Connect a model");
+    await pickFirstSource();
+    await screen.findByRole("heading", { name: "Let's get started..." }, { timeout: STEP_TIMEOUT_MS });
+    await expect(screen.queryByRole("combobox", { name: "Saved API key" })).not.toBeInTheDocument();
+  },
+};
+
+/** Local terminal sign-in with the production wizard and controllable API responses. */
+function localSubscriptionStory(
+  provider: "Claude" | "OpenAI",
+  state: "sign-in" | "detected" | "testing" | "retry" | "success",
+): StoryObj {
+  return {
+    name: `Local ${provider} · ${state}`,
+    beforeEach: () => {
+      setOnboardingFixtureState({
+        environments: "local",
+        localLoginStatus: state === "detected" ? "ready" : "sign_in_required",
+        connectPending: state === "detected",
+        testPending: state === "testing",
+        testFailuresRemaining: state === "retry" ? 1 : 0,
+        testDelayMs: state === "success" || state === "retry" ? 800 : 0,
+      });
+      return resetOnboardingFixtureState;
+    },
+    render: () => <WizardArc />,
+    play: async () => {
+      await advance("Connect a model");
+      await userEvent.click(screen.getByRole("radio", { name: new RegExp(provider) }));
+      if (state === "detected") {
+        await screen.findByRole("button", { name: "Connecting…" }, { timeout: STEP_TIMEOUT_MS });
+        await expect(screen.getByRole("button", { name: "Connecting…" })).toBeDisabled();
+      } else {
+        await screen.findByText(/Run this in a terminal/, {}, { timeout: STEP_TIMEOUT_MS });
+        if (state === "sign-in") {
+          await expect(screen.getByRole("button", { name: "Connect" })).toBeEnabled();
+          return;
+        }
+        // Simulate the terminal finishing; the user's return triggers the real
+        // login hook, which must advance without a second Connect click.
+        setOnboardingFixtureState({ localLoginStatus: "ready" });
+        window.dispatchEvent(new Event("focus"));
+        if (state === "testing") {
+          await screen.findByRole("button", { name: "Testing…" }, { timeout: STEP_TIMEOUT_MS });
+          await expect(screen.getByRole("button", { name: "Testing…" })).toBeDisabled();
+          await expect(screen.getByRole("status")).toHaveTextContent("Testing connection…");
+        } else if (state === "retry") {
+          await screen.findByText("The provider did not respond. Try connecting again.", {}, { timeout: STEP_TIMEOUT_MS });
+          await expect(screen.getByRole("button", { name: "Connect" })).toBeEnabled();
+        } else {
+          await screen.findByRole("heading", { name: "Let's get started..." }, { timeout: STEP_TIMEOUT_MS });
+        }
+      }
+      await expect(screen.queryByRole("combobox", { name: "Saved subscription" })).not.toBeInTheDocument();
+      await expect(screen.queryByText(/Run this in a terminal/)).not.toBeInTheDocument();
+      await expect(screen.queryByRole("button", { name: "Start sign-in again" })).not.toBeInTheDocument();
+    },
+  };
+}
+
+export const LocalClaudeSignInRequired = localSubscriptionStory("Claude", "sign-in");
+export const LocalCodexSignInRequired = localSubscriptionStory("OpenAI", "sign-in");
+export const LocalClaudeDetected = localSubscriptionStory("Claude", "detected");
+export const LocalCodexDetected = localSubscriptionStory("OpenAI", "detected");
+export const LocalClaudeTesting = localSubscriptionStory("Claude", "testing");
+export const LocalCodexTesting = localSubscriptionStory("OpenAI", "testing");
+export const LocalClaudeRetry = localSubscriptionStory("Claude", "retry");
+export const LocalCodexRetry = localSubscriptionStory("OpenAI", "retry");
+export const LocalClaudeSuccess = localSubscriptionStory("Claude", "success");
+export const LocalCodexSuccess = localSubscriptionStory("OpenAI", "success");

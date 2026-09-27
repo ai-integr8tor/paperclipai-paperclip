@@ -30,6 +30,7 @@ export type InstanceExecutionMode = "kubernetes" | "any";
 
 export interface InstanceGeneralSettings {
   censorUsernameInLogs: boolean;
+  /** @deprecated Legacy instance value. Use /auth/preferences for personal shortcuts. */
   keyboardShortcuts: boolean;
   feedbackDataSharingPreference: FeedbackDataSharingPreference;
   backupRetention: BackupRetentionPolicy;
@@ -53,10 +54,31 @@ export interface InstanceExperimentalSettings {
    */
   enableManagedSandboxOnly: boolean;
   enableIsolatedWorkspaces: boolean;
+  /**
+   * Move the execution workspace default for a project that carries no policy
+   * of its own from the shared project checkout to an isolated per-task
+   * worktree. Inert unless `enableIsolatedWorkspaces` is also on, and never
+   * overrides a project that stores its own policy.
+   */
+  enableIsolatedWorkspacesByDefault: boolean;
   enableStreamlinedLeftNavigation: boolean;
+  /**
+   * Use the streamlined shell, navigation, and contextual-sidebar experience.
+   * Missing legacy values default on; the retired left-navigation preference
+   * remains separate so an old opt-out cannot disable the broader UI.
+   */
+  enableStreamlinedUi: boolean;
+  /** @deprecated Compatibility key only. Apps is always enabled. */
   enableApps: boolean;
+  /** Exposes chat connector setup and Board surfaces; existing delivery continues when hidden. */
+  enableChatConnectors: boolean;
+  /** @deprecated Compatibility key only. MCP aggregators are always enabled. */
+  enableMcpAggregators: boolean;
+  /** Show experimental memory connection setup. Existing connections remain usable. */
+  enableMemoryConnectors: boolean;
   enablePipelines: boolean;
   enableCases: boolean;
+  enableAgentChat: boolean;
   enableConferenceRoomChat: boolean;
   enableClassicTaskInterface: boolean;
   enableIssuePlanDecompositions: boolean;
@@ -79,6 +101,13 @@ export interface InstanceExperimentalSettings {
    * behavior change outside interaction wording.
    */
   enableSimplifiedEnglishInteractions: boolean;
+  /**
+   * When the user's first onboarding request is a single task, the chief of
+   * staff proposes with a short plan document and a checkbox card instead of a
+   * one-card confirmation. Read once, when the onboarding first task is created;
+   * flipping it later does not change an existing first task.
+   */
+  enableFirstTaskPlanProposal: boolean;
   autoRestartDevServerWhenIdle: boolean;
   enableWorkspaceBranchReconcileForward: boolean;
   enableWorkspaceDirtyQuarantineRepair: boolean;
