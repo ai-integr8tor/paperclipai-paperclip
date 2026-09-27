@@ -24,7 +24,9 @@ import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./
 import { claimQueuedNativeReviewRun } from "./native-runtime/native-review-dispatch.js";
 import { buildNativeReviewRequest } from "./native-runtime/native-review-prompt.js";
 import {
+  isProcessPreSpawnAdapterType,
   legacyExecutionNeedsReconciliation,
+  shouldStampBootstrapExecutionRecovery,
   terminalizeLegacyExecution,
 } from "./legacy-execution-recovery.js";
 import {
@@ -1247,16 +1249,6 @@ const ISSUE_RESPONSIBLE_USER_WAKE_REASONS = new Set([
   "execution_approval_requested",
   "execution_changes_requested",
   "approval_approved",
-]);
-const SESSIONED_LOCAL_ADAPTERS = new Set([
-  "claude_local",
-  "codex_local",
-  "cursor",
-  "gemini_local",
-  "hermes_local",
-  "kimi_local",
-  "opencode_local",
-  "pi_local",
 ]);
 // Routes and the scheduler construct separate heartbeatService instances, but
 // they must agree on in-process adapter executions when reaping stale runs.
@@ -8229,7 +8221,7 @@ function isSameTaskScope(left: string | null, right: string | null) {
 }
 
 function isTrackedLocalChildProcessAdapter(adapterType: string) {
-  return SESSIONED_LOCAL_ADAPTERS.has(adapterType);
+  return isProcessPreSpawnAdapterType(adapterType);
 }
 
 function isHeartbeatRunTerminalStatus(
@@ -25523,7 +25515,12 @@ export function heartbeatService(
         });
 
         const stoppedDuringFailure = executionControl.controller.signal.aborted;
-        const stopSnapshot = stoppedDuringFailure ? await getRun(run.id) : null;
+        // Always refresh the run row before bootstrap classification. onSpawn
+        // persists process identity to the DB, but the in-memory `run` stays at
+        // its pre-dispatch snapshot. Ordinary (non-abort) failures used to skip
+        // this refresh and mis-stamp bootstrap after a successful spawn.
+        const currentRun = await getRun(run.id);
+        const stopSnapshot = stoppedDuringFailure ? currentRun : null;
         const failureOutcome = stoppedDuringFailure ? "cancelled" : "failed";
         const failedRunWrite = await setRunStatusIfRunning(run.id, failureOutcome, {
           error: message,
@@ -25537,7 +25534,19 @@ export function heartbeatService(
               ...(workspaceValidationFailure?.resultJson ??
                 configurationIncompleteFailure?.resultJson ??
                 {}),
-              ...(!legacyAdapterEntered && run.runtimeMode !== "native"
+              // Entering the adapter is not provider work. Process adapters that
+              // throw before spawn leave processPid null — stamp bootstrap so
+              // stranded recovery cannot invent an action-outcome hold. HTTP /
+              // cloud adapters can fail post-dispatch without process metadata;
+              // do not treat a null PID alone as bootstrap for those.
+              ...(shouldStampBootstrapExecutionRecovery({
+                legacyAdapterEntered,
+                runtimeMode: run.runtimeMode,
+                adapterType: agent.adapterType,
+                processPid: currentRun?.processPid ?? run.processPid,
+                processStartedAt:
+                  currentRun?.processStartedAt ?? run.processStartedAt,
+              })
                 ? {
                     executionRecovery: {
                       kind: "bootstrap",
