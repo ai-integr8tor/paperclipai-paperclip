@@ -542,7 +542,7 @@ test('a stalled invalidation and retry are bounded without blocking other compar
   assert.match(failure, /comparison was unavailable or stale/)
 })
 
-test('a late first invalidation write taints the head even when its retry succeeds', async () => {
+test('a timed-out invalidation taints the head even when its retry succeeds', async () => {
   const taintedHead = head
   const healthyHead = 'c'.repeat(40)
   const statuses = []
@@ -612,7 +612,7 @@ test('a late first invalidation write taints the head even when its retry succee
   assert.equal(statuses.filter(({ sha }) => sha === taintedHead).length, 1)
   assert.equal(statuses.find(({ sha }) => sha === taintedHead).state, 'pending')
   assert.match(errors[0], /timed out after 5ms/)
-  assert.match(errors[1], /head remains excluded after an uncertain first write/)
+  assert.match(errors[1], /head remains excluded after an unresolved first write/)
   assert.match(failure, /comparison was unavailable or stale/)
 
   releaseLateWrite()
@@ -674,13 +674,13 @@ test('a base change during success publication overwrites the transient success'
   assert.match(failure, /unavailable or stale/)
 })
 
-test('a rejected first invalidation is retried but excluded from comparison', async () => {
+test('a settled rejected invalidation is retried before comparison and reaches success', async () => {
   const statuses = []
   let statusAttempt = 0
   let comparisonStarted = false
   let failure
   const github = {
-    request: rulesetRequest(strictRuleset({ enforcement: 'disabled' })),
+    request: rulesetRequest(),
     rest: {
       git: { getRef: async () => ({ data: { object: { sha: base } } }) },
       pulls: {
@@ -717,8 +717,8 @@ test('a rejected first invalidation is retried but excluded from comparison', as
 
   await runBranchFreshness({ github, context, core })
 
-  assert.equal(comparisonStarted, false)
+  assert.equal(comparisonStarted, true)
   assert.equal(statuses[0].state, 'pending')
-  assert.equal(statuses.length, 1)
-  assert.match(failure, /unavailable or stale/)
+  assert.equal(statuses.at(-1).state, 'success')
+  assert.equal(failure, undefined)
 })

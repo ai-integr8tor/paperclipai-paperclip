@@ -1,5 +1,7 @@
 const SHA_PATTERN = /^[0-9a-f]{40}$/
 
+class InvalidationTimeoutError extends Error {}
+
 function isRecord(value) {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value))
 }
@@ -144,7 +146,7 @@ export async function runBranchFreshness({
         new Promise((_, reject) => {
           timeout = setTimeout(() => {
             controller.abort()
-            reject(new Error(`${label} timed out after ${invalidationTimeoutMs}ms`))
+            reject(new InvalidationTimeoutError(`${label} timed out after ${invalidationTimeoutMs}ms`))
           }, invalidationTimeoutMs)
         }),
       ])
@@ -309,19 +311,26 @@ export async function runBranchFreshness({
     if (invalidation.status === 'fulfilled') {
       preparedPulls.push(invalidation.value)
     } else {
-      comparisonFailed = true
       const message = invalidation.reason instanceof Error
         ? invalidation.reason.message
         : String(invalidation.reason)
       core.error(`PR #${pulls[index].number}: could not publish pending status: ${message}`)
       const retry = invalidationRetries[index]
       if (retry.status === 'fulfilled') {
-        // A rejected request has an unknown server-side outcome. It can still
-        // complete after this retry and replace a later terminal status with
-        // pending. The retry removes any prior success when it lands, but this
-        // run must not compare or finalize the tainted head.
-        core.error(`PR #${pulls[index].number}: pending status retry succeeded, but the head remains excluded after an uncertain first write`)
+        if (invalidation.reason instanceof InvalidationTimeoutError) {
+          comparisonFailed = true
+          // The timed-out request is still unsettled and can complete after the
+          // retry, replacing a later terminal status with pending. The retry
+          // removes any prior success when it lands, but this run must not
+          // compare or finalize the tainted head.
+          core.error(`PR #${pulls[index].number}: pending status retry succeeded, but the head remains excluded after an unresolved first write`)
+        } else {
+          // The first request is settled, so it cannot land after the retry or
+          // overwrite the terminal status this comparison will publish.
+          preparedPulls.push(retry.value)
+        }
       } else {
+        comparisonFailed = true
         const retryMessage = retry.reason instanceof Error
           ? retry.reason.message
           : String(retry.reason)
