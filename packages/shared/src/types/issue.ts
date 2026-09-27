@@ -1396,6 +1396,8 @@ export interface ExecutionGrantRequestPayload {
   targetAgentId: string;
   operation: "agent_config:update";
   targetRevisionId: string | null;
+  targetUpdatedAt: string;
+  requestBody: Record<string, unknown>;
   requestHash: string;
   expiresAt: string;
   policyVersion: number;

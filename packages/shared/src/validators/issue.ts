@@ -1511,6 +1511,8 @@ export const executionGrantRequestPayloadSchema = z.object({
   targetAgentId: z.string().guid(),
   operation: z.literal("agent_config:update"),
   targetRevisionId: z.string().guid().nullable(),
+  targetUpdatedAt: z.string().datetime({ offset: true }),
+  requestBody: z.record(z.string(), z.unknown()),
   requestHash: z.string().regex(/^[a-f0-9]{64}$/),
   expiresAt: z.string().datetime({ offset: true }),
   policyVersion: z.number().int().positive(),

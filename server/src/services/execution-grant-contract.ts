@@ -58,10 +58,40 @@ function canonicalize(value: unknown): unknown {
   return value;
 }
 
-export function executionGrantRequestHash(method: string, path: string, body: unknown): string {
+export function executionGrantRequestHash(method: string, path: string, body: unknown, targetUpdatedAt?: string): string {
   return createHash("sha256")
-    .update(JSON.stringify({ method: method.toUpperCase(), path, body: canonicalize(body) }))
+    .update(JSON.stringify({ method: method.toUpperCase(), path, body: canonicalize(body), targetUpdatedAt }))
     .digest("hex");
+}
+
+/** This exact text is shown to the approver and checked again before issuance. */
+export function executionGrantApprovalDetails(request: {
+  executorAgentId: string;
+  targetAgentId: string;
+  targetRevisionId: string | null;
+  targetUpdatedAt: string;
+  requestBody: Record<string, unknown>;
+  requestHash: string;
+  expiresAt: string;
+  policyVersion: number;
+}): string {
+  const bodyLines = JSON.stringify(canonicalize(request.requestBody), null, 2)
+    .split("\n").map((line) => `+${line}`);
+  return [
+    "Approve one exact agent configuration write.",
+    `Executor agent: ${request.executorAgentId}`,
+    `Target agent: ${request.targetAgentId}`,
+    `Target revision: ${request.targetRevisionId ?? "none"}`,
+    `Target updated at: ${request.targetUpdatedAt}`,
+    `Expires at: ${request.expiresAt}`,
+    `Policy version: ${request.policyVersion}`,
+    "",
+    "```diff",
+    `+++ PATCH /api/agents/${request.targetAgentId}`,
+    ...bodyLines,
+    "```",
+    `Request SHA-256: ${request.requestHash}`,
+  ].join("\n");
 }
 
 export function executionGrantDenial(

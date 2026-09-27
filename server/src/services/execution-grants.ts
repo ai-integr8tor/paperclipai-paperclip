@@ -1,10 +1,12 @@
 import type { Db } from "@paperclipai/db";
-import { agentConfigRevisions, agents, approvals, executionGrantPolicies, executionGrants, issueApprovals, issues, issueThreadInteractions } from "@paperclipai/db";
+import { agentConfigRevisions, agents, approvals, executionGrantPolicies, executionGrants, heartbeatRuns, issueApprovals, issues, issueThreadInteractions } from "@paperclipai/db";
 import { executionGrantRequestPayloadSchema } from "@paperclipai/shared";
 import { and, desc, eq, gt, isNull } from "drizzle-orm";
-import { forbidden, notFound } from "../errors.js";
+import { conflict, forbidden, notFound } from "../errors.js";
 import {
+  executionGrantApprovalDetails,
   executionGrantDenial,
+  executionGrantRequestHash,
   type ExecutionGrant,
   type ExecutionGrantAttempt,
 } from "./execution-grant-contract.js";
@@ -28,6 +30,23 @@ function toContract(row: typeof executionGrants.$inferSelect): ExecutionGrant {
   };
 }
 
+export async function assertActiveExecutionGrantRun(input: {
+  db: Db;
+  companyId: string;
+  executorAgentId: string;
+  runId: string;
+}) {
+  const run = await input.db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.id, input.runId),
+    eq(heartbeatRuns.companyId, input.companyId),
+    eq(heartbeatRuns.agentId, input.executorAgentId),
+    eq(heartbeatRuns.status, "running"),
+  )).for("update").then((rows) => rows[0] ?? null);
+  if (!run) throw forbidden("An active executor run is required", {
+    code: "execution_grant_active_run_required",
+  });
+}
+
 /** Materialize the immutable request that an agent or board already approved. */
 export async function issueExecutionGrant(input: {
   db: Db;
@@ -48,6 +67,13 @@ export async function issueExecutionGrant(input: {
     .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)))
     .then((rows) => rows[0] ?? null);
   if (!issue) throw notFound("Issue not found");
+  const priorGrant = await input.db.select({ consumedAt: executionGrants.consumedAt })
+    .from(executionGrants).where(and(
+      eq(executionGrants.companyId, input.companyId),
+      eq(executionGrants.decisionKind, input.decisionKind),
+      eq(executionGrants.decisionId, input.decisionId),
+    )).then((rows) => rows[0] ?? null);
+  if (priorGrant?.consumedAt) throw conflict("Decision grant was already consumed");
 
   let proposerAgentId: string | null = null;
   let approverAgentId: string | null = null;
@@ -100,15 +126,33 @@ export async function issueExecutionGrant(input: {
   }
 
   const request = executionGrantRequestPayloadSchema.safeParse(rawRequest);
-  if (!request.success || !proposerAgentId ||
-      request.data.executorAgentId !== input.executorAgentId ||
-      request.data.targetAgentId === policy.stewardAgentId ||
+  if (!request.success) throw forbidden("Decision has no valid execution request", {
+    code: "execution_grant_invalid_decision",
+  });
+  const proposed = request.data;
+  const target = await input.db.select({ id: agents.id, updatedAt: agents.updatedAt })
+    .from(agents).where(and(
+      eq(agents.companyId, input.companyId),
+      eq(agents.id, proposed.targetAgentId),
+    )).then((rows) => rows[0] ?? null);
+  const currentRevision = target ? await input.db.select({ id: agentConfigRevisions.id })
+    .from(agentConfigRevisions).where(and(
+      eq(agentConfigRevisions.companyId, input.companyId),
+      eq(agentConfigRevisions.agentId, target.id),
+    )).orderBy(desc(agentConfigRevisions.createdAt), desc(agentConfigRevisions.id))
+      .limit(1).then((rows) => rows[0]?.id ?? null) : null;
+  if (!target || !proposerAgentId ||
+      proposed.executorAgentId !== input.executorAgentId ||
+      proposed.targetAgentId === policy.stewardAgentId ||
       (input.decisionKind === "agent" &&
         (approverAgentId === proposerAgentId || approverAgentId === input.executorAgentId)) ||
-      !displayedDetails?.includes(request.data.requestHash) ||
-      !/```diff\b|(^|\n)[+-][^\n]+/i.test(displayedDetails) ||
-      Date.parse(request.data.expiresAt) <= Date.now() ||
-      request.data.policyVersion !== policy.version) {
+      proposed.targetRevisionId !== currentRevision ||
+      proposed.targetUpdatedAt !== target.updatedAt.toISOString() ||
+      executionGrantRequestHash("PATCH", `/api/agents/${target.id}`,
+        proposed.requestBody, proposed.targetUpdatedAt) !== proposed.requestHash ||
+      displayedDetails !== executionGrantApprovalDetails(proposed) ||
+      Date.parse(proposed.expiresAt) <= Date.now() ||
+      proposed.policyVersion !== policy.version) {
     throw forbidden("Decision does not authorize the exact proposed execution grant", {
       code: "execution_grant_invalid_decision",
     });
@@ -122,20 +166,23 @@ export async function issueExecutionGrant(input: {
     proposerAgentId,
     approverAgentId,
     approverUserId,
-    executorAgentId: request.data.executorAgentId,
-    targetAgentId: request.data.targetAgentId,
-    operation: request.data.operation,
-    targetRevisionId: request.data.targetRevisionId,
-    requestHash: request.data.requestHash,
-    expiresAt: new Date(request.data.expiresAt),
-    policyVersion: request.data.policyVersion,
+    executorAgentId: proposed.executorAgentId,
+    targetAgentId: proposed.targetAgentId,
+    operation: proposed.operation,
+    targetRevisionId: proposed.targetRevisionId,
+    requestHash: proposed.requestHash,
+    expiresAt: new Date(proposed.expiresAt),
+    policyVersion: proposed.policyVersion,
   }).onConflictDoNothing().returning();
-  if (inserted) return inserted;
-  return input.db.select().from(executionGrants).where(and(
+  if (inserted) return { ...inserted, newlyIssued: true };
+  const existing = await input.db.select().from(executionGrants).where(and(
     eq(executionGrants.companyId, input.companyId),
     eq(executionGrants.decisionKind, input.decisionKind),
     eq(executionGrants.decisionId, input.decisionId),
   )).then((rows) => rows[0] ?? null);
+  if (!existing) return null;
+  if (existing.consumedAt) throw conflict("Decision grant was already consumed");
+  return { ...existing, newlyIssued: false };
 }
 
 /** The callback must perform the protected write through txDb, so a failure rolls back consumption. */
@@ -143,12 +190,13 @@ export async function withConsumedExecutionGrant<T>(input: {
   db: Db;
   grantId: string;
   attempt: Omit<ExecutionGrantAttempt, "targetRevisionId" | "now" | "decisionStewardAgentId" | "currentPolicyVersion">;
+  requestBody?: unknown;
   runId: string;
   apply: (txDb: Db) => Promise<T>;
 }): Promise<T> {
   return input.db.transaction(async (tx) => {
     const txDb = tx as unknown as Db;
-    const target = await txDb.select({ id: agents.id })
+    const target = await txDb.select({ id: agents.id, updatedAt: agents.updatedAt })
       .from(agents)
       .where(and(eq(agents.id, input.attempt.targetAgentId), eq(agents.companyId, input.attempt.companyId)))
       .for("update")
@@ -179,14 +227,26 @@ export async function withConsumedExecutionGrant<T>(input: {
     if (!grant) throw forbidden("Execution grant is unavailable", { code: "execution_grant_unavailable" });
 
     const now = new Date();
+    const requestHash = input.requestBody === undefined
+      ? input.attempt.requestHash
+      : executionGrantRequestHash("PATCH", `/api/agents/${target.id}`,
+        input.requestBody, target.updatedAt.toISOString());
     const denial = executionGrantDenial(toContract(grant), {
       ...input.attempt,
+      requestHash,
       targetRevisionId: currentRevision,
       decisionStewardAgentId: policy.stewardAgentId,
       currentPolicyVersion: policy.version,
       now,
     });
     if (denial) throw forbidden("Execution grant does not authorize this write", { code: `execution_grant_${denial}` });
+
+    await assertActiveExecutionGrantRun({
+      db: txDb,
+      companyId: input.attempt.companyId,
+      executorAgentId: input.attempt.executorAgentId,
+      runId: input.runId,
+    });
 
     const [consumed] = await txDb.update(executionGrants)
       .set({ consumedAt: now, consumedByRunId: input.runId })
@@ -196,7 +256,7 @@ export async function withConsumedExecutionGrant<T>(input: {
         eq(executionGrants.executorAgentId, input.attempt.executorAgentId),
         eq(executionGrants.targetAgentId, input.attempt.targetAgentId),
         eq(executionGrants.operation, input.attempt.operation),
-        eq(executionGrants.requestHash, input.attempt.requestHash),
+        eq(executionGrants.requestHash, requestHash),
         gt(executionGrants.expiresAt, now),
         isNull(executionGrants.consumedAt),
       ))

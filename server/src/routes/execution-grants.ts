@@ -4,7 +4,7 @@ import { and, eq, sql } from "drizzle-orm";
 import { z } from "zod";
 import { forbidden, notFound } from "../errors.js";
 import { validate } from "../middleware/validate.js";
-import { issueExecutionGrant } from "../services/execution-grants.js";
+import { assertActiveExecutionGrantRun, issueExecutionGrant } from "../services/execution-grants.js";
 import { logActivity } from "../services/activity-log.js";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 
@@ -73,37 +73,50 @@ export function executionGrantRoutes(db: Db) {
     const companyId = req.actor.companyId;
     if (!companyId) throw forbidden("Company-scoped agent authentication is required");
     assertCompanyAccess(req, companyId);
-    const grant = await issueExecutionGrant({
-      db,
-      companyId,
-      issueId: req.params.id as string,
-      decisionKind: req.body.decisionKind,
-      decisionId: req.body.decisionId,
-      executorAgentId: req.actor.agentId,
+    const actor = getActorInfo(req);
+    const grant = await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await assertActiveExecutionGrantRun({
+        db: txDb,
+        companyId,
+        executorAgentId: req.actor.agentId,
+        runId: req.actor.runId,
+      });
+      const issued = await issueExecutionGrant({
+        db: txDb,
+        companyId,
+        issueId: req.params.id as string,
+        decisionKind: req.body.decisionKind,
+        decisionId: req.body.decisionId,
+        executorAgentId: req.actor.agentId,
+      });
+      if (issued?.newlyIssued) {
+        await logActivity(txDb, {
+          companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "execution_grant.issued",
+          entityType: "execution_grant",
+          entityId: issued.id,
+          issueId: req.params.id as string,
+          details: {
+            decisionKind: issued.decisionKind,
+            decisionId: issued.decisionId,
+            executorAgentId: issued.executorAgentId,
+            targetAgentId: issued.targetAgentId,
+            operation: issued.operation,
+            policyVersion: issued.policyVersion,
+          },
+        });
+      }
+      return issued;
     });
     if (!grant) throw forbidden("Execution grant could not be issued");
-    const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      agentApiKeyId: actor.agentApiKeyId,
-      action: "execution_grant.issued",
-      entityType: "execution_grant",
-      entityId: grant.id,
-      issueId: req.params.id as string,
-      details: {
-        decisionKind: grant.decisionKind,
-        decisionId: grant.decisionId,
-        executorAgentId: grant.executorAgentId,
-        targetAgentId: grant.targetAgentId,
-        operation: grant.operation,
-        policyVersion: grant.policyVersion,
-      },
-    });
-    res.status(201).json(grant);
+    const { newlyIssued, ...grantRow } = grant;
+    res.status(newlyIssued ? 201 : 200).json(grantRow);
   });
 
   return router;

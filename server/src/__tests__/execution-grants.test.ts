@@ -4,12 +4,12 @@ import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import {
-  activityLog, agentConfigRevisions, agents, approvals, companies, companyMemberships, createDb,
+  activityLog, agentConfigRevisions, agents, approvals, companies, companyMemberships, companySecrets, createDb,
   executionGrantPolicies, executionGrants, heartbeatRuns, issueApprovals,
   issueThreadInteractions, issues, principalPermissionGrants,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
-import { executionGrantRequestHash } from "../services/execution-grant-contract.js";
+import { executionGrantApprovalDetails, executionGrantRequestHash } from "../services/execution-grant-contract.js";
 import { issueExecutionGrant, withConsumedExecutionGrant } from "../services/execution-grants.js";
 import { executionGrantRoutes } from "../routes/execution-grants.js";
 import { agentRoutes } from "../routes/agents.js";
@@ -38,6 +38,7 @@ describeDb("execution grants", () => {
     await db.delete(agentConfigRevisions);
     await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
+    await db.delete(companySecrets);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -54,7 +55,6 @@ describeDb("execution grants", () => {
     const executorRunId = randomUUID();
     const decisionId = randomUUID();
     const body = { name: "Chief of staff approved name" };
-    const requestHash = executionGrantRequestHash("PATCH", `/api/agents/${targetAgentId}`, body);
     const expiresAt = new Date(Date.now() + 3_600_000).toISOString();
     await db.insert(companies).values({
       id: companyId, name: "Household", issuePrefix: "JOH", defaultResponsibleUserId: "board-user",
@@ -68,6 +68,10 @@ describeDb("execution grants", () => {
         adapterConfig: {}, runtimeConfig: {}, permissions: {},
       });
     }
+    const targetUpdatedAt = (await db.select({ updatedAt: agents.updatedAt }).from(agents)
+      .where(eq(agents.id, targetAgentId)))[0].updatedAt.toISOString();
+    const requestHash = executionGrantRequestHash("PATCH", `/api/agents/${targetAgentId}`,
+      body, targetUpdatedAt);
     await db.insert(companyMemberships).values({
       companyId, principalType: "agent", principalId: executorAgentId,
     });
@@ -86,15 +90,16 @@ describeDb("execution grants", () => {
       id: issueId, companyId, title: "Chief config proposal", status: "in_review",
       priority: "medium", identifier: "JOH-1", issueNumber: 1, createdByAgentId: proposerAgentId,
     });
+    const executionGrant = {
+      version: 1 as const, executorAgentId, targetAgentId,
+      operation: "agent_config:update" as const, targetRevisionId: null,
+      targetUpdatedAt, requestBody: body, requestHash, expiresAt, policyVersion: 1,
+    };
     const payload = {
       version: 1 as const,
       prompt: "Approve this exact Chief config change?",
-      detailsMarkdown: `\`\`\`diff\n- old name\n+ approved name\n\`\`\`\nRequest SHA-256: ${requestHash}`,
-      executionGrant: {
-        version: 1 as const, executorAgentId, targetAgentId,
-        operation: "agent_config:update" as const, targetRevisionId: null,
-        requestHash, expiresAt, policyVersion: 1,
-      },
+      detailsMarkdown: executionGrantApprovalDetails(executionGrant),
+      executionGrant,
     };
     await db.insert(issueThreadInteractions).values({
       id: decisionId, companyId, issueId, kind: "request_confirmation", status: "accepted",
@@ -173,6 +178,18 @@ describeDb("execution grants", () => {
       db, companyId: fixture.companyId, issueId: fixture.issueId,
       decisionKind: "agent", decisionId: fixture.decisionId, executorAgentId: fixture.executorAgentId,
     })).rejects.toMatchObject({ status: 403 });
+  });
+
+  it("rejects an approval display that describes a different request", async () => {
+    const fixture = await seed();
+    await db.update(issueThreadInteractions).set({
+      payload: { ...fixture.payload, detailsMarkdown: `\`\`\`diff\n+ a harmless change\n\`\`\`\nRequest SHA-256: ${fixture.requestHash}` },
+    }).where(eq(issueThreadInteractions.id, fixture.decisionId));
+    await expect(issueExecutionGrant({
+      db, companyId: fixture.companyId, issueId: fixture.issueId,
+      decisionKind: "agent", decisionId: fixture.decisionId,
+      executorAgentId: fixture.executorAgentId,
+    })).rejects.toMatchObject({ status: 403, details: { code: "execution_grant_invalid_decision" } });
   });
 
   it("rejects a stale revision, expired grant, and changed policy version", async () => {
@@ -264,6 +281,12 @@ describeDb("execution grants", () => {
       decisionId: fixture.decisionId, executorAgentId: fixture.executorAgentId,
       targetAgentId: fixture.targetAgentId,
     });
+    await request(appAs(agentActor))
+      .post(`/api/issues/${fixture.issueId}/execution-grants`)
+      .send({ decisionKind: "agent", decisionId: fixture.decisionId })
+      .expect(200);
+    expect(await db.select().from(activityLog).where(eq(activityLog.action, "execution_grant.issued")))
+      .toHaveLength(1);
     await request(appAs({ ...agentActor, agentId: fixture.proposerAgentId }))
       .post(`/api/issues/${fixture.issueId}/execution-grants`)
       .send({ decisionKind: "agent", decisionId: fixture.decisionId })
@@ -293,7 +316,81 @@ describeDb("execution grants", () => {
     await request(app).patch(path)
       .set("X-Paperclip-Execution-Grant", grant!.id)
       .send(fixture.body).expect(403);
+    await request(app)
+      .post(`/api/issues/${fixture.issueId}/execution-grants`)
+      .send({ decisionKind: "agent", decisionId: fixture.decisionId })
+      .expect(409);
     expect((await db.select().from(agents).where(eq(agents.id, fixture.targetAgentId)))[0].name)
       .toBe(fixture.body.name);
+  });
+
+  it("rejects issuance and consumption after the executor run completes", async () => {
+    const fixture = await seed();
+    const actor: Express.Request["actor"] = {
+      type: "agent", companyId: fixture.companyId, agentId: fixture.executorAgentId,
+      runId: fixture.executorRunId, source: "agent_jwt",
+    };
+    const grant = await issueExecutionGrant({
+      db, companyId: fixture.companyId, issueId: fixture.issueId,
+      decisionKind: "agent", decisionId: fixture.decisionId,
+      executorAgentId: fixture.executorAgentId,
+    });
+    await db.update(heartbeatRuns).set({ status: "succeeded" })
+      .where(eq(heartbeatRuns.id, fixture.executorRunId));
+    await request(appAs(actor))
+      .post(`/api/issues/${fixture.issueId}/execution-grants`)
+      .send({ decisionKind: "agent", decisionId: fixture.decisionId })
+      .expect(403);
+    const response = await request(appAs(actor))
+      .patch(`/api/agents/${fixture.targetAgentId}`)
+      .set("X-Paperclip-Execution-Grant", grant!.id)
+      .send(fixture.body);
+    expect(response.status, JSON.stringify(response.body)).toBe(403);
+    expect(response.body.details?.code).toBe("execution_grant_active_run_required");
+    expect((await db.select().from(executionGrants).where(eq(executionGrants.id, grant!.id)))[0].consumedAt)
+      .toBeNull();
+  });
+
+  it("rejects a changed agent row even if no config revision was recorded", async () => {
+    const fixture = await seed();
+    const grant = await issueExecutionGrant({
+      db, companyId: fixture.companyId, issueId: fixture.issueId,
+      decisionKind: "agent", decisionId: fixture.decisionId,
+      executorAgentId: fixture.executorAgentId,
+    });
+    await db.update(agents).set({ name: "intervening change", updatedAt: new Date(Date.now() + 1_000) })
+      .where(eq(agents.id, fixture.targetAgentId));
+    const actor: Express.Request["actor"] = {
+      type: "agent", companyId: fixture.companyId, agentId: fixture.executorAgentId,
+      runId: fixture.executorRunId, source: "agent_jwt",
+    };
+    const response = await request(appAs(actor))
+      .patch(`/api/agents/${fixture.targetAgentId}`)
+      .set("X-Paperclip-Execution-Grant", grant!.id)
+      .send(fixture.body);
+    expect(response.status, JSON.stringify(response.body)).toBe(403);
+    expect(response.body.details?.code).toBe("execution_grant_request_changed");
+    expect((await db.select().from(executionGrants).where(eq(executionGrants.id, grant!.id)))[0].consumedAt)
+      .toBeNull();
+  });
+
+  it("does not persist adapter secrets for a rejected grant-backed PATCH", async () => {
+    const fixture = await seed();
+    const grant = await issueExecutionGrant({
+      db, companyId: fixture.companyId, issueId: fixture.issueId,
+      decisionKind: "agent", decisionId: fixture.decisionId,
+      executorAgentId: fixture.executorAgentId,
+    });
+    const actor: Express.Request["actor"] = {
+      type: "agent", companyId: fixture.companyId, agentId: fixture.executorAgentId,
+      runId: fixture.executorRunId, source: "agent_jwt",
+    };
+    await request(appAs(actor))
+      .patch(`/api/agents/${fixture.targetAgentId}`)
+      .set("X-Paperclip-Execution-Grant", grant!.id)
+      .send({ adapterConfig: { env: { OPENAI_API_KEY: "test-secret" } } })
+      .expect(403);
+    expect(await db.select().from(companySecrets).where(eq(companySecrets.companyId, fixture.companyId)))
+      .toHaveLength(0);
   });
 });

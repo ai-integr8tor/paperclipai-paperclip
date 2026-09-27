@@ -2461,8 +2461,10 @@ export function agentRoutes(
     adapterType: string | null | undefined;
     adapterConfig: Record<string, unknown>;
     constraintAdapterConfig?: Record<string, unknown>;
+    database?: Db;
   }): Promise<Record<string, unknown>> {
-    const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
+    const normalizedAdapterConfig = await (input.database ? secretService(input.database) : secretsSvc)
+      .normalizeAdapterConfigForPersistence(
       input.companyId,
       input.adapterConfig,
       {
@@ -5301,6 +5303,11 @@ export function agentRoutes(
     const touchesAdapterConfiguration =
       hasOwn(patchData, "adapterType") ||
       hasOwn(patchData, "adapterConfig");
+    let deferredAdapterConfig: {
+      companyId: string;
+      adapterType: string;
+      adapterConfig: Record<string, unknown>;
+    } | null = null;
     if (touchesAdapterConfiguration) {
       assertExternalInstructionsAdmin(req, existing);
       const existingAdapterConfig = asRecord(existing.adapterConfig) ?? {};
@@ -5373,12 +5380,21 @@ export function agentRoutes(
           rawEffectiveAdapterConfig,
         ),
       );
-      const normalizedEffectiveAdapterConfig = await normalizeMediatedAdapterConfigForPersistence({
-        companyId: existing.companyId,
-        adapterType: requestedAdapterType,
-        adapterConfig: effectiveAdapterConfig,
-      });
-      patchData.adapterConfig = syncInstructionsBundleConfigFromFilePath(existing, normalizedEffectiveAdapterConfig);
+      if (executionGrantId) {
+        deferredAdapterConfig = {
+          companyId: existing.companyId,
+          adapterType: requestedAdapterType,
+          adapterConfig: effectiveAdapterConfig,
+        };
+        patchData.adapterConfig = syncInstructionsBundleConfigFromFilePath(existing, effectiveAdapterConfig);
+      } else {
+        const normalizedEffectiveAdapterConfig = await normalizeMediatedAdapterConfigForPersistence({
+          companyId: existing.companyId,
+          adapterType: requestedAdapterType,
+          adapterConfig: effectiveAdapterConfig,
+        });
+        patchData.adapterConfig = syncInstructionsBundleConfigFromFilePath(existing, normalizedEffectiveAdapterConfig);
+      }
       assertExternalInstructionsAdmin(req, {
         ...existing,
         adapterConfig: patchData.adapterConfig,
@@ -5440,10 +5456,24 @@ export function agentRoutes(
             executorAgentId: req.actor.agentId,
             targetAgentId: id,
             operation: "agent_config:update",
-            requestHash: executionGrantRequestHash("PATCH", `/api/agents/${id}`, req.body),
+            requestHash: executionGrantRequestHash("PATCH", `/api/agents/${id}`, req.body,
+              existing.updatedAt.toISOString()),
           },
+          requestBody: req.body,
           runId: req.actor.runId,
-          apply: (txDb) => agentService(txDb).update(id, patchData, updateOptions),
+          apply: async (txDb) => {
+            let txPatchData = patchData;
+            if (deferredAdapterConfig) {
+              const normalized = await normalizeMediatedAdapterConfigForPersistence({
+                ...deferredAdapterConfig,
+                database: txDb,
+              });
+              const adapterConfig = syncInstructionsBundleConfigFromFilePath(existing, normalized);
+              assertExternalInstructionsAdmin(req, { ...existing, adapterConfig });
+              txPatchData = { ...patchData, adapterConfig };
+            }
+            return agentService(txDb).update(id, txPatchData, updateOptions);
+          },
         })
       : await svc.update(id, patchData, updateOptions);
     if (!agent) {
