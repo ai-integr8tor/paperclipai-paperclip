@@ -706,6 +706,14 @@ On startup and on the periodic recovery loop, Paperclip performs the following r
 
 The stranded-work pass closes the gap where issue state survives a crash but the wake/run path does not. The silent-run scan covers the separate case where a live process exists but has stopped producing observable output.
 
+The stale-lock sweep leaves native runs with their finalization coordinator while
+same-session recovery or accepted-result finalization is pending. A provider can
+exit before workspace copy-back, assessment, or arbitration completes. An expired
+coordinator lease or a delayed retry does not make that run orphaned. The sweep
+checks coordinator ownership in its terminal update, so a result recorded after
+the process check is also protected. Terminal task status remains authoritative;
+exhausted finalization retries do not keep an otherwise orphaned run alive.
+
 Automatic productivity reviews are retired. Run counts, missing comments, and elapsed task time do not create review tasks or impose continuation holds. Bounded continuation, provider recovery, budget limits, explicit blockers, and normal review/approval stages remain in force. Existing productivity-review tasks, comments, assignments, and dependencies remain unchanged and readable; their historical origins still identify them as recovery work for recursion suppression.
 
 ### Issue-thread interaction resolution
@@ -1243,6 +1251,19 @@ returning instead of leaving a new idle owner behind. If checkpointing fails,
 the retained state continues to block unverified reuse.
 
 ### Warm sandbox continuity
+
+For the native runner, warm mode requests a reusable sandbox lease **before**
+lease acquisition. The environment's explicit runner lifecycle overrides the
+agent default; an inherited lifecycle uses the current agent setting on each
+new turn. This run-scoped configuration does not modify the shared environment
+or replace the task's workspace. Switching an existing task from per-turn to
+warm therefore acquires a reusable lease through the normal provider path,
+instead of starting warm execution on an ephemeral lease. Provider capability,
+ownership, cleanup, and verified restore checks still apply; an unsupported
+provider must not be treated as reusable. Existing active runs retain their
+admitted lifecycle, including when recovery acquires a lease after the agent or
+environment lifecycle setting changes. Recovery uses the persisted execution
+input for both lease acquisition and lifecycle validation.
 
 A warm sandbox's shared workspace binding persists independently of the
 experimental isolated-workspaces UI. Ordinary workspace updates remain gated;
