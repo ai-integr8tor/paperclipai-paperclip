@@ -34,6 +34,7 @@ import {
   activityLog,
   agentWakeupRequests,
   agents,
+  authUsers,
   approvals,
   chatConversations,
   chatEndpoints,
@@ -5668,6 +5669,20 @@ export function issueRoutes(
           })
         : null;
     const actor = getActorInfo(req);
+    const verifiedEmail =
+      actor.actorType === "user" &&
+      interaction.addresseeUserId?.includes("@")
+        ? await db
+            .select({
+              email: authUsers.email,
+              emailVerified: authUsers.emailVerified,
+            })
+            .from(authUsers)
+            .where(eq(authUsers.id, actor.actorId))
+            .then((rows) =>
+              rows[0]?.emailVerified ? rows[0].email : null,
+            )
+        : null;
     const decision: IssueThreadInteractionResolverAudienceDecision =
       evaluateIssueThreadInteractionResolverAudience({
         actor:
@@ -5677,7 +5692,7 @@ export function issueRoutes(
                 agentId: actor.agentId,
                 runId: runId || actor.runId,
               }
-            : { type: "user", userId: actor.actorId },
+            : { type: "user", userId: actor.actorId, verifiedEmail },
         interaction,
         additionalRestriction: resolverPolicyRestriction,
         governedAction:
