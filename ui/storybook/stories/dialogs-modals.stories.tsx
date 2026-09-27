@@ -689,6 +689,15 @@ export default meta;
 
 type Story = StoryObj<typeof meta>;
 
+function constrainVisualViewportForPickerStory() {
+  const viewport = window.visualViewport;
+  if (!viewport) return null;
+  Object.defineProperty(viewport, "height", { configurable: true, value: 420 });
+  Object.defineProperty(viewport, "offsetTop", { configurable: true, value: 24 });
+  viewport.dispatchEvent(new Event("resize"));
+  return viewport;
+}
+
 export const NewIssueEmpty: Story = {
   name: "New Issue - Empty",
   render: () => (
@@ -737,9 +746,14 @@ export const NewIssueMobileAssigneePicker: Story = {
     await userEvent.click(await page.findByRole("button", { name: "Assignee" }));
     const search = await page.findByPlaceholderText("Search assignees...");
     await userEvent.click(search);
+    const viewport = constrainVisualViewportForPickerStory();
+    await new Promise((resolve) => requestAnimationFrame(resolve));
     const bounds = search.closest<HTMLElement>("[data-mobile-entity-picker]")?.getBoundingClientRect();
-    await expect(bounds?.top).toBeGreaterThanOrEqual(0);
-    await expect(bounds?.bottom).toBeLessThanOrEqual(window.visualViewport?.height ?? window.innerHeight);
+    const offsetTop = viewport?.offsetTop ?? 0;
+    await expect((bounds?.top ?? -1) + offsetTop).toBeGreaterThanOrEqual(offsetTop);
+    await expect((bounds?.bottom ?? Number.POSITIVE_INFINITY) + offsetTop).toBeLessThanOrEqual(
+      offsetTop + (viewport?.height ?? window.innerHeight),
+    );
   },
 };
 
@@ -763,9 +777,14 @@ export const NewIssueMobileProjectPicker: Story = {
     await userEvent.click(await page.findByRole("button", { name: "Project" }));
     const search = await page.findByPlaceholderText("Search projects...");
     await userEvent.click(search);
+    const viewport = constrainVisualViewportForPickerStory();
+    await new Promise((resolve) => requestAnimationFrame(resolve));
     const bounds = search.closest<HTMLElement>("[data-mobile-entity-picker]")?.getBoundingClientRect();
-    await expect(bounds?.top).toBeGreaterThanOrEqual(0);
-    await expect(bounds?.bottom).toBeLessThanOrEqual(window.visualViewport?.height ?? window.innerHeight);
+    const offsetTop = viewport?.offsetTop ?? 0;
+    await expect((bounds?.top ?? -1) + offsetTop).toBeGreaterThanOrEqual(offsetTop);
+    await expect((bounds?.bottom ?? Number.POSITIVE_INFINITY) + offsetTop).toBeLessThanOrEqual(
+      offsetTop + (viewport?.height ?? window.innerHeight),
+    );
   },
 };
 

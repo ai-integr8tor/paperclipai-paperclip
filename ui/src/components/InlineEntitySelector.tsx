@@ -41,6 +41,25 @@ interface InlineEntitySelectorProps {
 
 const EMPTY_RECENT_OPTION_IDS: string[] = [];
 
+function useMobileSelectorModal() {
+  const [mobile, setMobile] = useState(() =>
+    typeof window !== "undefined"
+      && typeof window.matchMedia === "function"
+      && window.matchMedia("(max-width: 40rem)").matches,
+  );
+
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") return;
+    const media = window.matchMedia("(max-width: 40rem)");
+    const update = () => setMobile(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+
+  return mobile;
+}
+
 export const InlineEntitySelector = forwardRef<HTMLButtonElement, InlineEntitySelectorProps>(
   function InlineEntitySelector(
     {
@@ -69,6 +88,7 @@ export const InlineEntitySelector = forwardRef<HTMLButtonElement, InlineEntitySe
     const [open, setOpen] = useState(false);
     const [query, setQuery] = useState("");
     const [highlightedIndex, setHighlightedIndex] = useState(0);
+    const mobileSelectorModal = useMobileSelectorModal();
     const highlightedIndexRef = useRef(0);
     const inputRef = useRef<HTMLInputElement>(null);
     const shouldPreventCloseAutoFocusRef = useRef(false);
@@ -154,7 +174,7 @@ export const InlineEntitySelector = forwardRef<HTMLButtonElement, InlineEntitySe
           side="bottom"
           collisionPadding={16}
           className="w-(--sz-calc-6) p-1"
-          disablePortal={disablePortal}
+          disablePortal={disablePortal && !mobileSelectorModal}
           style={contentStyle}
           onOpenAutoFocus={(event) => {
             event.preventDefault();
@@ -172,7 +192,10 @@ export const InlineEntitySelector = forwardRef<HTMLButtonElement, InlineEntitySe
               type="button"
               className="inline-flex size-9 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
               aria-label="Close selector"
-              onClick={() => setOpen(false)}
+              onClick={() => {
+                shouldPreventCloseAutoFocusRef.current = true;
+                setOpen(false);
+              }}
             >
               <X className="size-5" />
             </button>

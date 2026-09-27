@@ -82,7 +82,7 @@ export const ComposerAssigneePicker: Story = {
 export const SearchableSelectModal: Story = {
   render: () => (
     <div className="flex min-h-screen items-end p-4">
-      <SearchableSelect
+      <SearchableSelect<string>
         value=""
         groups={[{ id: "projects", label: "Projects", options: projects.map((project) => ({ key: project.id, value: project.id, label: project.label })) }]}
         onValueChange={() => undefined}
