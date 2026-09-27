@@ -2855,7 +2855,15 @@ describe.sequential("issue thread interaction routes", () => {
       .send({});
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(mockInteractionService.acceptInteraction).toHaveBeenCalled();
+    expect(mockInteractionService.acceptInteraction).toHaveBeenCalledWith(
+      expect.anything(),
+      "interaction-email-addressed",
+      {},
+      expect.objectContaining({
+        userId: "user-1",
+        verifiedEmail: "reviewer@example.com",
+      }),
+    );
   });
 
   it("does not use an unverified email to resolve an email-addressed interaction", async () => {

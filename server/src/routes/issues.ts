@@ -5728,7 +5728,7 @@ export function issueRoutes(
       ))
     )
       return false;
-    return { decision, resolverPolicyRestriction } as const;
+    return { decision, resolverPolicyRestriction, verifiedEmail } as const;
   }
 
   async function getIssueThreadInteractionResolutionAuthorization(
@@ -16115,6 +16115,9 @@ export function issueRoutes(
           agentId: actor.agentId,
           runId: actor.runId,
           userId: actor.actorType === "user" ? actor.actorId : null,
+          ...(resolutionAuthorization.verifiedEmail
+            ? { verifiedEmail: resolutionAuthorization.verifiedEmail }
+            : {}),
           resolverPolicyRestriction:
             resolutionAuthorization.resolverPolicyRestriction,
           suggestedTaskEffectsAuthorized,
@@ -16430,6 +16433,9 @@ export function issueRoutes(
           agentId: actor.agentId,
           runId: actor.runId,
           userId: actor.actorType === "user" ? actor.actorId : null,
+          ...(resolutionAuthorization.verifiedEmail
+            ? { verifiedEmail: resolutionAuthorization.verifiedEmail }
+            : {}),
           resolverPolicyRestriction:
             resolutionAuthorization.resolverPolicyRestriction,
         },
@@ -16518,6 +16524,9 @@ export function issueRoutes(
           agentId: actor.agentId,
           runId: actor.runId,
           userId: actor.actorType === "user" ? actor.actorId : null,
+          ...(resolutionAuthorization.verifiedEmail
+            ? { verifiedEmail: resolutionAuthorization.verifiedEmail }
+            : {}),
           resolverPolicyRestriction:
             resolutionAuthorization.resolverPolicyRestriction,
         },
@@ -16600,6 +16609,9 @@ export function issueRoutes(
             agentId: actor.agentId,
             runId: actor.runId,
             userId: actor.actorType === "user" ? actor.actorId : null,
+            ...(resolutionAuthorization.verifiedEmail
+              ? { verifiedEmail: resolutionAuthorization.verifiedEmail }
+              : {}),
             resolverPolicyRestriction:
               resolutionAuthorization.resolverPolicyRestriction,
           },
