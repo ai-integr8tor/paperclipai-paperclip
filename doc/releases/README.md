@@ -45,8 +45,10 @@ Do not skip steps. A later lane does not substitute for an earlier gate.
    → Complete monitoring/verification section; record PASS/FAIL/PARTIAL
 
 8. Release notes (Release Engineer or release captain)
-   → Fill release-notes-template.md; land notes per RELEASING.md
-   → Include rollback owner and monitoring verification evidence
+   → Draft notes during soak / pre-ship using release-notes-template.md
+     (narrative + known owners may start as early as step 4–6)
+   → Complete monitoring verification fields only after step 7 evidence exists
+   → Land notes per RELEASING.md with rollback owner + verification evidence
 
 9. Handoff / close
    → Status: shipped (or rolled back)

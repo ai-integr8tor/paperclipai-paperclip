@@ -341,6 +341,11 @@ Stable changelog files live at:
 
 Canaries do not get changelog files.
 
+When drafting or editing notes, start from
+[`doc/releases/release-notes-template.md`](releases/release-notes-template.md)
+so rollback owners and monitoring verification stay explicit. Structure the
+narrative here; fill governance fields with that template.
+
 The `draft_stable_notes` job seeds a deterministic skeleton (grouped
 commit subjects) on the `release-notes/v<beta-version>` branch at beta
 publish; the flows below turn that skeleton into narrative release notes
@@ -407,6 +412,12 @@ Minimum checks:
 ## Rollback
 
 Rollback does not unpublish versions.
+
+For governance (owners, triggers, verification, and release-note fields), use
+[`doc/releases/readiness-checklist.md`](releases/readiness-checklist.md) and
+[`doc/releases/release-notes-template.md`](releases/release-notes-template.md)
+before and after a rollback. This section covers the npm `latest` dist-tag
+mechanic only.
 
 It only moves the `latest` dist-tag back to a previous stable:
 
