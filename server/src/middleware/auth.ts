@@ -478,47 +478,6 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       return;
     }
 
-    const normalizedRunIdHeader = normalizeOptionalString(runIdHeader);
-    if (normalizedRunIdHeader) {
-      const [keyRun] = await db
-        .select({
-          status: heartbeatRuns.status,
-          resultJson: heartbeatRuns.resultJson,
-          contextSnapshot: heartbeatRuns.contextSnapshot,
-        })
-        .from(heartbeatRuns)
-        .where(
-          and(
-            eq(heartbeatRuns.id, normalizedRunIdHeader),
-            eq(heartbeatRuns.companyId, key.companyId),
-            eq(heartbeatRuns.agentId, key.agentId),
-          ),
-        );
-      if (!keyRun) {
-        next(
-          unauthorized("Agent run context is invalid", {
-            code: "agent_run_context_invalid",
-          }),
-        );
-        return;
-      }
-      if (
-        agentRunWritesRevoked(keyRun) &&
-        !["GET", "HEAD", "OPTIONS"].includes(req.method)
-      ) {
-        const conversation = keyRun.contextSnapshot?.conversationMode === true;
-        _res.status(403).json({
-          error: conversation
-            ? "This conversation turn was cancelled"
-            : "This run was cancelled",
-          code: conversation
-            ? "conversation_turn_cancelled"
-            : "agent_run_cancelled",
-        });
-        return;
-      }
-    }
-
     req.actor = {
       type: "agent",
       agentId: key.agentId,
@@ -530,7 +489,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         companyId: key.companyId,
         userId: responsibleUserId,
       }),
-      runId: normalizedRunIdHeader ?? undefined,
+      runId: runIdHeader || undefined,
       source: "agent_key",
     };
 

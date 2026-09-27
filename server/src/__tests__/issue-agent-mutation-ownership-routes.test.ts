@@ -1061,22 +1061,6 @@ describe("agent issue mutation checkout ownership", () => {
     );
   });
 
-  it("rejects agent-key issue updates without a run id before they can bypass cancellation revocation", async () => {
-    mockIssueService.getById.mockResolvedValue(
-      makeIssue({ status: "todo", assigneeAgentId: ownerAgentId }),
-    );
-
-    const res = await request(
-      await createApp(peerActor({ runId: undefined })),
-    )
-      .patch(`/api/issues/${issueId}`)
-      .send({ status: "done" });
-
-    expect(res.status, JSON.stringify(res.body)).toBe(401);
-    expect(res.body).toEqual({ error: "Agent run id required" });
-    expect(mockIssueService.update).not.toHaveBeenCalled();
-  });
-
   it("denies cross-company agents before comment authorization is evaluated", async () => {
     const res = await request(await createApp(peerActor({ companyId: "99999999-9999-4999-8999-999999999999" })))
       .post(`/api/issues/${issueId}/comments`)

@@ -2951,7 +2951,7 @@ describe.sequential("issue thread interaction routes", () => {
     expect(mockInteractionService[service as keyof typeof mockInteractionService]).toHaveBeenCalled();
   });
 
-  it("enforces same-run exclusion under not_creator and rejects a missing resolver run id", async () => {
+  it("enforces same-run exclusion under not_creator and requires a resolver run id", async () => {
     mockInteractionService.getForIssue.mockResolvedValueOnce({
       id: "interaction-2",
       kind: "ask_user_questions",
@@ -2984,9 +2984,7 @@ describe.sequential("issue thread interaction routes", () => {
       .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-2/respond")
       .send({ answers: [] });
     expect(missingRun.status).toBe(422);
-    expect(missingRun.body).toMatchObject({
-      code: "interaction_run_attribution_required",
-    });
+    expect(missingRun.body).toMatchObject({ code: "interaction_run_attribution_required" });
   });
 
   it("rejects an invalid run attribution before resolving or waking", async () => {

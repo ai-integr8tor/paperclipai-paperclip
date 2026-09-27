@@ -514,48 +514,6 @@ describe("agent auth middleware", () => {
     });
   });
 
-  it("revokes cancelled-run writes authenticated by an agent API key", async () => {
-    const companyId = randomUUID();
-    const agentId = randomUUID();
-    const runId = randomUUID();
-    const token = "pcp_test_cancelled_agent_key";
-    const { db } = createDbState({
-      agent: { id: agentId, companyId },
-      agentKey: {
-        id: randomUUID(),
-        agentId,
-        companyId,
-        keyHash: hashToken(token),
-        responsibleUserId: "user-key",
-      },
-      run: { id: runId, companyId, agentId, status: "cancelled" },
-    });
-    const client = createApp(db);
-    const endpoint = `/companies/${companyId}/issues/${randomUUID()}`;
-
-    const write = await request(client)
-      .patch(endpoint)
-      .set("Authorization", `Bearer ${token}`)
-      .set("X-Paperclip-Run-Id", runId)
-      .send({ status: "done" });
-
-    expect(write.status).toBe(403);
-    expect(write.body.code).toBe("agent_run_cancelled");
-
-    const read = await request(client)
-      .get("/actor")
-      .set("Authorization", `Bearer ${token}`)
-      .set("X-Paperclip-Run-Id", runId);
-    expect(read.status).toBe(200);
-    expect(read.body).toMatchObject({
-      type: "agent",
-      agentId,
-      companyId,
-      runId,
-      source: "agent_key",
-    });
-  });
-
   it("rejects agent keys that lack a responsible user binding and audits the denial", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

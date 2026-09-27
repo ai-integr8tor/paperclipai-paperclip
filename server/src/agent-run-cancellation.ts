@@ -1,6 +1,6 @@
 import { and, eq } from "drizzle-orm";
 import { heartbeatRuns, type Db } from "@paperclipai/db";
-import { forbidden, unauthorized } from "./errors.js";
+import { forbidden } from "./errors.js";
 
 /** Stop revokes write authority before waiting for the executor to settle. */
 export function agentRunWritesRevoked(run: {
@@ -18,21 +18,11 @@ export async function assertAgentRunWriteAllowed(tx: Db, companyId: string, acto
   runId?: string | null;
   stopId?: string | null;
 }) {
-  if (!actor.agentId) return;
-  if (!actor.runId) {
-    throw unauthorized("Agent run id required", {
-      code: "agent_run_id_required",
-    });
-  }
+  if (!actor.agentId || !actor.runId) return;
   const [run] = await tx.select({ status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson })
     .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, actor.runId),
       eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, actor.agentId)))
     .for("share");
-  if (!run) {
-    throw unauthorized("Agent run context is invalid", {
-      code: "agent_run_context_invalid",
-    });
-  }
   const stoppedForThisMutation = run?.status === "cancelled" && actor.stopId &&
     run.resultJson?.issueMutationStopId === actor.stopId;
   if (agentRunWritesRevoked(run) && !stoppedForThisMutation) {

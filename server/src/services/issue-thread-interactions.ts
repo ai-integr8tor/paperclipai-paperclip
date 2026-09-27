@@ -143,7 +143,7 @@ type InteractionActor = {
 };
 
 async function assertInteractionRunWriteAllowed(tx: Db, issue: { id: string; companyId: string }, actor: InteractionActor) {
-  if (!actor.agentId) return;
+  if (!actor.agentId || !actor.runId) return;
   // Keep the same issue -> run lock order as task mutation and checkout.
   await tx.select({ id: issues.id }).from(issues)
     .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("update");

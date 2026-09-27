@@ -11002,7 +11002,7 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
-        if (actorAgentId) {
+        if (actorAgentId && actorRunId) {
           // Recheck under a run lock: a request admitted before Stop must not
           // commit a late Done after cancellation revoked its credentials.
           await assertAgentRunWriteAllowed(tx, receiptExisting.companyId, {
