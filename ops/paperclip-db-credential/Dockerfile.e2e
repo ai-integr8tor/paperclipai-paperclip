@@ -1,0 +1,7 @@
+FROM postgres:16
+
+# The production Python job entrypoints and pg-client require python3. Keep
+# this dependency in the disposable smoke image, never on the live host.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 \
+    && rm -rf /var/lib/apt/lists/*

@@ -71,6 +71,7 @@ import {
   resolveLegacyPaperclipDesiredSkillNames,
   removeMaintainerOnlySkillSymlinks,
   rewriteWorkspaceCwdEnvVarsForExecution,
+  sanitizeInheritedPaperclipEnv,
   shapePaperclipWorkspaceEnvForExecution,
   type PaperclipSkillEntry,
 } from "@paperclipai/adapter-utils/server-utils";
@@ -2624,7 +2625,7 @@ function resolveRuntimeEnv(
     platform?: typeof process.platform;
   },
 ): Record<string, string> {
-  const inheritedEnv = options.inheritedEnv ?? process.env;
+  const inheritedEnv = sanitizeInheritedPaperclipEnv(options.inheritedEnv ?? process.env);
   const projectedHostEnv = projectAcpxInheritedHostEnvironment(
     inheritedEnv,
     acpxAgent,
@@ -2638,6 +2639,9 @@ function resolveRuntimeEnv(
     env,
     (options.platform ?? process.platform) === "win32",
   );
+  // Never export the control-plane credential path to an agent, even if a
+  // future launch contribution accidentally supplies it explicitly.
+  delete mergedEnv.PAPERCLIP_DATABASE_URL_FILE;
   const finalEnv = Object.fromEntries(
     Object.entries(mergedEnv).filter(
       (entry): entry is [string, string] => typeof entry[1] === "string",
