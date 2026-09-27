@@ -27,6 +27,23 @@ describe("execution grant approval payloads", () => {
     expect(resubmitApprovalSchema.safeParse({ payload: board.payload }).success).toBe(true);
   });
 
+  it("accepts safe adapter and runtime settings with managed secret references", () => {
+    const safeRequest = { ...request, requestBody: {
+      adapterConfig: { engine: "cli", env: { OPENAI_API_KEY: {
+        type: "secret_ref", secretId: "33333333-3333-4333-8333-333333333333",
+      } } },
+      runtimeConfig: { aiConnection: {
+        mode: "responsible_user", provider: "openai", method: "subscription",
+      } },
+    } };
+    const details = executionGrantApprovalDetails(safeRequest);
+    expect(requestConfirmationPayloadSchema.safeParse({ ...interaction,
+      executionGrant: safeRequest, detailsMarkdown: details }).success).toBe(true);
+    expect(createApprovalSchema.safeParse({ ...board, payload: {
+      executionGrant: safeRequest, detailsMarkdown: details,
+    } }).success).toBe(true);
+  });
+
   it.each([
     ["interaction", (payload: unknown) => requestConfirmationPayloadSchema.safeParse(payload).success,
       (executionGrant: unknown, details: string) => ({ ...interaction, executionGrant, detailsMarkdown: details })],
@@ -39,5 +56,11 @@ describe("execution grant approval payloads", () => {
       .toBe(false);
     expect(parse(wrap({ ...request, hiddenSecret: "secret" }, detailsMarkdown))).toBe(false);
     expect(parse(wrap({ ...request, requestBody: { name: "Changed" } }, detailsMarkdown))).toBe(false);
+    expect(parse(wrap({ ...request, requestBody: { adapterConfig: {
+      env: { OPENAI_API_KEY: "plaintext-secret" },
+    } } }, detailsMarkdown))).toBe(false);
+    expect(parse(wrap({ ...request, requestBody: { runtimeConfig: {
+      debug: { providerTrace: "raw" },
+    } } }, detailsMarkdown))).toBe(false);
   });
 });

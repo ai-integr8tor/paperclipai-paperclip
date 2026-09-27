@@ -324,6 +324,37 @@ describeDb("execution grants", () => {
       .toBe(fixture.body.name);
   });
 
+  it("applies a safe adapter configuration change once through the agent API", async () => {
+    const fixture = await seed();
+    const body = { adapterConfig: { engine: "cli" } };
+    const executionGrant = { ...fixture.payload.executionGrant, requestBody: body,
+      requestHash: executionGrantRequestHash("PATCH", `/api/agents/${fixture.targetAgentId}`,
+        body, fixture.payload.executionGrant.targetUpdatedAt),
+    };
+    await db.update(issueThreadInteractions).set({ payload: {
+      ...fixture.payload, executionGrant,
+      detailsMarkdown: executionGrantApprovalDetails(executionGrant),
+    } }).where(eq(issueThreadInteractions.id, fixture.decisionId));
+    const grant = await issueExecutionGrant({
+      db, companyId: fixture.companyId, issueId: fixture.issueId,
+      decisionKind: "agent", decisionId: fixture.decisionId,
+      executorAgentId: fixture.executorAgentId,
+    });
+    const actor: Express.Request["actor"] = {
+      type: "agent", companyId: fixture.companyId, agentId: fixture.executorAgentId,
+      runId: fixture.executorRunId, source: "agent_jwt",
+    };
+    const app = appAs(actor);
+    const path = `/api/agents/${fixture.targetAgentId}`;
+    const response = await request(app).patch(path)
+      .set("X-Paperclip-Execution-Grant", grant!.id).send(body);
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect((await db.select().from(agents).where(eq(agents.id, fixture.targetAgentId)))[0]
+      .adapterConfig).toMatchObject({ engine: "cli" });
+    await request(app).patch(path)
+      .set("X-Paperclip-Execution-Grant", grant!.id).send(body).expect(403);
+  });
+
   it("rejects issuance and consumption after the executor run completes", async () => {
     const fixture = await seed();
     const actor: Express.Request["actor"] = {

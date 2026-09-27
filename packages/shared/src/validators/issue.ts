@@ -1,5 +1,7 @@
 import { z } from "zod";
 import { executionGrantApprovalDetails } from "../execution-grant-details.js";
+import { aiConnectionBindingSchema } from "../ai-connections.js";
+import { envBindingSecretRefSchema } from "./secret.js";
 import {
   ISSUE_EXECUTION_DECISION_OUTCOMES,
   ISSUE_EXECUTION_MONITOR_CLEAR_REASONS,
@@ -1508,8 +1510,33 @@ export const requestConfirmationSecretProposalPayloadSchema = z.object({
 
 const executionGrantDisplaySafeFields = new Set([
   "name", "role", "title", "icon", "reportsTo", "capabilities",
-  "adapterType", "defaultEnvironmentId", "budgetMonthlyCents",
+  "adapterType", "adapterConfig", "runtimeConfig", "defaultEnvironmentId", "budgetMonthlyCents",
 ]);
+
+// Decisions are readable on the issue. Keep plaintext credentials and arbitrary
+// adapter/runtime fields out of both the stored request and the displayed diff.
+const executionGrantSafeAdapterConfigSchema = z.strictObject({
+  engine: z.enum(["auto", "cli", "acp"]).optional(),
+  mode: z.enum(["persistent", "oneshot"]).optional(),
+  nonInteractivePermissions: z.enum(["deny", "fail"]).optional(),
+  model: z.string().optional(),
+  provider: z.string().optional(),
+  acpxAgent: z.string().optional(),
+  env: z.record(z.string(), envBindingSecretRefSchema.strict()).optional(),
+});
+const executionGrantSafeRuntimeConfigSchema = z.strictObject({
+  aiConnection: aiConnectionBindingSchema.optional(),
+});
+
+function isDisplaySafeGrantBody(body: Record<string, unknown>): boolean {
+  if (Object.keys(body).length === 0 ||
+      !Object.keys(body).every((key) => executionGrantDisplaySafeFields.has(key))) return false;
+  if (body.adapterConfig !== undefined &&
+      !executionGrantSafeAdapterConfigSchema.safeParse(body.adapterConfig).success) return false;
+  if (body.runtimeConfig !== undefined &&
+      !executionGrantSafeRuntimeConfigSchema.safeParse(body.runtimeConfig).success) return false;
+  return true;
+}
 
 export const executionGrantRequestPayloadSchema = z.strictObject({
   version: z.literal(1),
@@ -1518,11 +1545,8 @@ export const executionGrantRequestPayloadSchema = z.strictObject({
   operation: z.literal("agent_config:update"),
   targetRevisionId: z.string().guid().nullable(),
   targetUpdatedAt: z.string().datetime({ offset: true }),
-  requestBody: z.record(z.string(), z.unknown()).refine(
-    (body) => Object.keys(body).length > 0 &&
-      Object.keys(body).every((key) => executionGrantDisplaySafeFields.has(key)),
-    "Execution grants only support display-safe agent configuration fields",
-  ),
+  requestBody: z.record(z.string(), z.unknown()).refine(isDisplaySafeGrantBody,
+    "Execution grants only support display-safe agent configuration fields and managed secret references"),
   requestHash: z.string().regex(/^[a-f0-9]{64}$/),
   expiresAt: z.string().datetime({ offset: true }),
   policyVersion: z.number().int().positive(),
