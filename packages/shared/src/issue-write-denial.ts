@@ -281,8 +281,9 @@ export function describeIssueWriteDenial(
         whoCanAct:
           `${actor} from inside its own current run.`,
         sanctionedPath:
-          `Check out the issue you intend to write to in this run (or continue on the run ` +
-          `that already holds it), then retry — do not resend an unchanged run id.`,
+          `Start or continue a current run of your own, have it hold the issue you intend to ` +
+          `write to, and send that run's id. A run id that is not a live run of yours cannot be ` +
+          `repaired by retrying it, so do not resend this one.`,
       };
 
     case "issue_write_attribution_spoof_rejected":
