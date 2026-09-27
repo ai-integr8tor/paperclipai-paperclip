@@ -7,6 +7,7 @@ export const companies = pgTable(
     name: text("name").notNull(),
     description: text("description"),
     status: text("status").notNull().default("active"),
+    operatorVisible: boolean("operator_visible").notNull().default(true),
     pauseReason: text("pause_reason"),
     pausedAt: timestamp("paused_at", { withTimezone: true }),
     issuePrefix: text("issue_prefix").notNull().default("PAP"),
