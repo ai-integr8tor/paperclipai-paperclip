@@ -1,5 +1,5 @@
 import { execFile as execFileCallback } from "node:child_process";
-import { lstat, mkdir, mkdtemp, readFile, readlink, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readlink, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -158,16 +158,32 @@ describe("git workspace sync", () => {
       names.map((name) => `storybook-output/${name}`).sort((left, right) => left.localeCompare(right)),
     );
 
-    // The larger allowance must still fail closed on an oversized snapshot.
+    // A larger tree exceeds the old 8 MiB bound but fits the new 32 MiB bound.
     for (let start = 5_000; start < 40_000; start += 100) {
       await Promise.all(Array.from({ length: 100 }, (_, index) => writeFile(
         path.join(generatedDir, `${"asset-".repeat(36)}${start + index}.js`), "",
       )));
     }
+    const largerRaw = await runLocalGit(repo, ["ls-files", "--others", "--exclude-standard", "-z"], {
+      maxBuffer: 32 * 1024 * 1024,
+    });
+    expect(Buffer.byteLength(largerRaw.stdout)).toBeGreaterThan(8 * 1024 * 1024);
+    const largerSnapshot = await readGitWorkspaceSnapshot(repo);
+    expect(largerSnapshot?.overlayPaths).toEqual(
+      largerRaw.stdout.split("\0").filter(Boolean).sort((left, right) => left.localeCompare(right)),
+    );
+
+    // Reuse the files with longer parent paths to exceed 32 MiB without
+    // creating hundreds of thousands of files solely to test the bound.
+    const deepParent = path.join(repo, ...Array.from({ length: 4 }, () => "nested-".repeat(30)));
+    await mkdir(deepParent, { recursive: true });
+    await rename(generatedDir, path.join(deepParent, "storybook-output"));
+    expect(Buffer.byteLength(largerRaw.stdout) + 40_000 * (path.relative(repo, deepParent).length + 1))
+      .toBeGreaterThan(32 * 1024 * 1024);
     await expect(readGitWorkspaceSnapshot(repo)).rejects.toMatchObject({
       code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
     });
-  }, 30_000);
+  }, 60_000);
 
   async function createRepo(rootDir: string): Promise<string> {
     const repo = path.join(rootDir, "repo");

@@ -206,7 +206,7 @@ export async function readGitWorkspaceSnapshot(localDir: string, includeReposito
     // collapsing directories would let later files enter the staging copy.
     runExpensiveWorkspaceGit(localDir, ["ls-files", "--others", "--exclude-standard", "-z"], "adapter_sync.untracked_files", {
       timeout: 10_000,
-      maxBuffer: 8 * 1024 * 1024,
+      maxBuffer: 32 * 1024 * 1024,
     }),
     runExpensiveWorkspaceGit(localDir, ["diff", "--name-only", "-z", "--diff-filter=D", "HEAD", "--"], "adapter_sync.deleted_files", {
       timeout: 10_000,
