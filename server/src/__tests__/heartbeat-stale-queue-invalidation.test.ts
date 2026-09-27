@@ -116,7 +116,10 @@ async function cleanupHeartbeatInvalidationFixture(db: ReturnType<typeof createD
       const isLateCommentRace =
         error instanceof Error &&
         error.message.includes("issue_comments_issue_id_issues_id_fk");
-      const isDeadlock = (error as { code?: string } | null)?.code === "40P01";
+      const deadlockCode =
+        (error as { code?: string } | null)?.code ??
+        (error as { cause?: { code?: string } } | null)?.cause?.code;
+      const isDeadlock = deadlockCode === "40P01";
       if ((!isLateCommentRace && !isDeadlock) || attempt === 9) {
         throw error;
       }
