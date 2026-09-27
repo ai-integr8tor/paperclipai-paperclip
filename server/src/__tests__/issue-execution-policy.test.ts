@@ -2191,4 +2191,15 @@ describe("stripMonitorFromExecutionPolicy", () => {
     });
     expect(result).toMatchObject({ stages: [], authorizationPolicy: { trustPreset: "low_trust_review" } });
   });
+
+  it("keeps a stages-less policy that still carries a review-round limit", () => {
+    const result = stripMonitorFromExecutionPolicy({
+      mode: "normal",
+      commentRequired: true,
+      stages: [],
+      monitor,
+      maxReviewRounds: 3,
+    });
+    expect(result).toMatchObject({ stages: [], maxReviewRounds: 3 });
+  });
 });

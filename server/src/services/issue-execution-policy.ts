@@ -332,11 +332,19 @@ export function stripMonitorFromExecutionPolicy(policy: IssueExecutionPolicy | n
   // the trust boundary on every fire.
   const { monitor: _monitor, ...rest } = policy;
 
-  // A policy with nothing left but defaults is no policy. This mirrors the
-  // emptiness rule in normalizeIssueExecutionPolicy: a reviewPreset or an
-  // authorizationPolicy keeps a stages-less policy meaningful, so neither may
-  // be discarded along with the monitor.
-  if (rest.stages.length === 0 && !rest.reviewPreset && !rest.authorizationPolicy) {
+  // A policy with nothing left but defaults is no policy. Like
+  // normalizeIssueExecutionPolicy, a reviewPreset or an authorizationPolicy
+  // keeps a stages-less policy meaningful. Unlike that function, this one also
+  // counts a maxReviewRounds: normalize only guards creation and never sees
+  // that field without a monitor, while this function guards retention and must
+  // not discard a configured value. mode and commentRequired are defaults, so
+  // they never keep a policy alive on their own.
+  if (
+    rest.stages.length === 0 &&
+    !rest.reviewPreset &&
+    !rest.authorizationPolicy &&
+    rest.maxReviewRounds == null
+  ) {
     return null;
   }
 
