@@ -82,6 +82,27 @@ export function executionGrantRoutes(db: Db) {
       executorAgentId: req.actor.agentId,
     });
     if (!grant) throw forbidden("Execution grant could not be issued");
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
+      action: "execution_grant.issued",
+      entityType: "execution_grant",
+      entityId: grant.id,
+      issueId: req.params.id as string,
+      details: {
+        decisionKind: grant.decisionKind,
+        decisionId: grant.decisionId,
+        executorAgentId: grant.executorAgentId,
+        targetAgentId: grant.targetAgentId,
+        operation: grant.operation,
+        policyVersion: grant.policyVersion,
+      },
+    });
     res.status(201).json(grant);
   });
 

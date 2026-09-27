@@ -5461,7 +5461,10 @@ export function agentRoutes(
       action: "agent.updated",
       entityType: "agent",
       entityId: agent.id,
-      details: summarizeAgentUpdateDetails(patchData),
+      details: {
+        ...summarizeAgentUpdateDetails(patchData),
+        ...(executionGrantId ? { executionGrantId } : {}),
+      },
     });
 
     res.json(redactAgentRowForResponse(agent));
