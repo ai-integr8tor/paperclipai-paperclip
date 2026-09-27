@@ -1353,11 +1353,19 @@ describe("resolveClaudeAcpBillingIdentity", () => {
     delete process.env.ANTHROPIC_API_KEY;
     delete process.env.CLAUDE_CODE_USE_BEDROCK;
     delete process.env.ANTHROPIC_BEDROCK_BASE_URL;
-    expect(await resolveClaudeAcpBillingIdentity({ config: {} })).toEqual({
-      provider: "anthropic",
-      biller: "anthropic",
-      billingType: "subscription",
-    });
+    // Isolate CLAUDE_CONFIG_DIR so this does not fall through to a real
+    // ~/.claude/settings.json apiKeyHelper on the host running the test.
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-acp-no-helper-"));
+    process.env.CLAUDE_CONFIG_DIR = root;
+    try {
+      expect(await resolveClaudeAcpBillingIdentity({ config: {} })).toEqual({
+        provider: "anthropic",
+        biller: "anthropic",
+        billingType: "subscription",
+      });
+    } finally {
+      await fs.rm(root, { recursive: true, force: true }).catch(() => undefined);
+    }
   });
 
   it("ignores host env for remote execution targets", async () => {
