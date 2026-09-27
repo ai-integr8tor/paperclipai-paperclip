@@ -331,6 +331,8 @@ describe("local process sandbox", () => {
           method: "GET",
           scheme: "http",
           hostnameSanitized: false,
+          portSanitized: false,
+          methodSanitized: false,
           tunnelId: null,
         },
         {
@@ -342,6 +344,8 @@ describe("local process sandbox", () => {
           method: "GET",
           scheme: "http",
           hostnameSanitized: false,
+          portSanitized: false,
+          methodSanitized: false,
           tunnelId: null,
         },
         {
@@ -353,6 +357,8 @@ describe("local process sandbox", () => {
           method: "CONNECT",
           scheme: null,
           hostnameSanitized: false,
+          portSanitized: false,
+          methodSanitized: false,
           tunnelId: null,
         },
       ]);
@@ -649,7 +655,13 @@ describe("local process sandbox", () => {
       expect(tunnels[0].bytesOut).toBeGreaterThan(0);
       expect(tunnels[0].bytesIn).toBeGreaterThan(0);
       expect(tunnels[0].durationMs).toBeGreaterThanOrEqual(0);
-      expect(tunnels[0]).toMatchObject({ hostname: "127.0.0.1", port: String(address.port) });
+      expect(tunnels[0]).toMatchObject({
+        hostname: "127.0.0.1",
+        port: String(address.port),
+        portSanitized: false,
+        // The client closed this one, so the flag distinguishes it from a tunnel teardown had to flush.
+        closedAtTeardown: false,
+      });
       // Without the shared tunnelId the byte totals cannot be attributed to a hostname decision.
       expect(tunnels[0].tunnelId).toBe(decisionEvents(events)[0].tunnelId);
       // Payload bytes are counted, never recorded.
@@ -834,6 +846,218 @@ describe("local process sandbox", () => {
       denyCount: 0,
       sinkErrorCount: 0,
     }]);
+  });
+
+  it.runIf(process.platform === "linux")("counts a rejected asynchronous sink write in the teardown tally", async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-network-async-sink-"));
+    cleanup.push(workspace);
+    const server = http.createServer((_request, response) => response.end("allowed-response"));
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Expected TCP test server address.");
+    const events: SandboxNetworkEvent[] = [];
+    const target = await buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath,
+      args: ["-e", "process.exit(0)"],
+      cwd: workspace,
+      options: {
+        workspaceDir: workspace,
+        networkScope: "allowlist",
+        networkAllowlist: [`127.0.0.1:${address.port}`],
+        // The shape a real observer has: it writes to a host sink and returns a promise. A
+        // synchronous throw — the only failure the sink used to count — is a shape production cannot
+        // produce, so a persistently broken sink reported sinkErrorCount: 0, which a reviewer reads
+        // as an affirmative "the sink was healthy".
+        onNetworkDecision: (event) => {
+          events.push(event);
+          return Promise.reject(new Error("run-event sink down"));
+        },
+      },
+    });
+    const socketPath = proxySocketPath(target.args);
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const outgoing = http.request(
+          { socketPath, path: `http://127.0.0.1:${address.port}/canary`, headers: { host: `127.0.0.1:${address.port}` } },
+          (response) => {
+            response.resume();
+            response.on("end", () => resolve());
+          },
+        );
+        outgoing.on("error", reject);
+        outgoing.end();
+      });
+      await connectThroughProxy(socketPath, "denied.example:443");
+    } finally {
+      await target.cleanup?.();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+
+    const stopped = stoppedEvents(events);
+    expect(stopped).toHaveLength(1);
+    // Teardown drains the outstanding writes before reading the counters, so this is the whole tally
+    // and not a timing artefact. Every event but the stopped one itself had failed by then.
+    expect(stopped[0].sinkErrorCount).toBe(events.length - 1);
+    expect(stopped[0].sinkErrorCount).toBeGreaterThanOrEqual(1);
+  });
+
+  it.runIf(process.platform === "linux")("bounds and scrubs an oversized non-numeric CONNECT port", async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-network-port-"));
+    cleanup.push(workspace);
+    const events: SandboxNetworkEvent[] = [];
+    const target = await buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath,
+      args: ["-e", "process.exit(0)"],
+      cwd: workspace,
+      options: {
+        workspaceDir: workspace,
+        networkScope: "allowlist",
+        networkAllowlist: ["api.openai.com"],
+        onNetworkDecision: (event) => events.push(event),
+      },
+    });
+    const socketPath = proxySocketPath(target.args);
+    // Node's request-target limit is maxHeaderSize, 16 KB. Everything after the last colon reaches
+    // the event on the malformed branch, where the numeric test has by definition not passed.
+    const oversizedPort = "n".repeat(4096);
+
+    try {
+      const response = await connectThroughProxy(socketPath, `example.com:${oversizedPort}`);
+      expect(response).toContain("HTTP/1.1 403 Forbidden\r\n");
+      const decisions = decisionEvents(events);
+      expect(decisions).toHaveLength(1);
+      expect(decisions[0]).toMatchObject({
+        decision: "deny",
+        reason: "invalid_connect_target",
+        hostname: "example.com",
+        hostnameSanitized: false,
+        portSanitized: true,
+      });
+      // Bounded and charset-clean: the audit trail must not amplify request bytes at request rate.
+      expect(decisions[0].port).toBe("????????");
+      expect(Buffer.byteLength(decisions[0].port!)).toBeLessThanOrEqual(8);
+      // Still exactly one small, valid JSON object, carrying none of the request bytes.
+      const serialized = JSON.stringify(decisions[0]);
+      expect(JSON.parse(serialized)).toEqual(decisions[0]);
+      expect(serialized.length).toBeLessThan(400);
+      expect(serialized).not.toContain("nnnn");
+    } finally {
+      await target.cleanup?.();
+    }
+  });
+
+  it.runIf(process.platform === "linux")("records an unusual but legal method verbatim without flagging it", async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-network-method-"));
+    cleanup.push(workspace);
+    const events: SandboxNetworkEvent[] = [];
+    const target = await buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath,
+      args: ["-e", "process.exit(0)"],
+      cwd: workspace,
+      options: {
+        workspaceDir: workspace,
+        networkScope: "allowlist",
+        networkAllowlist: ["api.openai.com"],
+        onNetworkDecision: (event) => events.push(event),
+      },
+    });
+    const socketPath = proxySocketPath(target.args);
+
+    try {
+      // `M-SEARCH` is in llhttp's table and contains the one non-alphabetic byte the method scrub
+      // permits, so a scrub tight enough to mangle a legal verb would fail here.
+      await new Promise<void>((resolve, reject) => {
+        const outgoing = http.request(
+          { socketPath, method: "M-SEARCH", path: "http://denied.example/", headers: { host: "denied.example" } },
+          (response) => {
+            response.resume();
+            response.on("end", () => resolve());
+          },
+        );
+        outgoing.on("error", reject);
+        outgoing.end();
+      });
+      expect(decisionEvents(events)[0]).toMatchObject({
+        decision: "deny",
+        method: "M-SEARCH",
+        methodSanitized: false,
+      });
+    } finally {
+      await target.cleanup?.();
+    }
+  });
+
+  it.runIf(process.platform === "linux")("flushes a tunnel still open at teardown before the stopped event", async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-network-teardown-"));
+    cleanup.push(workspace);
+    let sawUpstreamBytes: (() => void) | undefined;
+    const upstreamReceived = new Promise<void>((resolve) => {
+      sawUpstreamBytes = resolve;
+    });
+    // Holds the connection open and never replies: the long-lived tunnel to an allowlisted host that
+    // is still streaming when the run ends is the exact shape the tunnel event was added for.
+    const upstream = net.createServer((socket) => {
+      socket.on("data", () => sawUpstreamBytes?.());
+    });
+    await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+    const address = upstream.address();
+    if (!address || typeof address === "string") throw new Error("Expected TCP upstream address.");
+    const events: SandboxNetworkEvent[] = [];
+    const target = await buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath,
+      args: ["-e", "process.exit(0)"],
+      cwd: workspace,
+      options: {
+        workspaceDir: workspace,
+        networkScope: "allowlist",
+        networkAllowlist: [`127.0.0.1:${address.port}`],
+        onNetworkDecision: (event) => events.push(event),
+      },
+    });
+    const socketPath = proxySocketPath(target.args);
+    const client = net.createConnection(socketPath, () => {
+      client.write(`CONNECT 127.0.0.1:${address.port} HTTP/1.1\r\nHost: 127.0.0.1:${address.port}\r\n\r\n`);
+    });
+    client.on("error", () => {});
+
+    try {
+      client.setEncoding("utf8");
+      await new Promise<void>((resolve, reject) => {
+        client.on("data", (chunk: string) => {
+          if (chunk.includes("200 Connection Established")) {
+            client.write("teardown-client-payload");
+            resolve();
+          }
+        });
+        client.on("error", reject);
+      });
+      await upstreamReceived;
+      // Teardown without the client ever closing its socket. Before the registry, this produced no
+      // tunnel event at all — indistinguishable from "no tunnel was opened".
+      await target.cleanup?.();
+
+      const tunnels = tunnelEvents(events);
+      expect(tunnels).toHaveLength(1);
+      expect(tunnels[0]).toMatchObject({
+        hostname: "127.0.0.1",
+        port: String(address.port),
+        closedAtTeardown: true,
+      });
+      expect(tunnels[0].bytesOut).toBeGreaterThan(0);
+      expect(tunnels[0].tunnelId).toBe(decisionEvents(events)[0].tunnelId);
+      // `proxy.stopped` stays a valid end-of-stream marker: the flush precedes it.
+      const tunnelIndex = events.findIndex((event) => event.event === "sandbox.network.tunnel.closed");
+      const stoppedIndex = events.findIndex((event) => event.event === "sandbox.network.proxy.stopped");
+      expect(tunnelIndex).toBeGreaterThanOrEqual(0);
+      expect(stoppedIndex).toBeGreaterThan(tunnelIndex);
+      // Bytes are counted, never recorded.
+      expect(JSON.stringify(tunnels)).not.toMatch(/teardown-client-payload/);
+    } finally {
+      client.destroy();
+      await target.cleanup?.();
+      await new Promise<void>((resolve) => upstream.close(() => resolve()));
+    }
   });
 
   it("digests the effective ruleset independently of configuration order", async () => {

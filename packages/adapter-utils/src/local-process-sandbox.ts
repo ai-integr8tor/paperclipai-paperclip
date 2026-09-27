@@ -73,6 +73,11 @@ export interface SandboxNetworkDecision extends SandboxNetworkEventEnvelope {
    * that flag is true this is a bounded, charset-scrubbed rendering of that input instead.
    */
   hostname: string | null;
+  /**
+   * Bounded to {@link EVENT_PORT_MAX_BYTES} and scrubbed to digits. A malformed `CONNECT` target
+   * reaches this field having failed the numeric check by definition, so it is arbitrary
+   * request-line bytes until it is bounded here.
+   */
   port: string | null;
   /** Literal "CONNECT" on the tunnel path; the client's method on the plain HTTP path. */
   method: string | null;
@@ -80,6 +85,10 @@ export interface SandboxNetworkDecision extends SandboxNetworkEventEnvelope {
   scheme: string | null;
   /** True when `hostname` was truncated or charset-scrubbed, so a reader never trusts a mangled name. */
   hostnameSanitized: boolean;
+  /** True when `port` was truncated or charset-scrubbed. Only reachable on the malformed branch. */
+  portSanitized: boolean;
+  /** True when `method` was truncated or charset-scrubbed. See the scrub note on {@link describeEventMethod}. */
+  methodSanitized: boolean;
   /** Correlates a CONNECT decision with its `sandbox.network.tunnel.closed` event. Null off that path. */
   tunnelId: string | null;
 }
@@ -136,6 +145,15 @@ export interface SandboxNetworkTunnelClosed extends SandboxNetworkEventEnvelope 
   /** Bytes the upstream returned. */
   bytesIn: number;
   durationMs: number;
+  /** Mirrors the decision event's flag for the same field. A tunnel only opens on a numeric port. */
+  portSanitized: boolean;
+  /**
+   * True when teardown flushed this tunnel because it was still open, rather than the client closing
+   * it. Absence of a `tunnel.closed` has no complement the way a missing `proxy.stopped` does — it
+   * reads as "no tunnel was opened" — so a tunnel held open for the whole run, the exact
+   * exfiltration shape this event exists for, must not vanish at teardown.
+   */
+  closedAtTeardown: boolean;
 }
 
 /** Every event the proxy can emit, all carried on the one observer — no second seam. */
@@ -160,8 +178,14 @@ export interface LocalProcessSandboxOptions {
    * Observer for every egress decision and for proxy/tunnel lifecycle. Runs in the host process,
    * never inside the sandbox. Throwing from it is contained: it cannot change a policy outcome or
    * stop the proxy.
+   *
+   * Returns `unknown` so an async observer can be accounted for. A production observer writes to a
+   * host sink and returns a promise; a `void` contract let the sink only see a *synchronous* throw,
+   * so a persistently failing async write reported `sinkErrorCount: 0` — a gap that affirmatively
+   * reports health. Return the write promise and the sink counts its rejection. The proxy still
+   * never awaits it.
    */
-  onNetworkDecision?: (event: SandboxNetworkEvent) => void;
+  onNetworkDecision?: (event: SandboxNetworkEvent) => unknown;
   command?: string;
 }
 
@@ -182,6 +206,17 @@ interface NetworkAllowlistRule {
 
 interface NetworkAllowlistProxy {
   close: () => Promise<void>;
+}
+
+/** One opened CONNECT tunnel that has not yet been accounted for by a `tunnel.closed` event. */
+interface LiveTunnel {
+  tunnelId: string;
+  /** Null when `net.connect` threw, so the tunnel never had a socket to account for. */
+  upstream: net.Socket | null;
+  openedAt: number;
+  hostname: string | null;
+  port: string | null;
+  portSanitized: boolean;
 }
 
 const SYSTEM_READ_PATHS = [
@@ -319,28 +354,87 @@ function formatNetworkRuleTarget(rule: NetworkAllowlistRule): string {
 const EVENT_HOSTNAME_MAX_BYTES = 253;
 /** `:` is permitted so a valid IPv6 literal is not scrubbed; `%` is not, as downstream readers decode it. */
 const EVENT_HOSTNAME_DISALLOWED = /[^a-z0-9.\-:]/g;
+/**
+ * A legal port is at most five digits. The slack keeps an out-of-range *numeric* target legible
+ * instead of silently truncating it into a different, plausible port.
+ */
+const EVENT_PORT_MAX_BYTES = 8;
+const EVENT_PORT_DISALLOWED = /[^0-9]/g;
+/** Comfortably past the longest verb in llhttp's table (`UNSUBSCRIBE`), short enough to stay a bound. */
+const EVENT_METHOD_MAX_BYTES = 24;
+/** `-` is permitted for `M-SEARCH`. Nothing else: a method is a token, never free text. */
+const EVENT_METHOD_DISALLOWED = /[^A-Za-z-]/g;
+
+interface BoundedEventField {
+  value: string;
+  sanitized: boolean;
+}
+
+/**
+ * Bounds and charset-scrubs one event field. Fixed order — truncate, then scrub — so the result is
+ * deterministic, and the returned flag makes any mutation visible rather than silent. Every field on
+ * an event that originates in the request line goes through this, because the docblock at the top of
+ * this module promises a reviewer can trust every field, and an unbounded one turns the audit trail
+ * into an amplifier for whatever the confined process chose to send.
+ */
+function boundAndScrubEventField(raw: string, maxBytes: number, disallowed: RegExp): BoundedEventField {
+  let value = raw;
+  let sanitized = false;
+  if (Buffer.byteLength(value) > maxBytes) {
+    value = Buffer.from(value).subarray(0, maxBytes).toString("utf8");
+    sanitized = true;
+  }
+  const scrubbed = value.replace(disallowed, "?");
+  if (scrubbed !== value) sanitized = true;
+  return { value: scrubbed, sanitized };
+}
 
 interface EventHostname {
   hostname: string | null;
   hostnameSanitized: boolean;
 }
 
-/**
- * Bounds and scrubs a hostname for the event record. Fixed order — normalize, truncate, scrub — so
- * the result is deterministic, and the flag makes any mutation visible rather than silent.
- */
+/** Normalizes with the policy helper first, so an unsanitized hostname is byte-equal to the compared one. */
 function describeEventHostname(rawHostname: string | null): EventHostname {
   if (!rawHostname) return { hostname: null, hostnameSanitized: false };
-  const normalized = normalizeNetworkHostname(rawHostname);
-  let value = normalized;
-  let hostnameSanitized = false;
-  if (Buffer.byteLength(value) > EVENT_HOSTNAME_MAX_BYTES) {
-    value = Buffer.from(value).subarray(0, EVENT_HOSTNAME_MAX_BYTES).toString("utf8");
-    hostnameSanitized = true;
-  }
-  const scrubbed = value.replace(EVENT_HOSTNAME_DISALLOWED, "?");
-  if (scrubbed !== value) hostnameSanitized = true;
-  return { hostname: scrubbed, hostnameSanitized };
+  const bounded = boundAndScrubEventField(
+    normalizeNetworkHostname(rawHostname),
+    EVENT_HOSTNAME_MAX_BYTES,
+    EVENT_HOSTNAME_DISALLOWED,
+  );
+  return { hostname: bounded.value, hostnameSanitized: bounded.sanitized };
+}
+
+interface EventPort {
+  port: string | null;
+  portSanitized: boolean;
+}
+
+/**
+ * The malformed-`CONNECT` branch reaches this having failed `/^\d+$/` by definition, so `port` there
+ * is up to `maxHeaderSize` (16 KB) of attacker-chosen request-line bytes at request rate.
+ */
+function describeEventPort(rawPort: string | null): EventPort {
+  if (!rawPort) return { port: null, portSanitized: false };
+  const bounded = boundAndScrubEventField(rawPort, EVENT_PORT_MAX_BYTES, EVENT_PORT_DISALLOWED);
+  return { port: bounded.value, portSanitized: bounded.sanitized };
+}
+
+interface EventMethod {
+  method: string | null;
+  methodSanitized: boolean;
+}
+
+/**
+ * Scrubbed rather than trusted. Today llhttp rejects any method outside its fixed table before the
+ * request handler runs, so this is a no-op — but that safety is a property of a dependency's default
+ * configuration, and enabling `insecureHTTPParser` anywhere upstream would silently turn `method`
+ * into free text on a security record. Bounding it here makes the guarantee local.
+ */
+function describeEventMethod(rawMethod: string | null): EventMethod {
+  if (!rawMethod) return { method: null, methodSanitized: false };
+  const bounded = boundAndScrubEventField(rawMethod, EVENT_METHOD_MAX_BYTES, EVENT_METHOD_DISALLOWED);
+  return { method: bounded.value, methodSanitized: bounded.sanitized };
 }
 
 /** Sorted, or the digest is not comparable between two runs holding the same effective ruleset. */
@@ -413,6 +507,24 @@ type SandboxNetworkEventInput = SandboxNetworkEvent extends infer Event
 interface SandboxNetworkEventSink {
   emit: (event: SandboxNetworkEventInput) => void;
   counters: () => { allowCount: number; denyCount: number; sinkErrorCount: number };
+  /**
+   * Settles once every observer write issued so far has settled, or once the budget expires.
+   * Teardown calls this before reading the counters, so `sinkErrorCount` is the real tally rather
+   * than whatever had happened to resolve by then.
+   */
+  drain: () => Promise<void>;
+}
+
+/**
+ * Teardown waits this long for outstanding observer writes. A hung sink must delay the run's exit,
+ * not hold it open: it is an observability dependency and never a gate on the sandbox shutting down.
+ */
+const SINK_DRAIN_TIMEOUT_MS = 1_000;
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+  return (
+    (typeof value === "object" && value !== null) || typeof value === "function"
+  ) && typeof (value as PromiseLike<unknown>).then === "function";
 }
 
 let emitterVersion: string | null | undefined;
@@ -448,11 +560,12 @@ function readEmitterVersion(): string | null {
  * counted instead and reported once at teardown, because the sink is the only transport available.
  */
 function createNetworkEventSink(
-  onNetworkDecision: ((event: SandboxNetworkEvent) => void) | undefined,
+  onNetworkDecision: ((event: SandboxNetworkEvent) => unknown) | undefined,
 ): SandboxNetworkEventSink {
   let allowCount = 0;
   let denyCount = 0;
   let sinkErrorCount = 0;
+  const inflight = new Set<Promise<void>>();
   return {
     emit: (event) => {
       if (event.event === "sandbox.network.decision") {
@@ -460,10 +573,11 @@ function createNetworkEventSink(
         else denyCount += 1;
       }
       if (!onNetworkDecision) return;
+      let result: unknown;
       try {
         // Envelope is stamped here and only here. An emit site cannot forget the version, and a
         // future event kind gets it by construction rather than by review.
-        onNetworkDecision({
+        result = onNetworkDecision({
           ts: new Date().toISOString(),
           schemaVersion: SANDBOX_NETWORK_EVENT_SCHEMA_VERSION,
           ...event,
@@ -471,9 +585,37 @@ function createNetworkEventSink(
       } catch {
         // Intentionally swallowed: see the doc comment above.
         sinkErrorCount += 1;
+        return;
       }
+      if (!isPromiseLike(result)) return;
+      // The observer writes asynchronously, so its failure arrives as a rejection rather than a
+      // throw. The sink attaches the handler itself: that is what keeps a failed observability
+      // write from becoming an unhandled rejection *and* makes it countable, which the observer
+      // swallowing its own rejection never could.
+      const settled = Promise.resolve(result).then(
+        () => undefined,
+        () => {
+          sinkErrorCount += 1;
+        },
+      );
+      inflight.add(settled);
+      void settled.then(() => {
+        inflight.delete(settled);
+      });
     },
     counters: () => ({ allowCount, denyCount, sinkErrorCount }),
+    drain: async () => {
+      const outstanding = Array.from(inflight);
+      if (outstanding.length === 0) return;
+      let timer: NodeJS.Timeout | undefined;
+      const budget = new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, SINK_DRAIN_TIMEOUT_MS);
+        timer.unref();
+      });
+      // `settled` never rejects, so this races completion against the budget and nothing else.
+      await Promise.race([Promise.all(outstanding).then(() => undefined), budget]);
+      if (timer) clearTimeout(timer);
+    },
   };
 }
 
@@ -501,7 +643,7 @@ async function startNetworkAllowlistProxy(
   allowlist: string[],
   trustedUrls: string[],
   socketPath: string,
-  onNetworkDecision?: (event: SandboxNetworkEvent) => void,
+  onNetworkDecision?: (event: SandboxNetworkEvent) => unknown,
 ): Promise<NetworkAllowlistProxy> {
   assertUnixSocketPathLength(socketPath);
   const sink = createNetworkEventSink(onNetworkDecision);
@@ -515,7 +657,7 @@ async function startNetworkAllowlistProxy(
     );
   }
   const server = http.createServer((request, response) => {
-    const method = request.method ?? null;
+    const { method, methodSanitized } = describeEventMethod(request.method ?? null);
     let target: URL;
     try {
       target = new URL(request.url ?? "");
@@ -529,13 +671,18 @@ async function startNetworkAllowlistProxy(
         method,
         scheme: null,
         hostnameSanitized: false,
+        portSanitized: false,
+        methodSanitized,
         tunnelId: null,
       });
       writeProxyError(response, 400, "invalid_request_url", "Paperclip sandbox proxy requires an absolute request URL.");
       return;
     }
-    const port = target.port || (target.protocol === "https:" ? "443" : "80");
+    const targetPort = target.port || (target.protocol === "https:" ? "443" : "80");
     const { hostname, hostnameSanitized } = describeEventHostname(target.hostname);
+    // WHATWG URL already guarantees a numeric port here; routed through the same helper so the
+    // event record has exactly one bounding path rather than a trusted branch and an untrusted one.
+    const { port, portSanitized } = describeEventPort(targetPort);
     const scheme = target.protocol.replace(/:$/, "");
     if (target.protocol !== "http:") {
       sink.emit({
@@ -547,12 +694,14 @@ async function startNetworkAllowlistProxy(
         method,
         scheme,
         hostnameSanitized,
+        portSanitized,
+        methodSanitized,
         tunnelId: null,
       });
       writeProxyError(response, 400, "https_requires_connect", "HTTPS targets must use CONNECT through the Paperclip sandbox proxy.");
       return;
     }
-    const matchedRule = matchNetworkTarget(target.hostname, port, rules);
+    const matchedRule = matchNetworkTarget(target.hostname, targetPort, rules);
     if (!matchedRule) {
       sink.emit({
         event: "sandbox.network.decision",
@@ -563,6 +712,8 @@ async function startNetworkAllowlistProxy(
         method,
         scheme,
         hostnameSanitized,
+        portSanitized,
+        methodSanitized,
         tunnelId: null,
       });
       writeProxyError(response, 403, "network_target_denied", "Network target denied by Paperclip sandbox policy.");
@@ -577,6 +728,8 @@ async function startNetworkAllowlistProxy(
       method,
       scheme,
       hostnameSanitized,
+      portSanitized,
+      methodSanitized,
       tunnelId: null,
     });
     const upstream = http.request(target, {
@@ -589,18 +742,51 @@ async function startNetworkAllowlistProxy(
     upstream.on("error", (error) => response.destroy(error));
     request.pipe(upstream);
   });
+  /**
+   * Tunnels that have been opened and not yet accounted for. Teardown reads this to close the record
+   * for a tunnel the client never closed; without it, exactly that tunnel left no event at all.
+   */
+  const liveTunnels = new Map<string, LiveTunnel>();
+  /**
+   * The only place `tunnel.closed` is emitted, and idempotent by construction: removal from the
+   * registry is the claim on the event, so the teardown flush and the socket-close handler racing
+   * each other still produce exactly one event rather than two or none.
+   */
+  const closeTunnel = (tunnelId: string, closedAtTeardown: boolean): void => {
+    const tunnel = liveTunnels.get(tunnelId);
+    if (!tunnel || !liveTunnels.delete(tunnelId)) return;
+    // Counters come off the socket rather than a transform in the pipe path: Node maintains both
+    // natively, so byte accounting costs nothing on the path carrying all confined egress. Read
+    // before the destroy — and, at teardown, before the client sockets are destroyed — or the
+    // accounting for the tunnel that mattered most is the accounting that is lost.
+    const bytesOut = tunnel.upstream?.bytesWritten ?? 0;
+    const bytesIn = tunnel.upstream?.bytesRead ?? 0;
+    tunnel.upstream?.destroy();
+    sink.emit({
+      event: "sandbox.network.tunnel.closed",
+      tunnelId: tunnel.tunnelId,
+      hostname: tunnel.hostname,
+      port: tunnel.port,
+      portSanitized: tunnel.portSanitized,
+      bytesOut,
+      bytesIn,
+      durationMs: Date.now() - tunnel.openedAt,
+      closedAtTeardown,
+    });
+  };
   server.on("connect", (request, clientSocket, head) => {
     const separator = request.url?.lastIndexOf(":") ?? -1;
     const hostname = separator > 0 ? normalizeNetworkHostname(request.url!.slice(0, separator)) : "";
     const port = separator > 0 ? request.url!.slice(separator + 1) : "443";
     // The proxy tunnels CONNECT opaquely, so the method is always the literal verb and the scheme is
-    // unknowable. Neither is ever inferred.
+    // unknowable. Neither is ever inferred, so neither can have been sanitized.
     const connectEvent = {
       event: "sandbox.network.decision",
       method: "CONNECT",
+      methodSanitized: false,
       scheme: null,
       ...describeEventHostname(hostname),
-      port: port || null,
+      ...describeEventPort(port || null),
     } as const;
     // A hostname-only allowlist entry leaves the port unconstrained, so policy cannot reject an
     // out-of-range one — this test is the only thing between the request line and net.connect, which
@@ -634,7 +820,16 @@ async function startNetworkAllowlistProxy(
       reason: matchedRule.source === "trusted_url" ? "trusted_url_match" : "allowlist_match",
       tunnelId,
     });
-    const tunnelOpenedAt = Date.now();
+    // Registered before the connect attempt, so the tunnel is accountable from the moment its
+    // decision was recorded rather than from the moment a socket happened to exist.
+    liveTunnels.set(tunnelId, {
+      tunnelId,
+      upstream: null,
+      openedAt: Date.now(),
+      hostname: connectEvent.hostname,
+      port: connectEvent.port,
+      portSanitized: connectEvent.portSanitized,
+    });
     // The validated number, not a second Number(port): the value that passed the range check is the
     // value that reaches the socket.
     let upstream: net.Socket;
@@ -652,36 +847,16 @@ async function startNetworkAllowlistProxy(
       // a policy one, so the allow above stands and no second decision event is emitted; the client
       // gets the same dead socket the asynchronous error path already gives it. The close event still
       // fires, so no allowed tunnelId is left without its correlated end.
-      sink.emit({
-        event: "sandbox.network.tunnel.closed",
-        tunnelId,
-        hostname: connectEvent.hostname,
-        port: connectEvent.port,
-        bytesOut: 0,
-        bytesIn: 0,
-        durationMs: Date.now() - tunnelOpenedAt,
-      });
+      closeTunnel(tunnelId, false);
       clientSocket.destroy();
       return;
     }
+    const tunnel = liveTunnels.get(tunnelId);
+    if (tunnel) tunnel.upstream = upstream;
     upstream.on("error", () => clientSocket.destroy());
-    clientSocket.on("close", () => {
-      // Counters come off the socket rather than a transform in the pipe path: Node maintains both
-      // natively, so byte accounting costs nothing on the path carrying all confined egress. This
-      // seam also covers the failure path, since an upstream error destroys the client socket.
-      const bytesOut = upstream.bytesWritten;
-      const bytesIn = upstream.bytesRead;
-      upstream.destroy();
-      sink.emit({
-        event: "sandbox.network.tunnel.closed",
-        tunnelId,
-        hostname: connectEvent.hostname,
-        port: connectEvent.port,
-        bytesOut,
-        bytesIn,
-        durationMs: Date.now() - tunnelOpenedAt,
-      });
-    });
+    // The client-socket close seam also covers the failure path, since an upstream error destroys the
+    // client socket.
+    clientSocket.on("close", () => closeTunnel(tunnelId, false));
   });
   const sockets = new Set<net.Socket>();
   server.on("connection", (socket) => {
@@ -709,13 +884,21 @@ async function startNetworkAllowlistProxy(
   let stopEventEmitted = false;
   return {
     close: async () => {
+      // Flush surviving tunnels *before* destroying sockets. A tunnel still open at teardown is the
+      // long-lived stream to an allowlisted host — the shape this event exists for — and its byte
+      // totals only exist while its socket does.
+      for (const tunnelId of Array.from(liveTunnels.keys())) closeTunnel(tunnelId, true);
       for (const socket of sockets) socket.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));
       if (stopEventEmitted) return;
       stopEventEmitted = true;
+      // Drain first, so the counters read below include every decision and tunnel write and so
+      // `proxy.stopped` is genuinely last on the stream rather than merely emitted last.
+      await sink.drain();
       // Best effort by design: this is the graceful path only, so a hard death of the host process
       // yields a started event with no stopped event — which reads as abnormal termination.
       sink.emit({ event: "sandbox.network.proxy.stopped", ...sink.counters() });
+      await sink.drain();
     },
   };
 }
