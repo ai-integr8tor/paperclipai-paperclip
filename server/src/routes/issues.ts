@@ -5287,6 +5287,8 @@ export function issueRoutes(
       res.status(403).json({ error: "Agent authentication required" });
       return false;
     }
+    const runId = requireAgentRunId(req, res);
+    if (!runId) return false;
     // Task-watchdog runs receive a scoped *grant* to mutate issues inside the
     // watched subtree. This must be evaluated before the base assignee-ownership
     // boundary below: that boundary denies an agent mutating an issue owned by a
@@ -5383,8 +5385,6 @@ export function issueRoutes(
     if (issue.status !== "in_progress") {
       return true;
     }
-    const runId = requireAgentRunId(req, res);
-    if (!runId) return false;
     const ownership = await svc.assertCheckoutOwner(
       issue.id,
       actorAgentId,
