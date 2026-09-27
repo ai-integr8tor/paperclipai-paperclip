@@ -5,6 +5,7 @@ export interface Company {
   name: string;
   description: string | null;
   status: CompanyStatus;
+  operatorVisible: boolean;
   pauseReason: PauseReason | null;
   pausedAt: Date | null;
   issuePrefix: string;

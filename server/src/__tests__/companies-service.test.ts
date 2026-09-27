@@ -67,6 +67,23 @@ describeEmbeddedPostgres("companyService", () => {
     expect(rows.map((row) => row.issuePrefix).sort()).toEqual(["ARO", "AROA"]);
   });
 
+  it("persists operator visibility independently from an active runtime company", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Runtime-only legacy company",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      operatorVisible: false,
+    });
+
+    const [persisted] = await db
+      .select({ status: companies.status, operatorVisible: companies.operatorVisible })
+      .from(companies)
+      .where(eq(companies.id, companyId));
+
+    expect(persisted).toEqual({ status: "active", operatorVisible: false });
+  });
+
   it("archives companies by pausing runnable agents and cancelling active runs", async () => {
     const companyId = randomUUID();
     const runningAgentId = randomUUID();
