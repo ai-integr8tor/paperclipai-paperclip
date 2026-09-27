@@ -323,6 +323,51 @@ function readRequestedWakeScope(body: unknown): Partial<Record<WakeScopeKey, str
   return scope;
 }
 
+// Resolve the task a wake names to exactly one issue in the agent's company.
+// The three fields are not interchangeable: `issueId` and `taskId` are what the
+// issue-write gate, the scratch directory, and the task markdown read, while
+// `taskKey` is what selects the agent session to resume (`deriveTaskKey` in the
+// heartbeat prefers it over the other two). A `taskKey`-only wake would
+// therefore resume a task session while the run itself stayed unscoped — the
+// gate does not recognize `taskKey` — and a wake that named two different tasks
+// would resume one task's session under another task's scope. So every name the
+// caller supplies has to resolve to the same issue, and the persisted scope
+// always carries that issue's id in both `issueId` and `taskId`. A
+// caller-supplied `taskKey` is kept verbatim (an issue id or an identifier such
+// as `ENG-123`) so an identifier-keyed session still resumes, and an unknown or
+// foreign task is refused before any run is queued.
+async function resolveRequestedWakeScope(
+  db: Db,
+  companyId: string,
+  requested: Partial<Record<WakeScopeKey, string>>,
+): Promise<Partial<Record<WakeScopeKey, string>>> {
+  const entries = Object.entries(requested) as Array<[WakeScopeKey, string]>;
+  if (entries.length === 0) return {};
+  const issues = issueService(db);
+  let resolvedIssueId: string | null = null;
+  for (const [, value] of entries) {
+    // getById resolves an issue id and a task identifier, and it does not
+    // filter by company, so the company check below is what keeps a wake inside
+    // its own boundary.
+    const scopedIssue = await issues.getById(value);
+    if (!scopedIssue || scopedIssue.companyId !== companyId) {
+      throw notFound("Task not found");
+    }
+    if (resolvedIssueId && resolvedIssueId !== scopedIssue.id) {
+      throw badRequest(
+        "A wake cannot name two different tasks: issueId, taskId, and taskKey must resolve to the same task.",
+      );
+    }
+    resolvedIssueId = scopedIssue.id;
+  }
+  if (!resolvedIssueId) throw notFound("Task not found");
+  return {
+    issueId: resolvedIssueId,
+    taskId: resolvedIssueId,
+    ...(requested.taskKey ? { taskKey: requested.taskKey } : {}),
+  };
+}
+
 // Confirms a pre-existing `CODEX_HOME_<handle>` secret still names this
 // account's own home before a device login treats the secret's presence as a
 // successful, idempotent login. The secret name alone is not proof of a
@@ -5953,13 +5998,9 @@ export function agentRoutes(
     // what turned a board wake *about* an issue into an unscoped run whose
     // every write to that issue was refused. Failed-run retries keep the scope
     // derived from the selected run, so they never merge caller scope.
-    const requestedScope = req.body.failedRunId ? {} : readRequestedWakeScope(req.body);
-    if (requestedScope.issueId) {
-      const scopedIssue = await issueService(db).getById(requestedScope.issueId);
-      if (!scopedIssue || scopedIssue.companyId !== agent.companyId) {
-        throw notFound("Task not found");
-      }
-    }
+    const requestedScope = req.body.failedRunId
+      ? {}
+      : await resolveRequestedWakeScope(db, agent.companyId, readRequestedWakeScope(req.body));
     if (Object.keys(requestedScope).length > 0) {
       wakePayload = { ...(wakePayload ?? {}), ...requestedScope };
     }
@@ -6091,14 +6132,12 @@ export function agentRoutes(
     };
     // Same first-class task scope the modern /wakeup route accepts, so a board
     // wake typed on an issue is persisted as a scoped run instead of one whose
-    // writes back to that issue are refused (see readRequestedWakeScope).
-    const requestedScope = readRequestedWakeScope(req.body);
-    if (requestedScope.issueId) {
-      const scopedIssue = await issueService(db).getById(requestedScope.issueId);
-      if (!scopedIssue || scopedIssue.companyId !== agent.companyId) {
-        throw notFound("Task not found");
-      }
-    }
+    // writes back to that issue are refused (see resolveRequestedWakeScope).
+    const requestedScope = await resolveRequestedWakeScope(
+      db,
+      agent.companyId,
+      readRequestedWakeScope(req.body),
+    );
     Object.assign(contextSnapshot, requestedScope);
     if (body.forceFreshSession === true) {
       contextSnapshot.forceFreshSession = true;

@@ -1017,6 +1017,73 @@ describe("agent live run routes", () => {
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
+  it.each(["wakeup", "heartbeat/invoke"])("resolves a task key a wake names on %s to the run's issue scope", async (endpoint) => {
+    const scopedIssueId = "99999999-9999-4999-8999-999999999999";
+    mockIssueService.getById.mockResolvedValue({
+      id: scopedIssueId,
+      companyId: "company-1",
+      identifier: "ENG-263",
+    });
+
+    const res = await requestApp(await createApp(), (baseUrl) =>
+      request(baseUrl)
+        .post(`/api/agents/${routeAgentId}/${endpoint}?companyId=company-1`)
+        .send({
+          source: "on_demand",
+          triggerDetail: "manual",
+          reason: "task follow-up",
+          taskKey: "eng-263",
+        }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(202);
+    expect(mockIssueService.getById).toHaveBeenCalledWith("eng-263");
+    // A task key alone has to scope the run too: `taskKey` picks the session to
+    // resume, but only `issueId`/`taskId` reach the issue-write gate and the
+    // scratch dir, so the key is resolved to the issue it names.
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(routeAgentId, expect.objectContaining({
+      payload: expect.objectContaining({ issueId: scopedIssueId, taskId: scopedIssueId, taskKey: "eng-263" }),
+      contextSnapshot: expect.objectContaining({
+        issueId: scopedIssueId,
+        taskId: scopedIssueId,
+        taskKey: "eng-263",
+      }),
+    }));
+  });
+
+  it("refuses a wake that names two different tasks", async () => {
+    const firstIssueId = "99999999-9999-4999-8999-999999999999";
+    const secondIssueId = "88888888-8888-4888-8888-888888888888";
+    mockIssueService.getById.mockImplementation(async (value: string) => {
+      if (value === firstIssueId) return { id: firstIssueId, companyId: "company-1" };
+      if (value === "eng-263") return { id: secondIssueId, companyId: "company-1" };
+      return null;
+    });
+
+    const res = await requestApp(await createApp(), (baseUrl) =>
+      request(baseUrl)
+        .post(`/api/agents/${routeAgentId}/wakeup?companyId=company-1`)
+        .send({ issueId: firstIssueId, taskKey: "eng-263" }),
+    );
+
+    // The session key and the run scope must describe the same task, otherwise
+    // the run resumes one task's session under another task's scope.
+    expect(res.status).toBe(400);
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  it("refuses a wake whose task key names no task", async () => {
+    mockIssueService.getById.mockResolvedValue(null);
+    const res = await requestApp(await createApp(), (baseUrl) =>
+      request(baseUrl)
+        .post(`/api/agents/${routeAgentId}/wakeup?companyId=company-1`)
+        .send({ taskKey: "cre-999999" }),
+    );
+
+    expect(res.status).toBe(404);
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
   it.each(["wakeup", "heartbeat/invoke"])("lets an operator start an existing agent via %s without creating agents", async (endpoint) => {
     mockAccessService.decide.mockImplementation(async ({ action }) => ({
       allowed: action === "agent:wake", explanation: "Missing permission: agents:create",
