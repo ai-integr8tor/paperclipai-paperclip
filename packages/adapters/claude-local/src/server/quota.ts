@@ -170,11 +170,25 @@ function isolatedKeychainService(configDir: string): string {
   return `Claude Code-credentials-${createHash("sha256").update(configDir).digest("hex").slice(0, 8)}`;
 }
 
-async function readClaudeTokenFromKeychain(service: string): Promise<string | null> {
+async function readKeychainItemToken(args: string[]): Promise<string | null> {
   try {
-    const { stdout } = await execFileAsync("/usr/bin/security", ["find-generic-password", "-s", service, "-w"], { timeout: 10000, maxBuffer: 1024 * 1024 });
+    const { stdout } = await execFileAsync("/usr/bin/security", ["find-generic-password", ...args, "-w"], { timeout: 10000, maxBuffer: 1024 * 1024 });
     return parseClaudeCredentialToken(stdout);
   } catch { return null; }
+}
+
+// Claude Code writes its login under the macOS username as the account. Other
+// items can share the service name (for example an "unknown" account holding
+// only MCP OAuth state), and an unscoped lookup returns whichever matches
+// first, so prefer the user's own account and fall back to any account.
+async function readClaudeTokenFromKeychain(service: string): Promise<string | null> {
+  let account: string | null = null;
+  try { account = os.userInfo().username || null; } catch { account = null; }
+  if (account) {
+    const token = await readKeychainItemToken(["-s", service, "-a", account]);
+    if (token) return token;
+  }
+  return readKeychainItemToken(["-s", service]);
 }
 
 /**
