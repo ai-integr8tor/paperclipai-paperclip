@@ -36,6 +36,29 @@ describe("accumulateAssistantStreamText", () => {
       }),
     ).toBe("final answer");
   });
+
+  it("keeps the final reply when a run streams several assistant messages", () => {
+    // Embedded runs restart `text` at each assistant message; CLI runs stream a
+    // run-wide snapshot and then replay the final result as a text-only frame.
+    const embedded = [
+      { text: "Checking now.", delta: "Checking now." },
+      { text: "Result: X", delta: "Result: X" },
+    ];
+    const cli = [
+      { text: "Checking now.", delta: "Checking now." },
+      { text: "Checking now.Result: X", delta: "Result: X" },
+      { text: "Result: X" },
+    ];
+
+    expect(embedded.reduce(accumulateAssistantStreamText, "")).toBe("Result: X");
+    expect(cli.reduce(accumulateAssistantStreamText, "")).toBe("Result: X");
+  });
+
+  it("keeps spaces carried by delta-only frames", () => {
+    const events = [{ delta: "Hello" }, { delta: " " }, { delta: "world" }, { delta: " again" }];
+
+    expect(events.reduce(accumulateAssistantStreamText, "")).toBe("Hello world again");
+  });
 });
 
 describe("resolveSessionKey", () => {

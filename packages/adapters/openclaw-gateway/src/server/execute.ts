@@ -68,16 +68,16 @@ export function accumulateAssistantStreamText(
   current: string,
   data: Record<string, unknown>,
 ): string {
-  const snapshot = nonEmpty(data.text);
-  if (snapshot) {
-    // OpenClaw emits `text` as the authoritative cumulative snapshot and may
-    // replay that snapshot in the final frame. Replacing instead of appending
-    // prevents repeated stream/final frames from multiplying the comment body.
-    return snapshot;
-  }
+  // A non-empty `text` is a full snapshot of the reply so far, never a fragment.
+  // OpenClaw replays it (the final result frame, `replace: true` frames), and
+  // embedded runs restart it at each assistant message. Keeping the latest
+  // snapshot therefore yields the final reply, matching the result-payload
+  // fallback; appending it is what multiplied one update in the comment body.
+  if (typeof data.text === "string" && data.text.trim().length > 0) return data.text;
 
-  const delta = nonEmpty(data.delta);
-  return delta ? `${current}${delta}` : current;
+  // Deltas are appended untrimmed so whitespace-only or space-led fragments
+  // keep the spaces between words. The summary is trimmed once at the end.
+  return typeof data.delta === "string" ? `${current}${data.delta}` : current;
 }
 
 type PendingRequest = {
