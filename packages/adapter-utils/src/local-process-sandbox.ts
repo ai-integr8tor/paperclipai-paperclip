@@ -208,6 +208,17 @@ interface NetworkAllowlistProxy {
   close: () => Promise<void>;
 }
 
+/** One opened CONNECT tunnel that has not yet been accounted for by a `tunnel.closed` event. */
+interface LiveTunnel {
+  tunnelId: string;
+  /** Null when `net.connect` threw, so the tunnel never had a socket to account for. */
+  upstream: net.Socket | null;
+  openedAt: number;
+  hostname: string | null;
+  port: string | null;
+  portSanitized: boolean;
+}
+
 const SYSTEM_READ_PATHS = [
   "/bin",
   "/sbin",
@@ -731,18 +742,51 @@ async function startNetworkAllowlistProxy(
     upstream.on("error", (error) => response.destroy(error));
     request.pipe(upstream);
   });
+  /**
+   * Tunnels that have been opened and not yet accounted for. Teardown reads this to close the record
+   * for a tunnel the client never closed; without it, exactly that tunnel left no event at all.
+   */
+  const liveTunnels = new Map<string, LiveTunnel>();
+  /**
+   * The only place `tunnel.closed` is emitted, and idempotent by construction: removal from the
+   * registry is the claim on the event, so the teardown flush and the socket-close handler racing
+   * each other still produce exactly one event rather than two or none.
+   */
+  const closeTunnel = (tunnelId: string, closedAtTeardown: boolean): void => {
+    const tunnel = liveTunnels.get(tunnelId);
+    if (!tunnel || !liveTunnels.delete(tunnelId)) return;
+    // Counters come off the socket rather than a transform in the pipe path: Node maintains both
+    // natively, so byte accounting costs nothing on the path carrying all confined egress. Read
+    // before the destroy — and, at teardown, before the client sockets are destroyed — or the
+    // accounting for the tunnel that mattered most is the accounting that is lost.
+    const bytesOut = tunnel.upstream?.bytesWritten ?? 0;
+    const bytesIn = tunnel.upstream?.bytesRead ?? 0;
+    tunnel.upstream?.destroy();
+    sink.emit({
+      event: "sandbox.network.tunnel.closed",
+      tunnelId: tunnel.tunnelId,
+      hostname: tunnel.hostname,
+      port: tunnel.port,
+      portSanitized: tunnel.portSanitized,
+      bytesOut,
+      bytesIn,
+      durationMs: Date.now() - tunnel.openedAt,
+      closedAtTeardown,
+    });
+  };
   server.on("connect", (request, clientSocket, head) => {
     const separator = request.url?.lastIndexOf(":") ?? -1;
     const hostname = separator > 0 ? normalizeNetworkHostname(request.url!.slice(0, separator)) : "";
     const port = separator > 0 ? request.url!.slice(separator + 1) : "443";
     // The proxy tunnels CONNECT opaquely, so the method is always the literal verb and the scheme is
-    // unknowable. Neither is ever inferred.
+    // unknowable. Neither is ever inferred, so neither can have been sanitized.
     const connectEvent = {
       event: "sandbox.network.decision",
       method: "CONNECT",
+      methodSanitized: false,
       scheme: null,
       ...describeEventHostname(hostname),
-      port: port || null,
+      ...describeEventPort(port || null),
     } as const;
     // A hostname-only allowlist entry leaves the port unconstrained, so policy cannot reject an
     // out-of-range one — this test is the only thing between the request line and net.connect, which
@@ -776,7 +820,16 @@ async function startNetworkAllowlistProxy(
       reason: matchedRule.source === "trusted_url" ? "trusted_url_match" : "allowlist_match",
       tunnelId,
     });
-    const tunnelOpenedAt = Date.now();
+    // Registered before the connect attempt, so the tunnel is accountable from the moment its
+    // decision was recorded rather than from the moment a socket happened to exist.
+    liveTunnels.set(tunnelId, {
+      tunnelId,
+      upstream: null,
+      openedAt: Date.now(),
+      hostname: connectEvent.hostname,
+      port: connectEvent.port,
+      portSanitized: connectEvent.portSanitized,
+    });
     // The validated number, not a second Number(port): the value that passed the range check is the
     // value that reaches the socket.
     let upstream: net.Socket;
@@ -794,36 +847,16 @@ async function startNetworkAllowlistProxy(
       // a policy one, so the allow above stands and no second decision event is emitted; the client
       // gets the same dead socket the asynchronous error path already gives it. The close event still
       // fires, so no allowed tunnelId is left without its correlated end.
-      sink.emit({
-        event: "sandbox.network.tunnel.closed",
-        tunnelId,
-        hostname: connectEvent.hostname,
-        port: connectEvent.port,
-        bytesOut: 0,
-        bytesIn: 0,
-        durationMs: Date.now() - tunnelOpenedAt,
-      });
+      closeTunnel(tunnelId, false);
       clientSocket.destroy();
       return;
     }
+    const tunnel = liveTunnels.get(tunnelId);
+    if (tunnel) tunnel.upstream = upstream;
     upstream.on("error", () => clientSocket.destroy());
-    clientSocket.on("close", () => {
-      // Counters come off the socket rather than a transform in the pipe path: Node maintains both
-      // natively, so byte accounting costs nothing on the path carrying all confined egress. This
-      // seam also covers the failure path, since an upstream error destroys the client socket.
-      const bytesOut = upstream.bytesWritten;
-      const bytesIn = upstream.bytesRead;
-      upstream.destroy();
-      sink.emit({
-        event: "sandbox.network.tunnel.closed",
-        tunnelId,
-        hostname: connectEvent.hostname,
-        port: connectEvent.port,
-        bytesOut,
-        bytesIn,
-        durationMs: Date.now() - tunnelOpenedAt,
-      });
-    });
+    // The client-socket close seam also covers the failure path, since an upstream error destroys the
+    // client socket.
+    clientSocket.on("close", () => closeTunnel(tunnelId, false));
   });
   const sockets = new Set<net.Socket>();
   server.on("connection", (socket) => {
@@ -851,13 +884,21 @@ async function startNetworkAllowlistProxy(
   let stopEventEmitted = false;
   return {
     close: async () => {
+      // Flush surviving tunnels *before* destroying sockets. A tunnel still open at teardown is the
+      // long-lived stream to an allowlisted host — the shape this event exists for — and its byte
+      // totals only exist while its socket does.
+      for (const tunnelId of Array.from(liveTunnels.keys())) closeTunnel(tunnelId, true);
       for (const socket of sockets) socket.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));
       if (stopEventEmitted) return;
       stopEventEmitted = true;
+      // Drain first, so the counters read below include every decision and tunnel write and so
+      // `proxy.stopped` is genuinely last on the stream rather than merely emitted last.
+      await sink.drain();
       // Best effort by design: this is the graceful path only, so a hard death of the host process
       // yields a started event with no stopped event — which reads as abnormal termination.
       sink.emit({ event: "sandbox.network.proxy.stopped", ...sink.counters() });
+      await sink.drain();
     },
   };
 }
