@@ -18,6 +18,10 @@ export const runnerApiCallSchema = z.object({
   body: z.unknown().optional(),
   contentType: z.string().max(120).optional(),
   files: z.array(fileSchema).max(10).optional(),
+  responseText: z.object({
+    offsetBytes: z.number().int().min(0).max(RUNNER_API_MAX_BYTES).optional(),
+    limitBytes: z.number().int().min(4).max(RUNNER_API_INLINE_BYTES).optional(),
+  }).strict().optional(),
 }).strict();
 export type RunnerApiCall = z.infer<typeof runnerApiCallSchema>;
 export type RunnerApiFile = z.infer<typeof fileSchema>;
@@ -44,6 +48,7 @@ export function validateRunnerApiCall(value: unknown, context: RunnerApiContext)
   const input = parsed.data;
   const operation = runnerApiOperation(input.operationId);
   if (operation.transport !== "rest") throw unprocessable("This endpoint requires its existing protocol client; call_api supports REST only");
+  if (input.responseText && operation.method !== "GET") throw badRequest("responseText requires a GET operation; read the saved artifact instead of repeating a mutation");
   const restriction = runnerApiRestriction(operation.method, operation.path);
   if (restriction) throw forbidden(restriction);
   if (!operation.allowedModes.includes(context.workMode)) throw forbidden("call_api permits only reads in Ask and Plan modes; use the permitted dedicated tools");
@@ -139,10 +144,19 @@ export async function readBoundedResponse(response: Response, maxBytes = RUNNER_
 }
 
 export async function executeRunnerApi(input: RunnerApiCall, context: RunnerApiContext, io: RunnerApiIo) {
-  const { operation } = validateRunnerApiCall(input, context);
+  const { operation, input: validated } = validateRunnerApiCall(input, context);
+  input = validated;
   const url = runnerApiUrl(operation, input, context, io.apiUrl);
   if (!io.token) throw new Error("Paperclip run authentication is unavailable");
   const headers = new Headers({ Authorization: `Bearer ${io.token}`, "X-Paperclip-Run-Id": context.runId });
+  const textOffset = input.responseText?.offsetBytes ?? 0;
+  const textLimit = input.responseText?.limitBytes ?? RUNNER_API_INLINE_BYTES;
+  const assetTextRange = input.responseText && operation.operationId === "GET /api/assets/{assetId}/content"
+    ? { start: Math.max(0, textOffset - 1), end: textOffset + textLimit }
+    : undefined;
+  // One byte before the requested offset permits an EOF read; one byte after
+  // the page lets the decoder trim an incomplete UTF-8 code point.
+  if (assetTextRange) headers.set("Range", `bytes=${assetTextRange.start}-${assetTextRange.end}`);
   let body: BodyInit | undefined;
   const contentType = input.contentType ?? (input.files?.length ? "multipart/form-data" : "application/json");
   if (/\r|\n/.test(contentType)) throw badRequest("Invalid content type");
@@ -180,7 +194,7 @@ export async function executeRunnerApi(input: RunnerApiCall, context: RunnerApiC
   await io.beforeDispatch?.();
   try {
     response = await (io.fetch ?? fetch)(url, { method: operation.method, headers, body, redirect: "manual", signal: AbortSignal.timeout(RUNNER_API_TIMEOUT_MS) });
-    bytes = await readBoundedResponse(response);
+    bytes = await readBoundedResponse(response, assetTextRange && response.ok ? textLimit + 2 : RUNNER_API_MAX_BYTES);
   } catch {
     return { ok: false, status: null, operationId: operation.operationId, error: "api_transport_failure", outcome: ["GET", "HEAD", "OPTIONS"].includes(operation.method) ? "read_failed" : "unknown", guidance: "Inspect current state before retrying a mutation; it may already have succeeded." };
   }
@@ -192,9 +206,49 @@ export async function executeRunnerApi(input: RunnerApiCall, context: RunnerApiC
   const uncertainty = { outcome: "unknown", guidance: "Inspect current state before retrying this mutation; it may already have succeeded." };
   const base = { ok: response.ok, status: response.status, operationId: operation.operationId, contentType: type, retryAfter: response.headers.get("retry-after"), ...(uncertain ? uncertainty : {}) };
   if (response.status >= 300 && response.status < 400) return { ...base, ok: false, error: "api_redirect_not_followed" };
+  if (input.responseText) {
+    if (!/json|^text\//i.test(type)) return { ...base, ok: false, error: "response_text_requires_text_content" };
+    let totalBytes = bytes.length;
+    let baseOffset = 0;
+    if (assetTextRange && response.ok) {
+      const range = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(response.headers.get("content-range") ?? "");
+      if (response.status === 200 && bytes.length === 0 && textOffset === 0) {
+        // An empty asset has no satisfiable byte range; its route returns 200.
+      } else if (response.status !== 206 || !range) {
+        return { ...base, ok: false, error: "response_text_invalid_range" };
+      } else {
+        const [start, end, total] = range.slice(1).map(Number);
+        if (![start, end, total].every(Number.isSafeInteger) || start !== assetTextRange.start
+          || total > RUNNER_API_MAX_BYTES || total < 1 || end !== Math.min(assetTextRange.end, total - 1)
+          || end < start || bytes.length !== end - start + 1) {
+          return { ...base, ok: false, error: "response_text_invalid_range" };
+        }
+        baseOffset = start;
+        totalBytes = total;
+      }
+    }
+    // HTTP denials are evidence, not text pages of an authorized asset.
+    const offsetBytes = response.ok ? textOffset : 0;
+    const localOffset = offsetBytes - baseOffset;
+    if (offsetBytes > totalBytes || localOffset < 0 || (localOffset < bytes.length && (bytes[localOffset] & 0xc0) === 0x80)) {
+      return { ...base, ok: false, error: "response_text_invalid_offset", byteSize: totalBytes };
+    }
+    let end = Math.min(bytes.length, localOffset + textLimit);
+    // Do not cut a UTF-8 code point. The next offset always starts a whole one.
+    while (end < bytes.length && end > localOffset && (bytes[end] & 0xc0) === 0x80) end--;
+    if (end === localOffset && end < bytes.length) return { ...base, ok: false, error: "response_text_invalid_utf8" };
+    try {
+      const data = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes.subarray(localOffset, end));
+      const nextOffset = baseOffset + end;
+      return { ...base, data, responseText: { offsetBytes, nextOffsetBytes: nextOffset < totalBytes ? nextOffset : null, totalBytes } };
+    } catch {
+      return { ...base, ok: false, error: "response_text_invalid_utf8" };
+    }
+  }
   if (!bytes.length) return { ...base, data: null };
   if (bytes.length > RUNNER_API_INLINE_BYTES || !/json|^text\//i.test(type)) {
-    return { ...base, artifact: await io.saveResponse(bytes, type), byteSize: bytes.length, preview: /json|^text\//i.test(type) ? bytes.subarray(0, 2000).toString("utf8") : null };
+    return { ...base, artifact: await io.saveResponse(bytes, type), byteSize: bytes.length, preview: /json|^text\//i.test(type) ? bytes.subarray(0, 2000).toString("utf8") : null,
+      ...(/json|^text\//i.test(type) ? { guidance: "Read the saved artifact with GET /api/assets/{assetId}/content and responseText: { offsetBytes: 0 }. Continue with responseText.nextOffsetBytes until null. Do not repeat a mutation to read its response." } : {}) };
   }
   const text = bytes.toString("utf8");
   if (/json/i.test(type)) {
