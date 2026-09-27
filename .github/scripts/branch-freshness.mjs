@@ -317,18 +317,13 @@ export async function runBranchFreshness({
       core.error(`PR #${pulls[index].number}: could not publish pending status: ${message}`)
       const retry = invalidationRetries[index]
       if (retry.status === 'fulfilled') {
-        if (invalidation.reason instanceof InvalidationTimeoutError) {
-          comparisonFailed = true
-          // The timed-out request is still unsettled and can complete after the
-          // retry, replacing a later terminal status with pending. The retry
-          // removes any prior success when it lands, but this run must not
-          // compare or finalize the tainted head.
-          core.error(`PR #${pulls[index].number}: pending status retry succeeded, but the head remains excluded after an unresolved first write`)
-        } else {
-          // The first request is settled, so it cannot land after the retry or
-          // overwrite the terminal status this comparison will publish.
-          preparedPulls.push(retry.value)
-        }
+        comparisonFailed = true
+        // A rejected transport promise does not prove that GitHub rejected the
+        // write. The request may have reached the server and can still publish
+        // pending after this local rejection. The retry removes any prior
+        // success when it lands, but this run must not compare or finalize the
+        // tainted head because a late first write could replace that result.
+        core.error(`PR #${pulls[index].number}: pending status retry succeeded, but the head remains excluded after an unresolved first write`)
       } else {
         comparisonFailed = true
         const retryMessage = retry.reason instanceof Error

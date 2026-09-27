@@ -674,11 +674,15 @@ test('a base change during success publication overwrites the transient success'
   assert.match(failure, /unavailable or stale/)
 })
 
-test('a settled rejected invalidation is retried before comparison and reaches success', async () => {
+test('a rejected invalidation with a delayed remote write taints the head', async () => {
   const statuses = []
   let statusAttempt = 0
   let comparisonStarted = false
   let failure
+  let releaseLateWrite
+  const lateWrite = new Promise((resolve) => {
+    releaseLateWrite = resolve
+  })
   const github = {
     request: rulesetRequest(),
     rest: {
@@ -695,8 +699,10 @@ test('a settled rejected invalidation is retried before comparison and reaches s
       repos: {
         createCommitStatus: async ({ sha, state, description }) => {
           statusAttempt += 1
-          if (statusAttempt === 1) throw new Error('transient status failure')
-          if (statusAttempt === 2) assert.equal(comparisonStarted, false)
+          if (statusAttempt === 1) {
+            lateWrite.then(() => statuses.push({ sha, state, description }))
+            throw new Error('transport rejected after sending request')
+          }
           statuses.push({ sha, state, description })
         },
         compareCommitsWithBasehead: async () => {
@@ -717,8 +723,14 @@ test('a settled rejected invalidation is retried before comparison and reaches s
 
   await runBranchFreshness({ github, context, core })
 
-  assert.equal(comparisonStarted, true)
+  assert.equal(comparisonStarted, false)
+  assert.equal(statuses.length, 1)
   assert.equal(statuses[0].state, 'pending')
-  assert.equal(statuses.at(-1).state, 'success')
-  assert.equal(failure, undefined)
+  assert.match(failure, /comparison was unavailable or stale/)
+
+  releaseLateWrite()
+  await new Promise((resolve) => setImmediate(resolve))
+
+  assert.equal(statuses.length, 2)
+  assert.ok(statuses.every(({ state }) => state === 'pending'))
 })
