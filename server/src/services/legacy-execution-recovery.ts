@@ -14,14 +14,17 @@ export const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
 
 /**
  * Local process adapters that record processPid/processStartedAt on spawn.
- * Keep in sync with heartbeat sessioned local adapters — both describe the
- * same pre-spawn process path.
+ * Keep aligned with GIT_SENSITIVE_LOCAL_ADAPTER_TYPES in heartbeat.ts plus the
+ * generic `process` adapter. HTTP/cloud types are intentionally excluded —
+ * null PID after entry is not bootstrap for those.
  */
 export const PROCESS_PRE_SPAWN_ADAPTER_TYPES = new Set([
+  "process",
   "claude_local",
   "codex_local",
   "cursor",
   "gemini_local",
+  "grok_local",
   "hermes_local",
   "kimi_local",
   "opencode_local",

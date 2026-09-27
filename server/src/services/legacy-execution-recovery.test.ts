@@ -95,10 +95,15 @@ it("stamps bootstrap for process adapters that fail before spawn, not HTTP post-
     processPid: null,
     processStartedAt: null,
   };
+  // Process / pre-spawn: missing command leaves null PID → bootstrap.
+  expect(shouldStampBootstrapExecutionRecovery({ ...base, adapterType: "process" })).toBe(true);
   expect(shouldStampBootstrapExecutionRecovery({ ...base, adapterType: "cursor" })).toBe(true);
   expect(shouldStampBootstrapExecutionRecovery({ ...base, adapterType: "claude_local" })).toBe(true);
+  expect(shouldStampBootstrapExecutionRecovery({ ...base, adapterType: "grok_local" })).toBe(true);
   // HTTP/cloud adapters do not record processPid; null PID after entry is not bootstrap.
   expect(shouldStampBootstrapExecutionRecovery({ ...base, adapterType: "http" })).toBe(false);
+  expect(shouldStampBootstrapExecutionRecovery({ ...base, adapterType: "cursor_cloud" })).toBe(false);
+  expect(shouldStampBootstrapExecutionRecovery({ ...base, adapterType: "hermes_gateway" })).toBe(false);
   expect(shouldStampBootstrapExecutionRecovery({ ...base, adapterType: "openclaw_gateway" })).toBe(false);
   expect(shouldStampBootstrapExecutionRecovery({ ...base, adapterType: null })).toBe(false);
   // Spawned process adapters already started provider work.

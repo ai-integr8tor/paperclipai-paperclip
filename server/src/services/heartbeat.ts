@@ -24,6 +24,7 @@ import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./
 import { claimQueuedNativeReviewRun } from "./native-runtime/native-review-dispatch.js";
 import { buildNativeReviewRequest } from "./native-runtime/native-review-prompt.js";
 import {
+  isProcessPreSpawnAdapterType,
   legacyExecutionNeedsReconciliation,
   shouldStampBootstrapExecutionRecovery,
   terminalizeLegacyExecution,
@@ -1248,16 +1249,6 @@ const ISSUE_RESPONSIBLE_USER_WAKE_REASONS = new Set([
   "execution_approval_requested",
   "execution_changes_requested",
   "approval_approved",
-]);
-const SESSIONED_LOCAL_ADAPTERS = new Set([
-  "claude_local",
-  "codex_local",
-  "cursor",
-  "gemini_local",
-  "hermes_local",
-  "kimi_local",
-  "opencode_local",
-  "pi_local",
 ]);
 // Routes and the scheduler construct separate heartbeatService instances, but
 // they must agree on in-process adapter executions when reaping stale runs.
@@ -8230,7 +8221,7 @@ function isSameTaskScope(left: string | null, right: string | null) {
 }
 
 function isTrackedLocalChildProcessAdapter(adapterType: string) {
-  return SESSIONED_LOCAL_ADAPTERS.has(adapterType);
+  return isProcessPreSpawnAdapterType(adapterType);
 }
 
 function isHeartbeatRunTerminalStatus(
