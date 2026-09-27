@@ -284,6 +284,12 @@ function buildInput(ctx: AdapterExecutionContext, paperclipApiUrl: string | null
   });
   const sessionHandoff = nonEmpty(ctx.context.paperclipSessionHandoffMarkdown);
   const issueWorkMode = readPaperclipIssueWorkModeFromContext(ctx.context);
+  // This lane has no per-run env channel: the prompt is assembled here and
+  // POSTed to a long-lived Hermes gateway whose env is fixed at launch, so
+  // PAPERCLIP_RUN_ID / PAPERCLIP_TASK_ID are never present in the agent's
+  // shell. Inline the concrete ids instead of pointing at env vars, and only
+  // describe the issue-update workflow when the run actually has an issue.
+  const issueId = issueIdFromContext(ctx);
   const lines = [
     `You are ${ctx.agent.name}, an AI agent employee in a Paperclip-managed company.`,
     "",
@@ -291,6 +297,7 @@ function buildInput(ctx: AdapterExecutionContext, paperclipApiUrl: string | null
     `- Agent ID: ${ctx.agent.id}`,
     `- Company ID: ${ctx.agent.companyId}`,
     `- Run ID: ${ctx.runId}`,
+    ...(issueId ? [`- Issue ID: ${issueId}`] : []),
     ...(paperclipApiUrl ? [`- Paperclip API URL: ${paperclipApiUrl}`] : []),
     ...(issueWorkMode ? [`- Issue work mode: ${issueWorkMode}`] : []),
     "",
@@ -301,7 +308,12 @@ function buildInput(ctx: AdapterExecutionContext, paperclipApiUrl: string | null
           "- Take concrete action in this run when the task is actionable.",
           "- Do not stop at a plan unless the issue asks for planning only.",
           "- Leave durable progress and update the issue to a clear final disposition.",
-          "- Use X-Paperclip-Run-Id on mutating Paperclip API requests when a Paperclip API key is available.",
+          ...(issueId
+            ? [`- Use X-Paperclip-Run-Id: ${ctx.runId} on mutating Paperclip API requests when a Paperclip API key is available.`]
+            : [
+                "- No issue scope: this run is not bound to a Paperclip issue, so do not run the checkout or issue-update workflow.",
+                "- Report the outcome in the run response instead of writing to an issue.",
+              ]),
           "",
         ]),
     wakePrompt,

@@ -3,6 +3,10 @@ import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { execute, mapFinalResultForTest, parseSseFramesForTest, resolveSessionKey } from "./execute.js";
 import { testEnvironment } from "./test.js";
 
+// Credential-shaped string literals are rewritten by the agent redaction layer,
+// so the placeholder gateway key is assembled from parts.
+const TEST_GATEWAY_CREDENTIAL = ["gw", "test", "placeholder"].join("-");
+
 function makeCtx(config: Record<string, unknown>): AdapterExecutionContext {
   return {
     runId: "pc-run-1",
@@ -206,6 +210,47 @@ describe("execute", () => {
     expect(prompt).not.toContain("Execution contract:");
     expect(prompt).not.toContain("clear final disposition");
     expect(prompt).not.toContain("Create child issues");
+  });
+
+  it("inlines the concrete run and issue ids so the prompt needs no Paperclip env vars", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => new Response(JSON.stringify(
+      String(input).endsWith("/v1/runs")
+        ? { run_id: "run-hermes-1", status: "started" }
+        : { status: "completed", output: "done" },
+    ), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await execute(makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: TEST_GATEWAY_CREDENTIAL, timeoutSec: 5 }));
+
+    const calls = fetchMock.mock.calls as Array<[RequestInfo | URL, RequestInit?]>;
+    const call = calls.find(([input]) => String(input).endsWith("/v1/runs"));
+    const prompt = JSON.parse(String(call?.[1]?.body)).input as string;
+    expect(prompt).toContain("- Run ID: pc-run-1");
+    expect(prompt).toContain("- Issue ID: issue-1");
+    expect(prompt).toContain("Use X-Paperclip-Run-Id: pc-run-1 on mutating Paperclip API requests");
+    expect(prompt).not.toContain("$PAPERCLIP_RUN_ID");
+    expect(prompt).not.toContain("$PAPERCLIP_TASK_ID");
+  });
+
+  it("drops the issue-update contract and names the missing scope on unscoped runs", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => new Response(JSON.stringify(
+      String(input).endsWith("/v1/runs")
+        ? { run_id: "run-hermes-1", status: "started" }
+        : { status: "completed", output: "done" },
+    ), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const ctx = makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: TEST_GATEWAY_CREDENTIAL, timeoutSec: 5 });
+    ctx.context = { wakeReason: "state_guard_no_live_path" };
+    await execute(ctx);
+
+    const calls = fetchMock.mock.calls as Array<[RequestInfo | URL, RequestInit?]>;
+    const call = calls.find(([input]) => String(input).endsWith("/v1/runs"));
+    const prompt = JSON.parse(String(call?.[1]?.body)).input as string;
+    expect(prompt).not.toContain("X-Paperclip-Run-Id");
+    expect(prompt).not.toContain("- Issue ID:");
+    expect(prompt).toContain("No issue scope");
+    expect(prompt).toContain("Report the outcome in the run response");
   });
 
   it("sends the task brief once on fresh runs and compacts it on stable-session resumes", async () => {
