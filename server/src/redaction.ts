@@ -46,6 +46,8 @@ const COMMAND_PAYLOAD_KEY_RE =
 const COMMAND_ARGS_PAYLOAD_KEY_RE = /^(commandArgs|command_?args|argv)$/i;
 const JWT_VALUE_RE =
   /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?$/;
+const JWT_TEXT_CANDIDATE_RE =
+  /(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{8,}){2,}/g;
 // Durable protocol schema identifiers share JWT's broad dotted shape but are
 // public discriminators, not credentials. Exempt the Paperclip schema
 // namespace only in fields that actually declare a schema; the same value in
@@ -997,7 +999,15 @@ export function redactSensitiveText(input: string): string {
       .replace(
         ESCAPED_JSON_SECRET_FIELD_TEXT_RE,
         `$1${REDACTED_EVENT_VALUE}$2`,
-      ),
+      )
+      .replace(JWT_TEXT_CANDIDATE_RE, (match, offset: number, source: string) => {
+        const address = source
+          .slice(offset)
+          .match(/^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*/)?.[0];
+        return address && isPublicExecutorToolSelector(address)
+          ? match
+          : REDACTED_EVENT_VALUE;
+      }),
     REDACTED_EVENT_VALUE,
   );
 }

@@ -30,9 +30,33 @@ const COMMAND_ENV_SECRET_ASSIGNMENT_RE = new RegExp(
 const COMMAND_AUTHORIZATION_BEARER_RE =
   /(\bAuthorization\s*:\s*Bearer\s+)[^\s"'`]+/gi;
 const COMMAND_OPENAI_KEY_RE = /\bsk-[A-Za-z0-9_-]{12,}\b/g;
+const COMMAND_STRIPE_KEY_RE = /\bsk_(?:live|test)_[A-Za-z0-9]{12,}\b/g;
 const COMMAND_GITHUB_TOKEN_RE = /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/g;
-const COMMAND_JWT_RE =
-  /\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{8,})?\b/g;
+const COMMAND_AWS_ACCESS_KEY_ID_RE = /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g;
+const COMMAND_AWS_SECRET_ACCESS_KEY_RE = new RegExp(
+  String.raw`(\b(?:aws[ _-]?secret[ _-]?(?:access[ _-]?)?key|secretaccesskey)\s*[:=]\s*["']?)[A-Za-z0-9/+=]{40}(["']?)`,
+  "gi",
+);
+// AWS secret access keys have no provider prefix. Limit bare-value matching to
+// the documented 40-character base64 shape with mixed case and a '/' or '+';
+// context-labelled values remain covered even when they are entirely alphanumeric.
+const COMMAND_AWS_SECRET_ACCESS_KEY_SHAPE_RE =
+  /(?<![A-Za-z0-9/+])(?=[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=]))(?=[A-Za-z0-9/+=]{0,39}[+/])(?=[A-Za-z0-9/+=]{0,39}[a-z])(?=[A-Za-z0-9/+=]{0,39}[A-Z])[A-Za-z0-9/+=]{40}/g;
+const COMMAND_INLINE_DSN_PASSWORD_RE =
+  /(\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss|amqp|amqps):\/\/[^:\s/@]+:)[^@\s]+(@)/gi;
+const COMMAND_PRIVATE_KEY_BLOCK_RE =
+  /-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----[\s\S]*?-----END \1-----/g;
+// Paperclip-issued bearer credentials. Minted in server/src/services/board-auth.ts as
+// `pcp_board_<48 hex>` and `pcp_cli_auth_<48 hex>`; the prefix segment is matched
+// generically so a future `pcp_<kind>_` credential is covered without another edit.
+// These are value-shaped: they leak as bare tokens in process stdout and in HTTP
+// header dumps, where no adjacent `key=` or `--flag` gives the name-based rules a handle.
+const COMMAND_PAPERCLIP_TOKEN_RE = /\bpcp_[a-z][a-z0-9_]*_[0-9a-f]{24,}\b/gi;
+// Slack tokens: bot (xoxb), user (xoxp), app (xoxa/xoxr), refresh (xoxs), and
+// app-level (xapp).
+const COMMAND_SLACK_TOKEN_RE = /\b(?:xox[abprs]|xapp)-[A-Za-z0-9-]{10,}\b/g;
+const COMMAND_JWT_CANDIDATE_RE =
+  /\b[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{8,}){2,}\b/g;
 const COMMAND_SECRET_HINTS = [
   "api",
   "key",
@@ -47,19 +71,88 @@ const COMMAND_SECRET_HINTS = [
   "cookie",
   "connectionstring",
   "sk-",
+  "sk_",
   "ghp_",
   "gho_",
   "ghu_",
   "ghs_",
   "ghr_",
+  // Value-prefix hints. Without these, a chunk carrying a bare `pcp_board_...` or
+  // `xoxb-...` and nothing else can short-circuit out of redactCommandText before
+  // the patterns above ever run.
+  "pcp_",
+  "xox",
+  "xapp-",
+  "akia",
+  "asia",
+  "postgres://",
+  "postgresql://",
+  "mysql://",
+  "mariadb://",
+  "mongodb://",
+  "mongodb+srv://",
+  "redis://",
+  "rediss://",
+  "amqp://",
+  "amqps://",
 ] as const;
 
 function maybeContainsSecretText(command: string) {
   const lower = command.toLowerCase();
+  COMMAND_AWS_SECRET_ACCESS_KEY_SHAPE_RE.lastIndex = 0;
+  const hasAwsSecretKeyShape = COMMAND_AWS_SECRET_ACCESS_KEY_SHAPE_RE.test(command);
+  COMMAND_AWS_SECRET_ACCESS_KEY_SHAPE_RE.lastIndex = 0;
   return (
     COMMAND_SECRET_HINTS.some((hint) => lower.includes(hint)) ||
-    command.includes(".")
+    command.includes(".") ||
+    hasAwsSecretKeyShape
   );
+}
+
+function getJoseCompactSegmentCount(encodedHeader: string): 3 | 5 | null {
+  try {
+    const header = JSON.parse(Buffer.from(encodedHeader, "base64url").toString("utf8")) as {
+      alg?: unknown;
+      enc?: unknown;
+    };
+    if (
+      !header ||
+      typeof header !== "object" ||
+      typeof header.alg !== "string" ||
+      header.alg.length === 0
+    ) {
+      return null;
+    }
+    return typeof header.enc === "string" && header.enc.length > 0 ? 5 : 3;
+  } catch {
+    return null;
+  }
+}
+
+function redactJwtCandidate(candidate: string, redactedValue: string): string {
+  const segments = candidate.split(".");
+  const headerIndex = segments.findIndex(
+    (segment) => getJoseCompactSegmentCount(segment) !== null,
+  );
+  if (headerIndex < 0) return candidate;
+
+  const tokenSegmentCount = getJoseCompactSegmentCount(segments[headerIndex]!);
+  const remainingSegmentCount = segments.length - headerIndex;
+  if (tokenSegmentCount === null || remainingSegmentCount < 3) {
+    return candidate;
+  }
+
+  // A compact JWS has three segments and a compact JWE has five. Redact at
+  // the exact shape declared by the protected header, preserving any dotted
+  // identifier prefix or suffix that the broad candidate matcher included.
+  // An `enc` member is only a JWE hint: a signed JWS may carry additional
+  // protected-header parameters. If fewer than five segments exist, redact
+  // every available segment rather than allowing a three-segment credential
+  // to pass through unchanged.
+  const redactedSegmentCount = Math.min(tokenSegmentCount, remainingSegmentCount);
+  const prefix = segments.slice(0, headerIndex);
+  const suffix = segments.slice(headerIndex + redactedSegmentCount);
+  return [...prefix, redactedValue, ...suffix].join(".");
 }
 
 export function redactCommandText(
@@ -86,13 +179,19 @@ export function redactCommandText(
       },
     )
     .replace(COMMAND_OPENAI_KEY_RE, redactedValue)
+    .replace(COMMAND_STRIPE_KEY_RE, redactedValue)
     .replace(COMMAND_GITHUB_TOKEN_RE, redactedValue)
-    .replace(COMMAND_JWT_RE, (match, offset: number, source: string) => {
-      // The JWT heuristic may match only the first three segments; inspect the
-      // complete address so a longer secret sharing a prefix stays redacted.
-      const address = source.slice(offset).match(/^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*/)?.[0];
-      return address && isPublicExecutorToolSelector(address) ? match : redactedValue;
-    });
+    .replace(COMMAND_PAPERCLIP_TOKEN_RE, redactedValue)
+    .replace(COMMAND_SLACK_TOKEN_RE, redactedValue)
+    .replace(COMMAND_AWS_ACCESS_KEY_ID_RE, redactedValue)
+    .replace(COMMAND_AWS_SECRET_ACCESS_KEY_RE, `$1${redactedValue}$2`)
+    .replace(COMMAND_AWS_SECRET_ACCESS_KEY_SHAPE_RE, redactedValue)
+    .replace(COMMAND_INLINE_DSN_PASSWORD_RE, `$1${redactedValue}$2`)
+    .replace(COMMAND_PRIVATE_KEY_BLOCK_RE, redactedValue)
+    .replace(
+      COMMAND_JWT_CANDIDATE_RE,
+      (candidate) => redactJwtCandidate(candidate, redactedValue),
+    );
 }
 
 // A JSON secret field is a key/value pair such as `"token":"opaque-value"`. The
@@ -130,4 +229,28 @@ export function redactDiagnosticText(
   return redactCommandText(text, redactedValue)
     .replace(JSON_ESCAPED_SECRET_FIELD_RE, `$1${redactedValue}$2`)
     .replace(JSON_SECRET_FIELD_RE, `$1${redactedValue}$2`);
+}
+
+export interface DiagnosticRedactionResult {
+  text: string;
+  redactionCount: number;
+}
+
+/**
+ * Redact a bounded diagnostic string and report how many replacement markers
+ * were introduced. The marker is selected so source text cannot be mistaken
+ * for a hit, and overlapping rules collapse to the single surviving marker.
+ */
+export function redactDiagnosticTextWithStats(
+  text: string,
+  redactedValue = REDACTED_COMMAND_TEXT_VALUE,
+): DiagnosticRedactionResult {
+  let marker = "\u0000paperclip-redaction-hit\u0000";
+  while (text.includes(marker)) marker += "\u0000";
+  const marked = redactDiagnosticText(text, marker);
+  const parts = marked.split(marker);
+  return {
+    text: parts.join(redactedValue),
+    redactionCount: parts.length - 1,
+  };
 }
