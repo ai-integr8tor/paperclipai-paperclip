@@ -17,6 +17,8 @@ import {
   principalPermissionGrants,
   routines,
   routineTriggers,
+  issues,
+  projects,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -54,6 +56,8 @@ describeEmbeddedPostgres("companyService", () => {
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(agentConfigRevisions);
+    await db.delete(issues);
+    await db.delete(projects);
     await db.delete(activityLog);
     await db.delete(agents);
     await db.delete(principalPermissionGrants);
@@ -863,5 +867,173 @@ describeEmbeddedPostgres("companyService", () => {
     expect(archiveActivity[0]).toMatchObject({
       details: { agentsPaused: 1, runsCancelled: 1 },
     });
+  });
+
+  it("consolidates an inactive legacy company into its holding without leaving a second company surface", async () => {
+    const sourceCompanyId = randomUUID();
+    const targetCompanyId = randomUUID();
+    const agentId = randomUUID();
+    const projectId = randomUUID();
+    const issueId = randomUUID();
+    const genericEscalationIssueId = randomUUID();
+
+    await db.insert(companies).values([
+      {
+        id: sourceCompanyId,
+        name: "Worker Tool Publisher",
+        description: "AgentSwarm provisioned business digital_services_products_worker_tool_publisher\n\nagentswarm:business=digital_services_products_worker_tool_publisher",
+        issuePrefix: `W${sourceCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      },
+      {
+        id: targetCompanyId,
+        name: "Digital Services Products — Holding",
+        description: "AgentSwarm holding authority\n\nagentswarm:holding-provider-onboarding-company=digital_services_products",
+        issuePrefix: `D${targetCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      },
+    ]);
+    await db.insert(agents).values({
+      id: agentId,
+      companyId: sourceCompanyId,
+      name: "Worker Tool Provisioner",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId: sourceCompanyId,
+      name: "Worker Tool Publisher",
+      leadAgentId: agentId,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId: sourceCompanyId,
+      projectId,
+      assigneeAgentId: agentId,
+      title: "Existing provider onboarding work",
+      description: "AgentSwarm run: run_legacy\nStage: provider-onboarding",
+      identifier: "WOR-3",
+    });
+    await db.insert(issues).values({
+      id: genericEscalationIssueId,
+      companyId: sourceCompanyId,
+      projectId,
+      assigneeAgentId: agentId,
+      title: "Decision required: generic agent escalation",
+      description: "Agent-authored request without a formal Paperclip approval.",
+      identifier: "WOR-4",
+      status: "in_review",
+    });
+
+    const result = await companyService(db).consolidateLegacyAgentSwarmBusiness({
+      sourceCompanyId,
+      targetCompanyId,
+      businessId: "digital_services_products_worker_tool_publisher",
+      holdingId: "digital_services_products",
+      actor: {
+        actorType: "system",
+        actorId: "agentswarm-holding-reconciler",
+        agentId: null,
+        runId: null,
+      },
+    });
+
+    expect(result).toMatchObject({
+      state: "consolidated",
+      sourceCompanyId,
+      targetCompanyId,
+      sourceCompanyArchived: true,
+    });
+    await expect(companyService(db).getById(sourceCompanyId)).resolves.toMatchObject({
+      id: sourceCompanyId,
+      status: "archived",
+    });
+
+    const [migratedAgent] = await db
+      .select({ companyId: agents.companyId })
+      .from(agents)
+      .where(eq(agents.id, agentId));
+    const [migratedProject] = await db
+      .select({ companyId: projects.companyId })
+      .from(projects)
+      .where(eq(projects.id, projectId));
+    const [migratedIssue] = await db
+      .select({ companyId: issues.companyId, projectId: issues.projectId, assigneeAgentId: issues.assigneeAgentId })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+
+    expect(migratedAgent).toEqual({ companyId: targetCompanyId });
+    expect(migratedProject).toEqual({ companyId: targetCompanyId });
+    expect(migratedIssue).toEqual({
+      companyId: targetCompanyId,
+      projectId,
+      assigneeAgentId: agentId,
+    });
+    const [retainedEscalation] = await db
+      .select({ companyId: issues.companyId, status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, genericEscalationIssueId));
+    expect(retainedEscalation).toEqual({ companyId: sourceCompanyId, status: "in_review" });
+  });
+
+  it("refuses consolidation while the source company has an active execution", async () => {
+    const sourceCompanyId = randomUUID();
+    const targetCompanyId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values([
+      {
+        id: sourceCompanyId,
+        name: "Worker Tool Publisher",
+        description: "AgentSwarm provisioned business digital_services_products_worker_tool_publisher\n\nagentswarm:business=digital_services_products_worker_tool_publisher",
+        issuePrefix: `W${sourceCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      },
+      {
+        id: targetCompanyId,
+        name: "Digital Services Products — Holding",
+        description: "AgentSwarm holding authority\n\nagentswarm:holding-provider-onboarding-company=digital_services_products",
+        issuePrefix: `D${targetCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      },
+    ]);
+    await db.insert(agents).values({
+      id: agentId,
+      companyId: sourceCompanyId,
+      name: "Worker Tool Provisioner",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      companyId: sourceCompanyId,
+      agentId,
+      invocationSource: "timer",
+      status: "running",
+    });
+
+    await expect(companyService(db).consolidateLegacyAgentSwarmBusiness({
+      sourceCompanyId,
+      targetCompanyId,
+      businessId: "digital_services_products_worker_tool_publisher",
+      holdingId: "digital_services_products",
+      actor: { actorType: "system", actorId: "agentswarm-holding-reconciler", agentId: null, runId: null },
+    })).resolves.toMatchObject({
+      state: "deferred_active_execution",
+      sourceCompanyId,
+      targetCompanyId,
+    });
+
+    await expect(companyService(db).getById(sourceCompanyId)).resolves.toMatchObject({ id: sourceCompanyId });
+    const [agent] = await db.select({ companyId: agents.companyId }).from(agents).where(eq(agents.id, agentId));
+    expect(agent).toEqual({ companyId: sourceCompanyId });
   });
 });

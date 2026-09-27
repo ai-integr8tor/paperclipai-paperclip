@@ -528,6 +528,29 @@ export function companyRoutes(db: Db, storage?: StorageService) {
     res.json(company);
   });
 
+  // Platform-only migration for the legacy AgentSwarm per-business surface.
+  // This is not an approval action: it is marker validated by the service and
+  // returns a deferred result while the legacy company has an active run.
+  router.post("/:companyId/consolidate-legacy-agentswarm-business", async (req, res) => {
+    assertBoard(req);
+    const sourceCompanyId = req.params.companyId as string;
+    assertCompanyAccess(req, sourceCompanyId);
+    const body = z.object({
+      targetCompanyId: z.string().uuid(),
+      businessId: z.string().min(1),
+      holdingId: z.string().min(1),
+    }).strict().parse(req.body);
+    assertCompanyAccess(req, body.targetCompanyId);
+    const result = await svc.consolidateLegacyAgentSwarmBusiness({
+      sourceCompanyId,
+      targetCompanyId: body.targetCompanyId,
+      businessId: body.businessId,
+      holdingId: body.holdingId,
+      actor: getActorInfo(req),
+    });
+    res.json(result);
+  });
+
   router.delete("/:companyId", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
