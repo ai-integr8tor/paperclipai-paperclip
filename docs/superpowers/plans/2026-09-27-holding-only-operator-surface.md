@@ -4,7 +4,7 @@
 
 **Goal:** Keep one Paperclip operator workspace per AgentSwarm holding even while a legacy business executor remains live.
 
-**Architecture:** Add an operator-visibility field to Paperclip companies. The marker-scoped consolidator immediately projects only formal approval work to the holding and hides the legacy source; it leaves live runtime state untouched until terminal, when the existing full consolidation archives the source. AgentSwarm treats the new deferred result as a normal native-runtime wait.
+**Architecture:** Separate operator visibility from native runtime ownership. The marker-scoped consolidator projects formal approvals to the holding with `operatorCompanyId` and hides the legacy source. Agents, issues, runs, comments, and approval gate links retain source ownership for their entire lifecycle. There is no later runtime migration or automatic archive. AgentSwarm treats `runtime_deferred` as a valid operator projection, not a reason to dispatch repair work.
 
 **Tech Stack:** TypeScript, Drizzle/Postgres, Express, React, Vitest, Node test runner.
 
@@ -21,7 +21,7 @@
 ## Review Focus
 
 - Active source with no formal approval: hide it and return `runtime_deferred` without any unrelated moves.
-- Formal approval linked to an issue: move both link endpoints and comments atomically.
+- Formal approval linked to an issue: preserve approval and link ownership while exposing the same decision in the holding; future source approvals inherit the projection atomically.
 - Repeated active-run reconciliation: no duplicate approval, no re-exposure, no dispatcher call.
 - Hidden source queued/running lifecycle: runtime liveness remains active because company status stays `active`.
 - Wrong source/target markers: no visibility or ownership change.
@@ -37,7 +37,7 @@
 - Modify: company service/route serializers and tests as required
 
 **Interfaces:**
-- Produces: `Company.operatorVisible: boolean`, default `true`.
+- Produces: `Company.operatorVisible: boolean`, default `true`, nullable `Company.operatorCompanyId` and `Approval.operatorCompanyId`.
 
 - [ ] **Step 1: Write failing schema/service tests for default-visible and persisted hidden companies.**
 
@@ -108,9 +108,9 @@
 
 **Interfaces:**
 - Consumes: `runtime_deferred` from Task 2.
-- Produces: normal wait/no-repair behavior until native core returns `consolidated`.
+- Produces: valid projected/no-repair behavior for `runtime_deferred`; `consolidated` remains only for sources already archived by the older migration.
 
-- [ ] **Step 1: Write failing client/reconciler tests for `runtime_deferred` and a later `consolidated` response.**
+- [ ] **Step 1: Write client/reconciler tests for `runtime_deferred` and an already archived `consolidated` response.**
 
 - [ ] **Step 2: Run focused AgentSwarm tests and verify the old deferred discriminant is insufficient.**
 
