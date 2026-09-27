@@ -109,34 +109,41 @@ function maybeContainsSecretText(command: string) {
   );
 }
 
-function hasJwtAlgorithmHeader(candidate: string): boolean {
-  const [encodedHeader] = candidate.split(".");
-  if (!encodedHeader) return false;
+function getJoseCompactSegmentCount(encodedHeader: string): 3 | 5 | null {
   try {
     const header = JSON.parse(Buffer.from(encodedHeader, "base64url").toString("utf8")) as {
       alg?: unknown;
+      enc?: unknown;
     };
-    return Boolean(
-      header &&
-      typeof header === "object" &&
-      typeof header.alg === "string" &&
-      header.alg.length > 0,
-    );
+    if (
+      !header ||
+      typeof header !== "object" ||
+      typeof header.alg !== "string" ||
+      header.alg.length === 0
+    ) {
+      return null;
+    }
+    return typeof header.enc === "string" && header.enc.length > 0 ? 5 : 3;
   } catch {
-    return false;
+    return null;
   }
 }
 
 function redactJwtCandidate(candidate: string, redactedValue: string): string {
   const segments = candidate.split(".");
-  const headerIndex = segments.findIndex((segment) => hasJwtAlgorithmHeader(segment));
-  const remainingSegments = segments.length - headerIndex;
-  if (headerIndex < 0 || remainingSegments < 3) return candidate;
+  const headerIndex = segments.findIndex(
+    (segment) => getJoseCompactSegmentCount(segment) !== null,
+  );
+  if (headerIndex < 0) return candidate;
+
+  const tokenSegmentCount = getJoseCompactSegmentCount(segments[headerIndex]!);
+  if (tokenSegmentCount === null || segments.length - headerIndex < tokenSegmentCount) {
+    return candidate;
+  }
 
   // A compact JWS has three segments and a compact JWE has five. Redact at
-  // most five segments from the validated header, preserving any dotted
+  // the exact shape declared by the protected header, preserving any dotted
   // identifier prefix or suffix that the broad candidate matcher included.
-  const tokenSegmentCount = Math.min(5, remainingSegments);
   const prefix = segments.slice(0, headerIndex);
   const suffix = segments.slice(headerIndex + tokenSegmentCount);
   return [...prefix, redactedValue, ...suffix].join(".");

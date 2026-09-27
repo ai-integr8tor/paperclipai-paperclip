@@ -111,10 +111,21 @@ second-line\" status=401`;
     expect(redactDiagnosticText(`namespace.${jwt}`)).toBe(
       `namespace.${REDACTED_COMMAND_TEXT_VALUE}`,
     );
+    expect(redactDiagnosticText(`${jwt}.execute_test.snapshot`)).toBe(
+      `${REDACTED_COMMAND_TEXT_VALUE}.execute_test.snapshot`,
+    );
 
     const whitespaceHeader = Buffer.from(' {"alg":"HS256","typ":"JWT"}').toString("base64url");
     const whitespaceJwt = `${whitespaceHeader}.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJlMTIz`;
     expect(redactDiagnosticText(whitespaceJwt)).toBe(REDACTED_COMMAND_TEXT_VALUE);
+
+    const jweHeader = Buffer.from('{"alg":"RSA-OAEP","enc":"A256GCM"}').toString(
+      "base64url",
+    );
+    const jwe = `${jweHeader}.ZW5jcnlwdGVkS2V5.aW5pdFZlY3Rvcg.Y2lwaGVydGV4dA.YXV0aFRhZw`;
+    expect(redactDiagnosticText(`${jwe}.diagnostic_suffix`)).toBe(
+      `${REDACTED_COMMAND_TEXT_VALUE}.diagnostic_suffix`,
+    );
   });
 
   it("redacts standard cloud, datastore, private-key, and Stripe credential forms", () => {
