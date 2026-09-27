@@ -325,12 +325,22 @@ function nextAssigneeIds(input: {
 export function stripMonitorFromExecutionPolicy(policy: IssueExecutionPolicy | null): IssueExecutionPolicy | null {
   if (!policy) return null;
   if (!policy.monitor) return policy;
-  if (policy.stages.length === 0) return null;
-  return {
-    mode: policy.mode,
-    commentRequired: policy.commentRequired,
-    stages: policy.stages,
-  };
+
+  // Drop the monitor and keep everything else. Rebuilding the object from a
+  // fixed list of keys used to discard reviewPreset, authorizationPolicy and
+  // maxReviewRounds, which silently disarmed the low-trust review preset and
+  // the trust boundary on every fire.
+  const { monitor: _monitor, ...rest } = policy;
+
+  // A policy with nothing left but defaults is no policy. This mirrors the
+  // emptiness rule in normalizeIssueExecutionPolicy: a reviewPreset or an
+  // authorizationPolicy keeps a stages-less policy meaningful, so neither may
+  // be discarded along with the monitor.
+  if (rest.stages.length === 0 && !rest.reviewPreset && !rest.authorizationPolicy) {
+    return null;
+  }
+
+  return rest;
 }
 
 export function setIssueExecutionPolicyMonitorScheduledBy(
