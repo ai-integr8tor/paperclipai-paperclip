@@ -22127,6 +22127,7 @@ export function heartbeatService(
           selectedEnvironmentId,
           localEnvironmentId: localEnvironment.id,
           adapterType: agent.adapterType,
+          adapterConfig: parseObject(agent.adapterConfig),
           issueId: issueId ?? null,
           heartbeatRunId: run.id,
           agentId: agent.id,
