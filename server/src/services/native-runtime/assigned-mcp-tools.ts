@@ -3,6 +3,48 @@ import type { Db } from "@paperclipai/db";
 import { ToolGatewayHttpError, type ToolGatewayDescriptor, type ToolGatewayService } from "../tool-gateway.js";
 
 type WorkMode = "standard" | "planning" | "ask";
+type ToolDefinition = Record<string, unknown>;
+
+const SEARCH_TOOL = "paperclip_search_assigned_tools";
+const CALL_TOOL = "paperclip_call_assigned_tool";
+// A single valid runner schema can be 512 KiB. Leave room for its description
+// while keeping the complete result below the 768 KiB provider-result bound.
+const SEARCH_PAGE_BYTES = 640 * 1024;
+const ON_DEMAND_TOOLS: ToolDefinition[] = [
+  {
+    name: SEARCH_TOOL,
+    description: "Search your assigned app tools by name or description and read their input schemas. Use an empty query to browse. Pass nextOffset to fetch the next page, then use paperclip_call_assigned_tool with a returned name and arguments matching its inputSchema.",
+    inputSchema: {
+      type: "object", additionalProperties: false,
+      properties: {
+        query: { type: "string", maxLength: 200 },
+        offset: { type: "integer", minimum: 0 },
+        limit: { type: "integer", minimum: 1, maximum: 20 },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: CALL_TOOL,
+    description: "Call an assigned app tool discovered with paperclip_search_assigned_tools. Use its exact returned name and arguments matching its inputSchema. The same permissions, approvals, and audit rules apply as for direct app tools.",
+    inputSchema: {
+      type: "object", additionalProperties: false,
+      properties: { name: { type: "string" }, arguments: { type: "object", additionalProperties: true } },
+      required: ["name", "arguments"],
+    },
+  },
+];
+
+function object(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("assigned_mcp_tool_invalid_arguments");
+  }
+  return value as Record<string, unknown>;
+}
+
+function definition(name: string, tool: ToolGatewayDescriptor): ToolDefinition {
+  return { name, description: `${tool.displayName}: ${tool.description}`, inputSchema: structuredClone(tool.parametersSchema) };
+}
 
 // Execution must use the app's configured gateway, including deployment
 // restrictions, OAuth refresh, and approval delivery. Never fall back to an
@@ -48,19 +90,61 @@ export async function createAssignedMcpTools(input: {
   }
   const permits = (tool: ToolGatewayDescriptor, mode: WorkMode = input.workMode ?? "standard") => mode === "standard" || tool.risk === "read";
 
+  async function search(argumentsValue: unknown, currentWorkMode?: WorkMode) {
+    const args = object(argumentsValue);
+    const offset = args.offset ?? 0;
+    const limit = args.limit ?? 5;
+    if (typeof args.query !== "string" || args.query.length > 200 ||
+      typeof offset !== "number" || !Number.isSafeInteger(offset) || offset < 0 ||
+      typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 1 || limit > 20) {
+      throw new Error("assigned_mcp_tool_invalid_arguments");
+    }
+    // Intersect fresh grants with this session's pinned catalog. Revocations
+    // take effect immediately; newly assigned tools require a new session.
+    const current = new Map((await input.gateway.listToolsForNamedGateway({
+      gatewayPublicId: input.gatewayPublicId, bearerToken: input.bearerToken,
+    })).map(tool => [tool.name, tool]));
+    const terms = args.query.toLowerCase().trim().split(/\s+/).filter(Boolean);
+    const matches = [...tools].filter(([name, tool]) => {
+      const fresh = current.get(tool.name);
+      const text = `${name} ${tool.displayName} ${tool.description}`.toLowerCase();
+      return fresh && permits(tool) && permits(tool, currentWorkMode) &&
+        permits(fresh) && permits(fresh, currentWorkMode) && terms.every(term => text.includes(term));
+    }).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+    const page: ToolDefinition[] = [];
+    for (const [name, tool] of matches.slice(offset, offset + limit)) {
+      const next = definition(name, tool);
+      if (Buffer.byteLength(JSON.stringify([...page, next]), "utf8") > SEARCH_PAGE_BYTES) {
+        if (page.length === 0) throw new Error("assigned_mcp_tool_schema_too_large");
+        break;
+      }
+      page.push(next);
+    }
+    return { tools: page, nextOffset: offset + page.length < matches.length ? offset + page.length : null };
+  }
+
   return {
-    definitions(): Array<Record<string, unknown>> {
-      return [...tools].filter(([, tool]) => permits(tool)).map(([name, tool]) => ({
-        name,
-        description: `${tool.displayName}: ${tool.description}`,
-        inputSchema: structuredClone(tool.parametersSchema),
-      }));
+    definitions(fits?: (definitions: ToolDefinition[]) => boolean): ToolDefinition[] {
+      const direct = [...tools].filter(([, tool]) => permits(tool)).map(([name, tool]) => definition(name, tool));
+      if (!fits || fits(direct)) return direct;
+      const compact = structuredClone(ON_DEMAND_TOOLS);
+      if (!fits(compact)) throw new Error("assigned_mcp_tool_catalog_capacity_exceeded");
+      return compact;
     },
     has(name: string): boolean {
-      return tools.has(name);
+      return tools.has(name) || name === SEARCH_TOOL || name === CALL_TOOL;
     },
     async execute(call: { tool: string; arguments: unknown }, currentWorkMode?: WorkMode): Promise<unknown> {
-      const descriptor = tools.get(call.tool);
+      if (call.tool === SEARCH_TOOL) return search(call.arguments, currentWorkMode);
+      let name = call.tool;
+      let parameters = call.arguments;
+      if (name === CALL_TOOL) {
+        const args = object(parameters);
+        if (typeof args.name !== "string") throw new Error("assigned_mcp_tool_invalid_arguments");
+        name = args.name;
+        parameters = object(args.arguments);
+      }
+      const descriptor = tools.get(name);
       if (!descriptor) throw new Error("assigned_mcp_tool_unknown");
       if (!permits(descriptor) || !permits(descriptor, currentWorkMode)) throw new Error("paperclip_runner_tool_mode_denied");
       // Reauthorize through the existing gateway on every call. Discovery is
@@ -69,7 +153,7 @@ export async function createAssignedMcpTools(input: {
         gatewayPublicId: input.gatewayPublicId,
         sessionToken: input.bearerToken,
         tool: descriptor.name,
-        parameters: call.arguments,
+        parameters,
       });
       if (result.status !== "completed" && result.status !== "replayed") {
         throw new Error("assigned_mcp_tool_execution_incomplete");
