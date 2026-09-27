@@ -3411,7 +3411,7 @@ export function recoveryService(
       issue.executionRunId !== null ||
       issue.checkoutRunId !== null
     ) {
-      return false;
+      return "not_applicable" as const;
     }
 
     return db.transaction(async (tx) => {
@@ -3453,7 +3453,10 @@ export function recoveryService(
         lockedIssue.executionRunId !== null ||
         lockedIssue.checkoutRunId !== null
       ) {
-        return false;
+        // The row changed after the sweep snapshot. Leave the action alone and
+        // let the next sweep re-evaluate fresh state instead of falling through
+        // to generic path-restoration resolution with stale ownership data.
+        return "deferred" as const;
       }
 
       // Issue-bound admission takes this same issue row lock before it inserts
@@ -3469,7 +3472,7 @@ export function recoveryService(
           true,
         )
       ) {
-        return false;
+        return "deferred" as const;
       }
 
       const now = new Date();
@@ -3531,7 +3534,7 @@ export function recoveryService(
           },
         },
       });
-      return true;
+      return "restored" as const;
     });
   }
 
@@ -3558,9 +3561,19 @@ export function recoveryService(
     for (const { action, issue } of rows) {
       const wakePolicy = parseObject(action.wakePolicy);
       const wakePolicyType = readNonEmptyString(wakePolicy.type);
-      if (await restoreLegacyRecoveryReturnOwner(action, issue)) {
+      const legacyReturnOwnerResult =
+        await restoreLegacyRecoveryReturnOwner(action, issue);
+      if (legacyReturnOwnerResult === "restored") {
         result.escalated += 1;
         result.issueIds.push(issue.id);
+        continue;
+      }
+      if (legacyReturnOwnerResult === "deferred") {
+        // A live path only postpones restoring the recorded return owner. It
+        // must not flow into the generic reconciliation below, where unrelated
+        // work could be mistaken for a durable replacement path and resolve
+        // the action while the temporary recovery owner is still assigned.
+        result.skipped += 1;
         continue;
       }
       if (
