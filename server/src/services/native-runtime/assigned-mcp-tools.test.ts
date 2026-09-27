@@ -77,6 +77,11 @@ describe("assigned MCP runner tools", () => {
     await expect(assigned.execute({
       tool: searchName, arguments: { query: "", offset: first.nextOffset, limit: 2 },
     })).resolves.toEqual({ tools: definitions.slice(2), nextOffset: null });
+
+    f.listToolsForNamedGateway.mockResolvedValue([descriptors[1]!, descriptors[3]!]);
+    await expect(assigned.execute({
+      tool: searchName, arguments: { query: "", offset: first.nextOffset, limit: 2 },
+    })).resolves.toEqual({ tools: definitions.slice(3), nextOffset: null });
   });
 
   it.each(["planning", "ask"] as const)("preserves pinned and fresh %s restrictions through the call wrapper", async mode => {
