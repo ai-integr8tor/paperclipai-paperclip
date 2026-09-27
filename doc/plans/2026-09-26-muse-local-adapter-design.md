@@ -1,6 +1,6 @@
 # `muse_local` adapter: Muse Code subscription support
 
-Status: design approved 2026-09-26; rev 2 (phased) 2026-09-26; Phase 1 and Phase 2 implemented and live-smoked 2026-09-26 on a Muse Code subscription; Phase 3 (sandbox device login) pending.
+Status: Phases 1–3 implemented 2026-09-26. Live-smoked on a Muse Code subscription: local runs, AI connection (terminal sign-in + API key), and SSH runs on chaos-srv (the agent used the Paperclip API through the bridge). Sandbox (Daytona) device login is unit-tested only (no Daytona account).
 
 ## Goal
 

@@ -238,8 +238,13 @@ Muse runs `muse login` with the attempt's own `XDG_CONFIG_HOME` and
 `<attempt>/xdg/muse/auth.json` instead of the OS keychain. Connect stores only
 that file's `LLM|` Meta API key (verified with `GET https://api.meta.ai/v1/models`),
 never its OAuth token or account email. Runs receive the key as `META_API_KEY`,
-so Muse has no credential file to refresh or merge. Sandbox device login for
-Muse is not available yet; use the terminal sign-in or an API key.
+so Muse has no credential file to refresh or merge. In sandbox environments
+the device login runs `muse login </dev/null` (stdin must not be a TTY, or Muse
+waits for "Press Enter to open it in your browser") with an isolated XDG home
+and copies `auth.json` to the session home for the descriptor-bound read; only
+the key is promoted. Remote (SSH and sandbox) Muse runs reach the Paperclip API
+through the standard bridge, which needs a run token, so the instance must have
+`PAPERCLIP_AGENT_JWT_SECRET` set (onboarding writes it).
 
 Attempts reuse `adapter_auth_sessions`, binding company, owner, provider, access
 intent, reconnect target, and a 30-minute expiry. Validation and completion are
