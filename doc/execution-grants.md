@@ -23,11 +23,37 @@ must equal the target agent's `updatedAt` at issuance.
 The proposed `executionGrant` has version `1`, a named `executorAgentId`, the
 `targetAgentId`, operation `agent_config:update`, the target revision and update
 time, the exact `requestBody`, a `requestHash`, an `expiresAt` timestamp, and the
-current policy version. Compute the SHA-256 hash with
-`executionGrantRequestHash("PATCH", "/api/agents/<target-id>", requestBody,
-targetUpdatedAt)` from `server/src/services/execution-grant-contract.ts`. The
-hash binds the HTTP method, target path, canonical JSON body, and target update
-time. Generate `detailsMarkdown` with `executionGrantApprovalDetails(request)`
+current policy version. Compute the SHA-256 hash of the JSON object
+`{method, path, body, targetUpdatedAt}`. Set `method` to `PATCH`, `path` to
+`/api/agents/<target-id>`, and `body` to the exact PATCH body. Recursively sort
+object keys with JavaScript `localeCompare`; preserve array order. For example,
+an API client running on Node.js can use:
+
+```js
+import { createHash } from "node:crypto";
+
+function canonicalize(value) {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => [key, canonicalize(entry)]));
+  }
+  return value;
+}
+
+const requestHash = createHash("sha256")
+  .update(JSON.stringify({
+    method: "PATCH", path: `/api/agents/${targetAgentId}`,
+    body: canonicalize(requestBody), targetUpdatedAt,
+  }))
+  .digest("hex");
+```
+
+This matches `executionGrantRequestHash` in
+`server/src/services/execution-grant-contract.ts`. The hash binds the HTTP
+method, target path, canonical JSON body, and target update time. Generate
+`detailsMarkdown` with `executionGrantApprovalDetails(request)`
 from `@paperclipai/shared`; the API rejects approval text that differs from this
 exact display.
 
