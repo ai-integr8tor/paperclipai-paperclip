@@ -983,6 +983,45 @@ describeEmbeddedPostgres("companyService", () => {
     expect(retainedEscalation).toEqual({ companyId: sourceCompanyId, status: "in_review" });
   });
 
+  it("hides an already archived legacy source and retains the consolidated response", async () => {
+    const sourceCompanyId = randomUUID();
+    const targetCompanyId = randomUUID();
+    await db.insert(companies).values([
+      {
+        id: sourceCompanyId,
+        name: "Archived Worker Tool Publisher",
+        status: "archived",
+        description: "agentswarm:business=digital_services_products_worker_tool_publisher",
+        issuePrefix: `W${sourceCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      },
+      {
+        id: targetCompanyId,
+        name: "Digital Services Products — Holding",
+        description: "agentswarm:holding-provider-onboarding-company=digital_services_products",
+        issuePrefix: `D${targetCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      },
+    ]);
+    const input = {
+      sourceCompanyId,
+      targetCompanyId,
+      businessId: "digital_services_products_worker_tool_publisher",
+      holdingId: "digital_services_products",
+      actor: { actorType: "system" as const, actorId: "agentswarm-holding-reconciler", agentId: null, runId: null },
+    };
+    await expect(companyService(db).consolidateLegacyAgentSwarmBusiness(input)).resolves.toEqual({
+      state: "consolidated", sourceCompanyId, targetCompanyId, sourceCompanyArchived: true,
+    });
+    await expect(companyService(db).getById(sourceCompanyId)).resolves.toMatchObject({
+      status: "archived", operatorVisible: false, operatorCompanyId: targetCompanyId,
+    });
+    await companyService(db).consolidateLegacyAgentSwarmBusiness(input);
+    const logs = await db.select({ id: activityLog.id }).from(activityLog).where(and(
+      eq(activityLog.companyId, targetCompanyId),
+      eq(activityLog.action, "company.legacy_agentswarm_operator_surface_projected"),
+    ));
+    expect(logs).toHaveLength(1);
+  });
+
   it("projects the operator surface even while the source company has an active execution", async () => {
     const sourceCompanyId = randomUUID();
     const targetCompanyId = randomUUID();

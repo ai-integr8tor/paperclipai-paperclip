@@ -296,10 +296,6 @@ export function companyService(db: Db) {
       ) {
         throw unprocessable("Company markers do not authorize this AgentSwarm consolidation");
       }
-      if (source.status === "archived") {
-        return { state: "consolidated" as const, sourceCompanyId: input.sourceCompanyId, targetCompanyId: input.targetCompanyId, sourceCompanyArchived: true as const };
-      }
-
       if (source.operatorCompanyId && source.operatorCompanyId !== input.targetCompanyId) {
         throw unprocessable("Legacy company already belongs to a different operator holding");
       }
@@ -319,15 +315,25 @@ export function companyService(db: Db) {
           .set({ operatorVisible: false, operatorCompanyId: input.targetCompanyId, updatedAt: new Date() })
           .where(eq(companies.id, input.sourceCompanyId));
       }
+      const projectionApplied = source.operatorVisible || !source.operatorCompanyId || movedApprovals.length > 0;
+      if (source.status === "archived") {
+        return {
+          state: "consolidated" as const,
+          sourceCompanyId: input.sourceCompanyId,
+          targetCompanyId: input.targetCompanyId,
+          sourceCompanyArchived: true as const,
+          projectionApplied,
+        };
+      }
       return {
         state: "runtime_deferred" as const,
         sourceCompanyId: input.sourceCompanyId,
         targetCompanyId: input.targetCompanyId,
-        projectionApplied: source.operatorVisible || !source.operatorCompanyId || movedApprovals.length > 0,
+        projectionApplied,
       };
     });
 
-    if (result.state === "runtime_deferred" && result.projectionApplied) {
+    if (result.projectionApplied) {
       await logActivity(db, {
         companyId: input.targetCompanyId,
         actorType: input.actor.actorType,
@@ -340,11 +346,8 @@ export function companyService(db: Db) {
         details: { businessId: input.businessId, holdingId: input.holdingId },
       });
     }
-    if (result.state === "runtime_deferred") {
-      const { projectionApplied: _, ...publicResult } = result;
-      return publicResult;
-    }
-    return result;
+    const { projectionApplied: _, ...publicResult } = result;
+    return publicResult;
   }
 
   return {
