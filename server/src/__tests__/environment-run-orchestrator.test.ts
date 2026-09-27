@@ -775,6 +775,8 @@ describe("native runner lifecycle changes before lease acquisition", () => {
   });
 
   it.each([
+    ["paperclip_runner", undefined, undefined, false],
+    ["paperclip_runner", "inherit", "per_turn", false],
     ["paperclip_runner", "per_turn", "warm", false],
     ["paperclip_runner", "warm", "per_turn", true],
     ["paperclip_runner", "inherit", "warm", true],
