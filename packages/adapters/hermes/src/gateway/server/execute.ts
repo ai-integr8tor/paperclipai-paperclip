@@ -696,6 +696,7 @@ export function mapFinalResultForTest(input: {
       strategy: input.strategy,
     },
     sessionDisplayId,
+    externalRunId: input.terminal.runId,
     resultJson: {
       run_id: input.terminal.runId,
       status: input.terminal.status,
@@ -954,6 +955,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         strategy,
       },
       sessionDisplayId: sessionKey ? redactText(sessionKey) : null,
+      externalRunId: runId,
     };
   }
 
