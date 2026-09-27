@@ -32,6 +32,7 @@ function makeCompany(id: string): Company {
     name: "Paperclip",
     description: null,
     status: "active",
+    operatorVisible: true,
     pauseReason: null,
     pausedAt: null,
     issuePrefix: "PAP",
@@ -191,5 +192,31 @@ describe("CompanyProvider", () => {
 
     expect(seen).toEqual([null, "company-1"]);
     expect(localStorage.getItem("paperclip.selectedCompanyId")).toBe("company-1");
+  });
+
+  it("does not bootstrap into an active runtime-only company", async () => {
+    localStorage.setItem("paperclip.selectedCompanyId", "runtime-only");
+    queryClient.setQueryData(queryKeys.companies.all, {
+      companies: [
+        { ...makeCompany("runtime-only"), operatorVisible: false },
+        makeCompany("holding"),
+      ],
+      unauthorized: false,
+    });
+    mockCompaniesApi.list.mockImplementation(() => new Promise(() => {}));
+    const seen: Array<string | null> = [];
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <CompanyProvider>
+            <Probe onSelectedCompanyId={(companyId) => seen.push(companyId)} />
+          </CompanyProvider>
+        </QueryClientProvider>,
+      );
+    });
+
+    expect(seen).toEqual([null, "holding"]);
+    expect(localStorage.getItem("paperclip.selectedCompanyId")).toBe("holding");
   });
 });

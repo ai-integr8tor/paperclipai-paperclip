@@ -11,6 +11,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Button } from "@/components/ui/button";
 import { useState } from "react";
+import { isOperatorVisibleCompany } from "../lib/company-visibility";
 
 function statusDotColor(status?: string): string {
   switch (status) {
@@ -33,7 +34,7 @@ interface CompanySwitcherProps {
 export function CompanySwitcher({ open: controlledOpen, onOpenChange }: CompanySwitcherProps = {}) {
   const [internalOpen, setInternalOpen] = useState(false);
   const { companies, selectedCompany, setSelectedCompanyId } = useCompany();
-  const sidebarCompanies = companies.filter((company) => company.status !== "archived");
+  const sidebarCompanies = companies.filter((company) => company.status !== "archived" && isOperatorVisibleCompany(company));
   const open = controlledOpen ?? internalOpen;
   const setOpen = onOpenChange ?? setInternalOpen;
 

@@ -36,6 +36,7 @@ import { useCompany } from "@/context/CompanyContext";
 import { useConferenceRoomChatEnabled } from "@/hooks/useConferenceRoomChatEnabled";
 import { useDialogActions } from "@/context/DialogContext";
 import { useCompanyOrder } from "@/hooks/useCompanyOrder";
+import { isOperatorVisibleCompany } from "@/lib/company-visibility";
 import { queryKeys } from "@/lib/queryKeys";
 import { cn, SIDEBAR_RAIL_HIDDEN_LABEL } from "@/lib/utils";
 import { useSidebar } from "../context/SidebarContext";
@@ -153,7 +154,7 @@ export function SidebarCompanyMenu({ open: controlledOpen, onOpenChange }: Sideb
     }),
   );
   const sidebarCompanies = useMemo(
-    () => companies.filter((company) => company.status !== "archived"),
+    () => companies.filter((company) => company.status !== "archived" && isOperatorVisibleCompany(company)),
     [companies],
   );
   const { data: session } = useQuery({

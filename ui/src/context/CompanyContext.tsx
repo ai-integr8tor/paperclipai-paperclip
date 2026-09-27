@@ -13,6 +13,7 @@ import { companiesApi } from "../api/companies";
 import { companiesListQueryOptions, type CompanyListResult } from "../api/companies-query";
 import { queryKeys } from "../lib/queryKeys";
 import type { CompanySelectionSource } from "../lib/company-selection";
+import { isOperatorVisibleCompany } from "../lib/company-visibility";
 type CompanySelectionOptions = { source?: CompanySelectionSource };
 
 interface CompanyContextValue {
@@ -73,7 +74,7 @@ export function CompanyProvider({ children }: { children: ReactNode }) {
   const companies = companiesResult.companies;
   const companyListUnauthorized = companiesResult.unauthorized;
   const sidebarCompanies = useMemo(
-    () => companies.filter((company) => company.status !== "archived"),
+    () => companies.filter((company) => company.status !== "archived" && isOperatorVisibleCompany(company)),
     [companies],
   );
 
@@ -137,8 +138,8 @@ export function CompanyProvider({ children }: { children: ReactNode }) {
   );
 
   const selectedCompany = useMemo(
-    () => companies.find((company) => company.id === selectedCompanyId) ?? null,
-    [companies, selectedCompanyId],
+    () => sidebarCompanies.find((company) => company.id === selectedCompanyId) ?? null,
+    [selectedCompanyId, sidebarCompanies],
   );
 
   const value = useMemo(

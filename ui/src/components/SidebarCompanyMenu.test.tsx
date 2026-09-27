@@ -72,6 +72,14 @@ vi.mock("@/context/CompanyContext", () => ({
         brandColor: "#a36a21",
         status: "active",
       },
+      {
+        id: "runtime-only-company",
+        issuePrefix: "WOR",
+        name: "Runtime-only Worker Tool Publisher",
+        brandColor: "#aa22aa",
+        status: "active",
+        operatorVisible: false,
+      },
     ],
     selectedCompany: {
       id: "company-1",
@@ -129,11 +137,11 @@ describe("SidebarCompanyMenu", () => {
     });
     mockAuthApi.signOut.mockResolvedValue(undefined);
     mockSidebarPreferencesApi.getCompanyOrder.mockResolvedValue({
-      orderedIds: ["company-1", "company-2", "company-3"],
+      orderedIds: ["company-1", "company-2", "company-3", "runtime-only-company"],
       updatedAt: null,
     });
     mockSidebarPreferencesApi.updateCompanyOrder.mockResolvedValue({
-      orderedIds: ["company-1", "company-2", "company-3"],
+      orderedIds: ["company-1", "company-2", "company-3", "runtime-only-company"],
       updatedAt: null,
     });
     mockLocation.pathname = "/PAP/dashboard";
@@ -210,6 +218,7 @@ describe("SidebarCompanyMenu", () => {
     expect(document.body.textContent).toContain("Edit");
     expect(document.body.textContent).toContain("Strata");
     expect(document.body.textContent).toContain("ANA");
+    expect(document.body.textContent).not.toContain("Runtime-only Worker Tool Publisher");
     expect(document.body.textContent).toContain("Create new team...");
     expect(document.body.textContent).toContain("Invite people to Acme Labs");
     expect(document.body.textContent).toContain("Company settings");
