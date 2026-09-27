@@ -493,5 +493,8 @@ Then fix forward with a new stable release.
 - [`scripts/create-github-release.sh`](../scripts/create-github-release.sh)
 - [`scripts/rollback-latest.sh`](../scripts/rollback-latest.sh)
 - [`doc/RELEASE-CHECKLIST.md`](RELEASE-CHECKLIST.md)
+- [`doc/releases/README.md`](releases/README.md) — governance templates, sign-off/handoff sequence
+- [`doc/releases/readiness-checklist.md`](releases/readiness-checklist.md) — go/no-go readiness checklist
+- [`doc/releases/release-notes-template.md`](releases/release-notes-template.md) — notes template with rollback + monitoring verification
 - [`doc/PUBLISHING.md`](PUBLISHING.md)
 - [`doc/RELEASE-AUTOMATION-SETUP.md`](RELEASE-AUTOMATION-SETUP.md)
