@@ -119,6 +119,12 @@ second-line\" status=401`;
     const whitespaceJwt = `${whitespaceHeader}.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJlMTIz`;
     expect(redactDiagnosticText(whitespaceJwt)).toBe(REDACTED_COMMAND_TEXT_VALUE);
 
+    const jwsHeaderWithEnc = Buffer.from(
+      '{"alg":"HS256","enc":"diagnostic-context"}',
+    ).toString("base64url");
+    const jwsWithEnc = `${jwsHeaderWithEnc}.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJlMTIz`;
+    expect(redactDiagnosticText(jwsWithEnc)).toBe(REDACTED_COMMAND_TEXT_VALUE);
+
     const jweHeader = Buffer.from('{"alg":"RSA-OAEP","enc":"A256GCM"}').toString(
       "base64url",
     );

@@ -137,15 +137,21 @@ function redactJwtCandidate(candidate: string, redactedValue: string): string {
   if (headerIndex < 0) return candidate;
 
   const tokenSegmentCount = getJoseCompactSegmentCount(segments[headerIndex]!);
-  if (tokenSegmentCount === null || segments.length - headerIndex < tokenSegmentCount) {
+  const remainingSegmentCount = segments.length - headerIndex;
+  if (tokenSegmentCount === null || remainingSegmentCount < 3) {
     return candidate;
   }
 
   // A compact JWS has three segments and a compact JWE has five. Redact at
   // the exact shape declared by the protected header, preserving any dotted
   // identifier prefix or suffix that the broad candidate matcher included.
+  // An `enc` member is only a JWE hint: a signed JWS may carry additional
+  // protected-header parameters. If fewer than five segments exist, redact
+  // every available segment rather than allowing a three-segment credential
+  // to pass through unchanged.
+  const redactedSegmentCount = Math.min(tokenSegmentCount, remainingSegmentCount);
   const prefix = segments.slice(0, headerIndex);
-  const suffix = segments.slice(headerIndex + tokenSegmentCount);
+  const suffix = segments.slice(headerIndex + redactedSegmentCount);
   return [...prefix, redactedValue, ...suffix].join(".");
 }
 
