@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { Router, type Request } from "express";
 import { and, count as countFn, eq } from "drizzle-orm";
+import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import { agents as agentsTable } from "@paperclipai/db";
 import {
@@ -454,6 +455,29 @@ export function companyRoutes(db: Db, storage?: StorageService) {
       return;
     }
     res.json(company);
+  });
+
+  // Platform-only migration for the legacy AgentSwarm per-business surface.
+  // This is not an approval action: it is marker validated by the service and
+  // returns a deferred result while the legacy company has an active run.
+  router.post("/:companyId/consolidate-legacy-agentswarm-business", async (req, res) => {
+    assertBoard(req);
+    const sourceCompanyId = req.params.companyId as string;
+    assertCompanyAccess(req, sourceCompanyId);
+    const body = z.object({
+      targetCompanyId: z.string().uuid(),
+      businessId: z.string().min(1),
+      holdingId: z.string().min(1),
+    }).strict().parse(req.body);
+    assertCompanyAccess(req, body.targetCompanyId);
+    const result = await svc.consolidateLegacyAgentSwarmBusiness({
+      sourceCompanyId,
+      targetCompanyId: body.targetCompanyId,
+      businessId: body.businessId,
+      holdingId: body.holdingId,
+      actor: getActorInfo(req),
+    });
+    res.json(result);
   });
 
   router.delete("/:companyId", async (req, res) => {
