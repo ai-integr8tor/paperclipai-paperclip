@@ -38,6 +38,7 @@ import {
   companies,
   companyMemberships,
   companySecretBindings,
+  managedAgentProfiles,
   companySecrets,
   principalPermissionGrants,
   userSecretDefinitions,
@@ -6026,6 +6027,19 @@ export function toolAccessService(
         ),
       );
     for (const row of foreignBindings) referencedElsewhere.add(row.secretId);
+
+    // A managed-agent profile holds its API key through a restrict foreign
+    // key, so deleting a secret it uses would fail.
+    const profileRefs = await db
+      .select({ secretId: managedAgentProfiles.apiKeySecretId })
+      .from(managedAgentProfiles)
+      .where(
+        and(
+          eq(managedAgentProfiles.companyId, connection.companyId),
+          inArray(managedAgentProfiles.apiKeySecretId, unique),
+        ),
+      );
+    for (const row of profileRefs) referencedElsewhere.add(row.secretId);
 
     // Bindings are the authority, but read the sibling refs too: a row written
     // before `syncCredentialBindings` existed — or by hand — can reference a
@@ -14076,17 +14090,6 @@ export function toolAccessService(
       }
     }
 
-    // Revoke replaced values before committing the new refs. A replaced value
-    // was never resolvable, and a retry that finds its ref still in place
-    // replaces it again, so a failure at either step stays recoverable.
-    await removeReplacedConnectionSecrets(connection, replacedSecretIds, {
-      grantId: personalIdentity?.grant?.id ?? null,
-      keptSecretIds: [
-        ...credentialRefs.map((ref) => ref.secretId),
-        ...connection.credentialSecretRefs.map((ref) => ref.secretId),
-        ...credentialSecretRefs.map((ref) => ref.secretId),
-      ],
-    });
     const updated = await db.transaction(async (tx) => {
       const updatedAt = new Date();
       if (personalIdentity) {
@@ -14135,6 +14138,7 @@ export function toolAccessService(
       updated,
       personalIdentity ? credentialSecretRefs : [],
     );
+    await removeReplacedConnectionSecrets(updated, replacedSecretIds);
     const health = await checkConnectionHealth(updated.id, actor);
     const refresh = await refreshCatalog(updated.id, actor, {
       enableAllByDefault: true,
@@ -14157,35 +14161,43 @@ export function toolAccessService(
   }
 
   /**
-   * Revoke credentials a reconnect replaced. `classifyConnectionSecrets` only
-   * looks at other connections, so also keep any secret this connection will
-   * still reference: the refs being committed and its other grants' refs.
+   * Revoke credentials a reconnect replaced, after the new refs are committed.
+   * `classifyConnectionSecrets` only looks at other consumers, so first keep
+   * any secret this connection still references through its own refs or any
+   * of its grants. Cleanup is best effort: the reconnect already succeeded,
+   * and a value left behind was never resolvable for the personal grant.
    */
   async function removeReplacedConnectionSecrets(
     connection: typeof toolConnections.$inferSelect,
     secretIds: string[],
-    kept: { grantId: string | null; keptSecretIds: string[] },
   ) {
     if (secretIds.length === 0) return;
-    const otherGrants = await db
-      .select({ refs: connectionGrants.credentialSecretRefs })
-      .from(connectionGrants)
-      .where(
-        and(
-          eq(connectionGrants.companyId, connection.companyId),
-          eq(connectionGrants.connectionId, connection.id),
-          kept.grantId ? ne(connectionGrants.id, kept.grantId) : undefined,
-        ),
+    try {
+      const grantRows = await db
+        .select({ refs: connectionGrants.credentialSecretRefs })
+        .from(connectionGrants)
+        .where(
+          and(
+            eq(connectionGrants.companyId, connection.companyId),
+            eq(connectionGrants.connectionId, connection.id),
+          ),
+        );
+      const stillReferenced = new Set([
+        ...connection.credentialRefs.map((ref) => ref.secretId),
+        ...connection.credentialSecretRefs.map((ref) => ref.secretId),
+        ...grantRows.flatMap((row) => (row.refs ?? []).map((ref) => ref.secretId)),
+      ]);
+      const { owned } = await classifyConnectionSecrets(
+        connection,
+        secretIds.filter((id) => !stillReferenced.has(id)),
       );
-    const stillReferenced = new Set([
-      ...kept.keptSecretIds,
-      ...otherGrants.flatMap((row) => (row.refs ?? []).map((ref) => ref.secretId)),
-    ]);
-    const { owned } = await classifyConnectionSecrets(
-      connection,
-      secretIds.filter((id) => !stillReferenced.has(id)),
-    );
-    for (const secretId of owned) await secrets.remove(secretId);
+      for (const secretId of owned) await secrets.remove(secretId);
+    } catch (error) {
+      logger.warn(
+        { err: error, companyId: connection.companyId, connectionId: connection.id },
+        "tool connection reconnect could not revoke a replaced credential",
+      );
+    }
   }
 
   async function startOAuth(

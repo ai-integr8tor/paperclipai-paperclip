@@ -22,6 +22,7 @@ import {
   connectionGrants,
   connectionTokenIssuances,
   companySecrets,
+  managedAgentProfiles,
   companySecretVersions,
   createDb,
   heartbeatRuns,
@@ -828,6 +829,7 @@ describeEmbeddedPostgres("tool access service", () => {
     await db.delete(connectionTokenIssuances);
     await db.delete(secretAccessEvents);
     await db.delete(companySecretBindings);
+    await db.delete(managedAgentProfiles);
     await db.delete(companySecrets);
     await db.delete(activityLog);
     await db.delete(toolCallEvents);
@@ -11664,9 +11666,10 @@ describeEmbeddedPostgres("tool access service", () => {
   });
 
   it.each([
-    { shared: false, outcome: "revokes" },
-    { shared: true, outcome: "keeps" },
-  ])("replaces a legacy company-scoped personal credential on reconnect and $outcome the old secret (shared with the organization slot: $shared)", async ({ shared }) => {
+    { sharedWith: "nothing", kept: false },
+    { sharedWith: "the organization slot", kept: true },
+    { sharedWith: "a managed-agent profile", kept: true },
+  ])("replaces a legacy company-scoped personal credential on reconnect when the old secret is shared with $sharedWith", async ({ sharedWith, kept }) => {
     const company = await createCompany(db);
     const service = createTestToolAccessService(db);
     mockToolsList([{ name: "search_memories", annotations: { readOnlyHint: true } }]);
@@ -11686,8 +11689,14 @@ describeEmbeddedPostgres("tool access service", () => {
     const [row] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
     await db.update(toolConnections).set({
       credentialRefs: row!.credentialRefs.map((ref) => ({ ...ref, secretId: legacy.id })),
-      credentialSecretRefs: shared ? [{ ...grantRef!, secretId: legacy.id }] : [],
+      credentialSecretRefs: sharedWith === "the organization slot" ? [{ ...grantRef!, secretId: legacy.id }] : [],
     }).where(eq(toolConnections.id, connected.connectionId));
+    if (sharedWith === "a managed-agent profile") {
+      await db.insert(managedAgentProfiles).values({
+        companyId: company.id, profileKey: `legacy-${randomUUID()}`, displayName: "Legacy profile",
+        anthropicAgentId: "agent", agentVersion: "1", environmentId: "env", apiKeySecretId: legacy.id,
+      });
+    }
 
     await service.reconnectGalleryApp(connected.connectionId, company.id,
       { credentialValues: { "credentials.authorization": "new-key" } }, actor);
@@ -11703,7 +11712,8 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(resolved?.value).toBe("new-key");
     const connection = await service.getConnection(connected.connectionId, company.id);
     expect(connection.credentialRefs.map((credentialRef) => credentialRef.secretId)).toEqual([ref.secretId]);
-    expect(await db.select().from(companySecrets).where(eq(companySecrets.id, legacy.id))).toHaveLength(shared ? 1 : 0);
+    const legacyRows = await db.select().from(companySecrets).where(eq(companySecrets.id, legacy.id));
+    expect(legacyRows.map((row) => row.status)).toEqual(kept ? ["active"] : []);
   });
 
   it("keeps rejected Mem0 API keys on the key-entry path rather than switching to OAuth", async () => {
