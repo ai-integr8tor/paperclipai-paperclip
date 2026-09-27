@@ -6,6 +6,7 @@ trap 'printf "Paperclip server smoke failed at line %s\n" "$LINENO" >&2' ERR
 repo_root=$(cd -- "$(dirname -- "$0")/../.." && pwd)
 scratch_parent=${PAPERCLIP_RUN_SCRATCH_DIR:-${TMPDIR:-/tmp}}
 scratch=$(mktemp -d "$scratch_parent/paperclip-db-server-e2e.XXXXXX")
+chmod 0755 "$scratch"
 container="paperclip-db-e2e-$$"
 server_pid=
 cleanup() {
@@ -53,8 +54,12 @@ cat > "$scratch/config.json" <<EOF
  "server":{"deploymentMode":"local_trusted","exposure":"private","host":"127.0.0.1","port":$server_port,"serveUi":false},
  "telemetry":{"enabled":false}}
 EOF
-printf 'postgres://paperclip:%s@127.0.0.1:%s/paperclip\n' "$password" "$db_port" > "$scratch/database-url"
+printf 'postgres://paperclip:%s@127.0.0.1:%s/paperclip?application_name=credential_smoke\n' "$password" "$db_port" > "$scratch/database-url"
 chmod 0600 "$scratch/database-url"
+cp "$repo_root/scripts/smoke/paperclip-db-credential-agent-probe.py" "$scratch/agent-probe.py"
+chmod 0644 "$scratch/agent-probe.py"
+docker build -q -f "$repo_root/ops/paperclip-db-credential/Dockerfile.e2e" \
+  -t paperclip-db-credential-e2e:local "$repo_root/ops/paperclip-db-credential" >/dev/null
 setsid env -i PATH="$PATH" HOME="$scratch/home" \
   PAPERCLIP_HOME="$scratch/home" PAPERCLIP_CONFIG="$scratch/config.json" \
   PAPERCLIP_DATABASE_URL_FILE="$scratch/database-url" \
@@ -79,13 +84,11 @@ if grep -F "$password" "$scratch/server.log" >/dev/null; then
   echo "Paperclip log contains the synthetic DB password" >&2
   exit 1
 fi
-mkdir -m 0700 "$scratch/agent-home"
 env -i PATH="$PATH" HOME="$scratch/home" \
   PAPERCLIP_HOME="$scratch/home" PAPERCLIP_CONFIG="$scratch/config.json" \
   PAPERCLIP_DATABASE_URL_FILE="$scratch/database-url" \
   PAPERCLIP_AGENT_JWT_SECRET=synthetic-jwt-signing-key-for-e2e-only \
-  PAPERCLIP_JWT_AGENT_HOME="$scratch/agent-home" \
   "$repo_root/server/node_modules/.bin/tsx" \
   "$repo_root/server/scripts/paperclip-db-credential-jwt-probe.ts" \
-  "http://127.0.0.1:$server_port"
-echo "Paperclip file-backed DB smoke passed: /api/health HTTP $code, log credential leak 0, JWT/API 2 checks"
+  "http://127.0.0.1:$server_port" "$scratch"
+echo "Paperclip file-backed DB smoke passed: /api/health HTTP $code, pg_dump/psql restore 2 checks, log credential leak 0, local+sandbox launcher/UID/JWT API 6 checks"
