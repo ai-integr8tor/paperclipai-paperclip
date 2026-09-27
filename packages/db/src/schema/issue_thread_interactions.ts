@@ -1,4 +1,5 @@
 import type {
+  DecisionBrief,
   IssueThreadInteractionCanonicalResolverPolicy,
   IssueThreadInteractionEffectiveResolverPolicySource,
   IssueThreadInteractionPayload,
@@ -45,6 +46,7 @@ export const issueThreadInteractions = pgTable(
     sourceRunId: uuid("source_run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
     title: text("title"),
     summary: text("summary"),
+    brief: jsonb("brief").$type<DecisionBrief>(),
     createdByAgentId: uuid("created_by_agent_id").references(() => agents.id),
     addresseeAgentId: uuid("addressee_agent_id").references(() => agents.id, { onDelete: "set null" }),
     addresseeUserId: text("addressee_user_id"),

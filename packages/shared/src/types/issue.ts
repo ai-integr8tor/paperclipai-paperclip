@@ -788,6 +788,8 @@ export interface Issue {
   title: string;
   description: string | null;
   descriptionTruncated?: boolean;
+  /** Up to 3 short paragraphs: what the task is for and its expected outcome. */
+  summary?: string | null;
   status: IssueStatus;
   workMode: IssueWorkMode;
   priority: IssuePriority;

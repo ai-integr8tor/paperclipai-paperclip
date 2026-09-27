@@ -1,4 +1,4 @@
-import type { DecisionInput, DecisionOption } from "@paperclipai/shared";
+import type { DecisionBrief, DecisionInput, DecisionOption } from "@paperclipai/shared";
 import { sql } from "drizzle-orm";
 import {
   index,
@@ -46,6 +46,7 @@ export const decisions = pgTable(
     ruleKey: text("rule_key"),
     title: text("title").notNull(),
     body: text("body").notNull(),
+    brief: jsonb("brief").$type<DecisionBrief>(),
     options: jsonb("options").$type<DecisionOption[]>().notNull(),
     inputs: jsonb("inputs").$type<DecisionInput[]>(),
     status: text("status").notNull().default("open"),

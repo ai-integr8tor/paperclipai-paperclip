@@ -39,6 +39,7 @@ export const issues = pgTable(
     parentId: uuid("parent_id").references((): AnyPgColumn => issues.id),
     title: text("title").notNull(),
     description: text("description"),
+    summary: text("summary"),
     status: text("status").notNull().default("backlog"),
     statusVersion: bigint("status_version", { mode: "number" }).notNull().default(0),
     lastStatusDecisionId: uuid("last_status_decision_id"),

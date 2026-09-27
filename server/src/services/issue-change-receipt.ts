@@ -32,6 +32,7 @@ export function buildIssueChanges(
 
     const longText =
       key === "description" ||
+      key === "summary" ||
       (key === "title" &&
         ((typeof from === "string" && Array.from(from).length > ISSUE_CHANGE_TEXT_BUDGET) ||
           (typeof to === "string" && Array.from(to).length > ISSUE_CHANGE_TEXT_BUDGET)));

@@ -1945,6 +1945,8 @@ export {
   COMPANY_SEARCH_MAX_TOKENS,
   type CompanySearchExtractQuery,
   type CompanySearchQuery,
+  ISSUE_SUMMARY_LIMITS,
+  issueSummarySchema,
   createIssueSchema,
   createIssueInputSchema,
   createChildIssueSchema,

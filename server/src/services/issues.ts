@@ -4849,6 +4849,7 @@ const issueListSelect = {
   goalId: issues.goalId,
   parentId: issues.parentId,
   title: issues.title,
+  summary: issues.summary,
   description: sql<string | null>`
     CASE
       WHEN ${issues.description} IS NULL THEN NULL

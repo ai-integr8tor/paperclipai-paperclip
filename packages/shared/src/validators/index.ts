@@ -416,6 +416,8 @@ export {
 } from "./document-annotation.js";
 
 export {
+  ISSUE_SUMMARY_LIMITS,
+  issueSummarySchema,
   createIssueSchema,
   createIssueInputSchema,
   createChildIssueSchema,
