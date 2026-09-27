@@ -113,6 +113,9 @@ without a `brief` returns **422** with the message
 
 - an interaction whose effective resolver policy is `human_only`, or that has an
   `addresseeUserId`;
+  - Server-generated interactions (tool-gateway confirmations and elicitations,
+    the onboarding opening question, connection/secret/tool-access cards) are
+    exempt in phase 1.
 - any standalone decision;
 - any approval created through `POST /companies/:companyId/approvals` (server-generated
   approvals — agent hire requests, budget overrides, tool-gateway approvals — are
@@ -293,7 +296,7 @@ interaction kinds table:
 
 - **When a brief is required.** For any question or decision a human may
   answer (default `anyone`, `human_only`, `addresseeUserId`), every standalone
-  decision, and every approval. It is optional when the question is addressed
+  decision, and every approval requested through the approvals API. It is optional when the question is addressed
   to an agent.
 - **What the three paragraphs contain.**
   - `whatIsHappening`: the work in progress, who requested it, and the parent

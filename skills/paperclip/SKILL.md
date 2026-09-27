@@ -342,7 +342,7 @@ Humans answering your questions do not see your run. Give them the context in a 
 }
 ```
 
-- **When:** on every interaction a human may answer (default `anyone`, `human_only`, or `addresseeUserId`), every standalone decision, and every approval you request through `POST /api/companies/{companyId}/approvals`. Optional when you address another agent with `addresseeAgentId`. A company may require it; a missing brief then fails with 422. Include a brief on every approval you request through the approvals API.
+- **When:** on every interaction a human may answer (default `anyone`, `human_only`, or `addresseeUserId`), every standalone decision, and every approval you request through `POST /api/companies/{companyId}/approvals`. Optional when you address another agent with `addresseeAgentId`. A company may require it; a missing brief then fails with 422.
 - **whatIsHappening:** the work in progress, who requested it, and the parent task.
 - **whyStopped:** the concrete fact that blocked you and why the decision is not yours to make.
 - **whatWeNeed:** the question and the consequence of each option. Put your pick in `recommendation`, not here.
