@@ -114,7 +114,9 @@ without a `brief` returns **422** with the message
 - an interaction whose effective resolver policy is `human_only`, or that has an
   `addresseeUserId`;
 - any standalone decision;
-- any approval.
+- any approval created through `POST /companies/:companyId/approvals` (server-generated
+  approvals — agent hire requests, budget overrides, tool-gateway approvals — are
+  exempt in phase 1).
 
 Interactions addressed to an agent (`addresseeAgentId`) or left to the
 default `anyone` audience are exempt. The flag is editable by board users in
