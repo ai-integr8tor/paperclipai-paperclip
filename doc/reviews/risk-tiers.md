@@ -119,4 +119,7 @@ Path heuristics that suggest elevated risk (non-exhaustive):
 - [CONTRIBUTING.md](../../CONTRIBUTING.md)
 - [CODEOWNERS](../../.github/CODEOWNERS)
 - [Release checklist](../RELEASE-CHECKLIST.md)
+
+<!-- Release note: PR dedup-search checkbox checked after Commitperclip gate (PSVA-1551). -->
+<!-- Release note: PR body linked-issue fields filled for Commitperclip gate (PSVA-1524). -->
 <!-- Release note: PR retitled feat(ci) after ci: prefix rejected source changes (PSVA-1551). -->
