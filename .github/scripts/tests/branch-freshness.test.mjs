@@ -474,6 +474,74 @@ test('all known heads begin invalidation without waiting for an earlier status w
   await run
 })
 
+test('a stalled invalidation and retry are bounded without blocking other comparisons', async () => {
+  const stalledHead = head
+  const healthyHead = 'c'.repeat(40)
+  const statuses = []
+  const comparedHeads = []
+  const errors = []
+  let failure
+  const pulls = [
+    { number: 41, head: { sha: stalledHead } },
+    { number: 42, head: { sha: healthyHead } },
+  ]
+  const github = {
+    request: rulesetRequest(),
+    paginate: async () => pulls,
+    rest: {
+      git: { getRef: async () => ({ data: { object: { sha: base } } }) },
+      pulls: {
+        list: async () => ({ data: pulls }),
+        get: async ({ pull_number: number }) => ({
+          data: {
+            state: 'open',
+            base: { ref: 'master' },
+            head: { sha: number === 41 ? stalledHead : healthyHead },
+          },
+        }),
+      },
+      repos: {
+        createCommitStatus: async ({ sha, state, description }) => {
+          statuses.push({ sha, state, description })
+          if (sha === stalledHead && state === 'pending') {
+            return new Promise(() => {})
+          }
+        },
+        compareCommitsWithBasehead: async ({ basehead }) => {
+          const comparedHead = basehead.split('...')[1]
+          comparedHeads.push(comparedHead)
+          return { data: comparison({ behind_by: 1 }) }
+        },
+      },
+    },
+  }
+  const context = {
+    eventName: 'push',
+    payload: { after: base },
+    sha: base,
+    repo: { owner: 'paperclipai', repo: 'paperclip' },
+    runId: 1,
+    serverUrl: 'https://github.com',
+  }
+  const core = {
+    error: (message) => errors.push(message),
+    setFailed: (message) => { failure = message },
+  }
+
+  await runBranchFreshness({
+    github,
+    context,
+    core,
+    invalidationTimeoutMs: 5,
+  })
+
+  assert.deepEqual(comparedHeads, [healthyHead])
+  assert.equal(statuses.filter(({ sha, state }) => sha === stalledHead && state === 'pending').length, 2)
+  assert.match(errors[0], /timed out after 5ms/)
+  assert.match(errors[1], /retry failed: .*timed out after 5ms/)
+  assert.match(failure, /comparison was unavailable or stale/)
+})
+
 test('a base change during success publication overwrites the transient success', async () => {
   const newerBase = 'c'.repeat(40)
   const statuses = []

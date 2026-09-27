@@ -88,6 +88,7 @@ export async function runBranchFreshness({
   statusContext = 'branch-freshness',
   rulesetId = 13619726,
   statusIntegrationId = 15368,
+  invalidationTimeoutMs = 10_000,
 }) {
   const statusTargetUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
 
@@ -122,7 +123,7 @@ export async function runBranchFreshness({
     })
   }
 
-  async function publish(headSha, state, description) {
+  async function publish(headSha, state, description, signal) {
     await github.rest.repos.createCommitStatus({
       ...context.repo,
       sha: requireSha(headSha, 'Status head'),
@@ -130,7 +131,26 @@ export async function runBranchFreshness({
       state,
       description,
       target_url: statusTargetUrl,
+      ...(signal ? { request: { signal } } : {}),
     })
+  }
+
+  async function publishInvalidation(headSha, description, label) {
+    const controller = new AbortController()
+    let timeout
+    try {
+      await Promise.race([
+        publish(headSha, 'pending', description, controller.signal),
+        new Promise((_, reject) => {
+          timeout = setTimeout(() => {
+            controller.abort()
+            reject(new Error(`${label} timed out after ${invalidationTimeoutMs}ms`))
+          }, invalidationTimeoutMs)
+        }),
+      ])
+    } finally {
+      clearTimeout(timeout)
+    }
   }
 
   async function publishEnumerationError(error) {
@@ -263,10 +283,10 @@ export async function runBranchFreshness({
 
   async function invalidate(candidate) {
     const observedHeadSha = requireSha(candidate.headSha, `PR #${candidate.number} event head`)
-    await publish(
+    await publishInvalidation(
       observedHeadSha,
-      'pending',
       `Checking head against protected ${protectedBase}.`,
+      `PR #${candidate.number} pending status`,
     )
     return { ...candidate, observedHeadSha }
   }
