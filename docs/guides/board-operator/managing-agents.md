@@ -37,6 +37,26 @@ Use `hermes_local` when Paperclip should start the local Hermes CLI. Use
 should call that server. Both are built-in adapter types from the unified
 `@paperclipai/hermes-paperclip-adapter` package.
 
+### Hermes with an OpenAI-compatible custom endpoint
+
+For a service such as OneProvider, first configure and verify its
+`/v1/chat/completions` endpoint in Hermes. In Hermes `config.yaml`, a single
+endpoint uses `model.default` (the exact verified model ID),
+`model.provider: custom`, and `model.base_url` (the verified API base URL).
+See the [Hermes provider guide](https://hermes-agent.nousresearch.com/docs/integrations/providers)
+for single and named endpoint examples. Supply the inference key through an
+authorized secret channel; do not include it in an agent description.
+
+Create the Paperclip agent with `hermes_local` if Paperclip starts Hermes, or
+`hermes_gateway` if it calls an already-running Hermes API server. For the
+local adapter, leave its provider and model on `auto` to use the verified
+Hermes default; the adapter's provider allowlist does not include `custom`.
+For the gateway adapter, `apiBaseUrl` and `apiKey` connect Paperclip to the
+Hermes server, not to the model endpoint. Paperclip `adapterConfig` is
+separate from Hermes `config.yaml`. Check existing agents before creating a
+duplicate and use **Test Environment** before relying on the new agent.
+An endpoint label alone does not establish model availability or compatibility.
+
 For `opencode_local`, configure an explicit `adapterConfig.model` (`provider/model`).
 Paperclip validates the selected model against live `opencode models` output.
 
