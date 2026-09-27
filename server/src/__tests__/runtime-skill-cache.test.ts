@@ -44,6 +44,7 @@ describe("runtime skill revision cache", () => {
     const sources = await Promise.all(Array.from({ length: 20 }, () => resolveRuntimeSkillCache(spec, read)));
     expect(new Set(sources).size).toBe(1);
     expect(read).toHaveBeenCalledTimes(2);
+    expect((await fs.stat(spec.entry)).mode & 0o222).toBe(0);
     expect((await fs.stat(sources[0]!)).mode & 0o222).toBe(0);
     expect((await fs.stat(path.join(sources[0]!, "SKILL.md"))).mode & 0o222).toBe(0);
     const before = await fs.stat(path.join(sources[0]!, "SKILL.md"));
@@ -129,6 +130,21 @@ describe("runtime skill revision cache", () => {
     expect(read).toHaveBeenCalledTimes(2);
     expect(await fs.readFile(path.join(source, "SKILL.md"), "utf8")).toBe(contents["SKILL.md"]);
     if (corruption === "symlink") expect(await fs.readFile(path.join(root, "outside.txt"), "utf8")).toBe("outside");
+    expect((await fs.stat(spec.entry)).mode & 0o222).toBe(0);
+    const displaced = (await fs.readdir(spec.root)).filter((name) => name.startsWith(".invalid-"));
+    expect(displaced).toHaveLength(1);
+    expect((await fs.stat(path.join(spec.root, displaced[0]!))).mode & 0o222).toBe(0);
+  });
+
+  it("rebuilds an entry that an interrupted publisher left writable", async () => {
+    const spec = runtimeSkillCacheSpec(root, skill)!;
+    const source = await resolveRuntimeSkillCache(spec, reader());
+    await fs.chmod(spec.entry, 0o700);
+    const read = reader();
+    expect(await resolveRuntimeSkillCache(spec, read, false)).toBeNull();
+    expect(await resolveRuntimeSkillCache(spec, read)).toBe(source);
+    expect(read).toHaveBeenCalledTimes(2);
+    expect((await fs.stat(spec.entry)).mode & 0o222).toBe(0);
   });
 
   it("does not publish partial builds and retries after a failed upstream read", async () => {
