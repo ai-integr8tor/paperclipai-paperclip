@@ -1505,6 +1505,17 @@ export const requestConfirmationSecretProposalPayloadSchema = z.object({
   expiresAt: z.string().datetime({ offset: true }),
 });
 
+export const executionGrantRequestPayloadSchema = z.object({
+  version: z.literal(1),
+  executorAgentId: z.string().guid(),
+  targetAgentId: z.string().guid(),
+  operation: z.literal("agent_config:update"),
+  targetRevisionId: z.string().guid().nullable(),
+  requestHash: z.string().regex(/^[a-f0-9]{64}$/),
+  expiresAt: z.string().datetime({ offset: true }),
+  policyVersion: z.literal(1),
+});
+
 export const requestConfirmationPayloadSchema = z.object({
   version: z.literal(1),
   prompt: z.string().trim().min(1).max(1000),
@@ -1525,6 +1536,7 @@ export const requestConfirmationPayloadSchema = z.object({
   target: requestConfirmationTargetSchema.nullable().optional(),
   toolAction: requestConfirmationToolActionPayloadSchema.optional(),
   secretProposal: requestConfirmationSecretProposalPayloadSchema.optional(),
+  executionGrant: executionGrantRequestPayloadSchema.optional(),
 });
 
 export const requestCheckboxConfirmationOptionSchema = z.object({
