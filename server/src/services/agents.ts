@@ -18,6 +18,7 @@ import {
   issueExecutionDecisions,
   issues,
   issueComments,
+  principalPermissionGrants,
 } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -1089,6 +1090,13 @@ export function agentService(db: Db) {
             eq(companyMemberships.companyId, existing.companyId),
             eq(companyMemberships.principalType, "agent"),
             eq(companyMemberships.principalId, id),
+          ),
+        );
+        await tx.delete(principalPermissionGrants).where(
+          and(
+            eq(principalPermissionGrants.companyId, existing.companyId),
+            eq(principalPermissionGrants.principalType, "agent"),
+            eq(principalPermissionGrants.principalId, id),
           ),
         );
         const deleted = await tx

@@ -6,6 +6,7 @@ import {
   companies,
   companyMemberships,
   createDb,
+  principalPermissionGrants,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -32,6 +33,7 @@ describeEmbeddedPostgres("agent service remove", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
     await db.delete(agents);
     await db.delete(companies);
@@ -76,6 +78,20 @@ describeEmbeddedPostgres("agent service remove", () => {
         status: "active",
       },
     ]);
+    await db.insert(principalPermissionGrants).values([
+      {
+        companyId,
+        principalType: "agent",
+        principalId: agentId,
+        permissionKey: "tasks:assign",
+      },
+      {
+        companyId,
+        principalType: "user",
+        principalId: userId,
+        permissionKey: "tasks:assign",
+      },
+    ]);
 
     const removed = await agentService(db).remove(agentId);
 
@@ -97,6 +113,23 @@ describeEmbeddedPostgres("agent service remove", () => {
         eq(companyMemberships.principalType, "user"),
         eq(companyMemberships.principalId, userId),
         eq(companyMemberships.status, "active"),
+      ))).toHaveLength(1);
+    expect(await db
+      .select()
+      .from(principalPermissionGrants)
+      .where(and(
+        eq(principalPermissionGrants.companyId, companyId),
+        eq(principalPermissionGrants.principalType, "agent"),
+        eq(principalPermissionGrants.principalId, agentId),
+      ))).toEqual([]);
+    expect(await db
+      .select()
+      .from(principalPermissionGrants)
+      .where(and(
+        eq(principalPermissionGrants.companyId, companyId),
+        eq(principalPermissionGrants.principalType, "user"),
+        eq(principalPermissionGrants.principalId, userId),
+        eq(principalPermissionGrants.permissionKey, "tasks:assign"),
       ))).toHaveLength(1);
   });
 });
