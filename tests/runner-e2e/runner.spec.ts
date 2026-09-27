@@ -31,6 +31,7 @@ import {
   isOpenRouterDeepSeekHelloTerminalVariance,
   numberedPlanStepCount,
   providerSessionContinuityFailures,
+  reasoningProjectionFailures,
 } from "./run-observations.js";
 import { resolveRunnerE2ESource } from "./source.js";
 import { isValidNativePrpEnvelope } from "./native-event-envelope.js";
@@ -1779,7 +1780,9 @@ for (const execution of executions) {
       const pendingInteractions = terminal.interactions.filter(
         (interaction) => interaction.status === "pending",
       );
-      const invariantFailures: string[] = [];
+      const invariantFailures: string[] = reasoningProjectionFailures(
+        runEventsByRun.flatMap((entry) => entry.events),
+      );
       if (pendingInteractions.length > 0)
         invariantFailures.push(
           `expected no unresolved interaction; observed ${pendingInteractions.length}`,
