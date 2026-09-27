@@ -207,11 +207,7 @@ import {
   checkStagedGrokCredentialReadiness,
   promoteGrokDeviceLoginCredential,
 } from "@paperclipai/adapter-grok-local/server";
-import {
-  checkStagedMuseCredentialReadiness,
-  parseMuseAuthApiKey,
-  promoteMuseDeviceLoginCredential,
-} from "@paperclipai/adapter-muse-local/server";
+import { createMuseDeviceLoginPromotion } from "../services/muse-device-login-promotion.js";
 import {
   AdapterAuthSessionConflictError,
   createDeviceLoginService,
@@ -1101,44 +1097,15 @@ export function agentRoutes(
           }
         },
       },
-      muse_local: {
-        async promote(authBytes, context) {
-          const managedSession = await adapterLoginStore.get(context.sessionId);
-          if (managedSession?.aiConnection) {
-            await adapterLoginStore.withCompanyAdapterPromotionLock(context.companyId, context.startedByUserId, context.adapterType, async () => {
-              // Only the Meta API key is saved; the auth file's OAuth token and
-              // account identity never leave this function.
-              const key = checkStagedMuseCredentialReadiness(authBytes).ready
-                ? parseMuseAuthApiKey(authBytes.toString("utf8"))
-                : null;
-              if (!key) throw new Error("Provider credential is not ready");
-              await aiConnectionService(db).save(context.companyId, context.startedByUserId, managedSession.aiConnection!, key, context.sessionId);
-            });
-            return;
-          }
-          const outcome = await adapterLoginStore.withCompanyAdapterPromotionLock(
-            context.companyId,
-            context.startedByUserId,
-            context.adapterType,
-            () =>
-              promoteMuseDeviceLoginCredential({
-                authBytes,
-                companyId: context.companyId,
-                userInitiated: true,
-                isSoleActiveOwner: async () => {
-                  const row = await adapterLoginStore.get(context.sessionId);
-                  return row?.status === "promoting" && row.companyId === context.companyId;
-                },
-                log: (line) => {
-                  logger.info({ sessionId: context.sessionId }, line);
-                },
-              }),
-          );
-          if (outcome !== "promoted") {
-            throw new Error(`device-login credential promotion rejected: ${outcome}`);
-          }
+      muse_local: createMuseDeviceLoginPromotion({
+        store: adapterLoginStore,
+        saveAiConnection: (companyId, userId, intent, credential, sessionId) =>
+          aiConnectionService(db).save(companyId, userId, intent, credential, sessionId),
+        log: (line, context) => {
+          // Fixed status lines only: no key, token, or account identity.
+          logger.info({ sessionId: context.sessionId }, line);
         },
-      },
+      }),
     } satisfies Partial<Record<AgentAdapterType, CredentialPromotion>>,
     recordActivity: (event) => {
       // The event carries no URL, no code, no credential, no account identifier,
