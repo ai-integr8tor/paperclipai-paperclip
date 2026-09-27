@@ -153,6 +153,33 @@ describe("pluginLoader.loadAll error retry", () => {
     expect(result).toEqual({ total: 0, succeeded: 0, failed: 0, results: [] });
   });
 
+  it("rejects npm Kubernetes installs and persisted records before worker startup", async () => {
+    vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+    try {
+      const plugin = createPluginRecord({
+        pluginKey: "paperclip.kubernetes-sandbox-provider",
+        packageName: "@paperclipai/plugin-kubernetes",
+        packagePath: null,
+        status: "ready",
+      });
+      mockRegistry.getById.mockResolvedValue(plugin);
+      const runtime = createRuntimeServices();
+      const startWorker = vi.fn();
+      runtime.workerManager.startWorker = startWorker;
+      const loader = createLoader(runtime);
+
+      await expect(loader.installPlugin({ packageName: "@paperclipai/plugin-kubernetes" }))
+        .rejects.toThrow(/bundled Kubernetes sandbox provider/);
+      const result = await loader.loadSingle(plugin.id);
+
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/bundled Kubernetes sandbox provider/);
+      expect(startWorker).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("rejects distribution capability escalation before saving a runtime refresh or starting a worker", async () => {
     const root = realpathSync(mkdtempSync(path.join(os.tmpdir(), "distribution-refresh-")));
     try {

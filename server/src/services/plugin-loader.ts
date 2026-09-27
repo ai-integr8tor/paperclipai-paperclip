@@ -50,7 +50,7 @@ import type { PluginJobStore } from "./plugin-job-store.js";
 import type { PluginToolDispatcher } from "./plugin-tool-dispatcher.js";
 import type { PluginLifecycleManager } from "./plugin-lifecycle.js";
 import { pluginDatabaseService } from "./plugin-database.js";
-import { resolveBundledCatalogRoot } from "./bundled-plugins.js";
+import { isTrustedBundledKubernetesProvider, resolveBundledCatalogRoot } from "./bundled-plugins.js";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1214,6 +1214,13 @@ export function pluginLoader(
       throw new Error("Either packageName or localPath must be provided");
     }
 
+    // npm manifests are executable modules. Reject the unverified provider
+    // before npm install or manifest import when local-key isolation is active.
+    if (process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true" &&
+        !localPath && packageName === "@paperclipai/plugin-kubernetes") {
+      throw new Error("Isolated local secrets require the bundled Kubernetes sandbox provider.");
+    }
+
     const targetInstallDir = installDir ?? localPluginDir;
 
     // Step 1 & 2: Resolve and install package
@@ -2256,6 +2263,13 @@ export function pluginLoader(
     } = runtimeServices;
 
     try {
+      // A persisted npm record may predate isolation mode. Check its actual
+      // bundled path before manifest import, migrations, or worker startup.
+      if (process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true" &&
+          pluginKey === "paperclip.kubernetes-sandbox-provider" &&
+          !isTrustedBundledKubernetesProvider(activePlugin)) {
+        throw new Error("Isolated local secrets require the bundled Kubernetes sandbox provider.");
+      }
       log.info(
         { pluginId, pluginKey, version: plugin.version },
         "plugin-loader: activating plugin",

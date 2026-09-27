@@ -1,9 +1,6 @@
 import { readEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
 import { remoteTerminationReceipt } from "./remote-execution-termination.js";
 import { createHash, randomUUID } from "node:crypto";
-import { realpathSync } from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { companySecrets, companySecretVersions, environmentLeases, heartbeatRuns } from "@paperclipai/db";
@@ -88,37 +85,7 @@ import {
   type SandboxOrphanCleanupSpool,
 } from "./sandbox-orphan-cleanup-spool.js";
 import { logger } from "../middleware/logger.js";
-import { resolveBundledCatalogRoot } from "./bundled-plugins.js";
-
-const repoKubernetesProviderRoot = path.resolve(
-  path.dirname(fileURLToPath(import.meta.url)),
-  "../../../packages/plugins/sandbox-providers/kubernetes",
-);
-
-function isTrustedKubernetesProvider(plugin: {
-  pluginKey: string;
-  packageName: string;
-  packagePath: string | null;
-}): boolean {
-  if (plugin.pluginKey !== "paperclip.kubernetes-sandbox-provider" ||
-      plugin.packageName !== "@paperclipai/plugin-kubernetes") return false;
-  // Registry installs of the project-owned package have no local packagePath.
-  // A local install must be the exact bundled directory, including after
-  // resolving symlinks; a plugin-authored name and manifest are not identity.
-  if (plugin.packagePath === null) return true;
-  try {
-    const actual = realpathSync(plugin.packagePath);
-    return [
-      repoKubernetesProviderRoot,
-      path.join(resolveBundledCatalogRoot(process.env), "sandbox-providers/kubernetes"),
-    ].some((expected) => {
-      try { return actual === realpathSync(expected); }
-      catch { return false; }
-    });
-  } catch {
-    return false;
-  }
-}
+import { isTrustedBundledKubernetesProvider } from "./bundled-plugins.js";
 
 // The constant error kind for the durable orphan-cleanup-write-failed log. The
 // log never reads the caught exception, because the exception can carry a
@@ -1883,7 +1850,7 @@ function createSandboxEnvironmentDriver(
         // Another installed plugin can declare the same "kubernetes" driver
         // key and win lookup. Only the trusted provider may build the pod.
         if (process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true" &&
-            !isTrustedKubernetesProvider(pluginProvider.resolved.plugin)) {
+            !isTrustedBundledKubernetesProvider(pluginProvider.resolved.plugin)) {
           throw new Error("Isolated local secrets require the bundled Kubernetes sandbox provider.");
         }
 

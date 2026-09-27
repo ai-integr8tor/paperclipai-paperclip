@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -36,6 +37,11 @@ const adapterExecute = vi.hoisted(() => vi.fn(async () => ({
   provider: "test",
   model: "test-model",
 })));
+
+const bundledKubernetesPath = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "../../../packages/plugins/sandbox-providers/kubernetes",
+);
 
 vi.mock("../adapters/index.js", () => ({
   getServerAdapter: () => ({
@@ -343,7 +349,8 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
 
       await db.insert(plugins).values({
         id: pluginId, pluginKey: "paperclip.kubernetes-sandbox-provider",
-        packageName: "@paperclipai/plugin-kubernetes", version: "0.1.0", apiVersion: 1,
+        packageName: "@paperclipai/plugin-kubernetes", packagePath: bundledKubernetesPath,
+        version: "0.1.0", apiVersion: 1,
         categories: ["automation"], status: "ready", installOrder: 1,
         manifestJson: {
           id: "paperclip.kubernetes-sandbox-provider", apiVersion: 1, version: "0.1.0",
@@ -388,12 +395,23 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
         expect(leases).toHaveLength(1);
         expect(leases[0]?.status).not.toBe("active");
       }, { timeout: 5_000 });
+      vi.mocked(workerManager.call).mockClear();
 
       await db.update(plugins).set({ packagePath: root }).where(eq(plugins.id, pluginId));
       const localSpoof = await seedCandidate({ driver: "sandbox", provider: "kubernetes" });
       const localSpoofRun = await runCandidate(localSpoof.agentId, localSpoof.projectId);
       expect(localSpoofRun.status).toBe("failed");
       expect(localSpoofRun.error).toMatch(/bundled Kubernetes sandbox provider/);
+
+      await db.update(plugins).set({
+        packagePath: null, packageName: "@paperclipai/plugin-kubernetes",
+      }).where(eq(plugins.id, pluginId));
+      const npmSpoof = await seedCandidate({ driver: "sandbox", provider: "kubernetes" });
+      const npmSpoofRun = await runCandidate(npmSpoof.agentId, npmSpoof.projectId);
+      expect(npmSpoofRun.status).toBe("failed");
+      expect(npmSpoofRun.error).toMatch(/bundled Kubernetes sandbox provider/);
+      expect(await db.select().from(environmentLeases)
+        .where(eq(environmentLeases.heartbeatRunId, npmSpoofRun.id))).toHaveLength(0);
 
       await db.update(plugins).set({ packagePath: null, packageName: "@other/spoofed-kubernetes" })
         .where(eq(plugins.id, pluginId));
@@ -402,6 +420,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
       expect(spoofedRun.status).toBe("failed");
       expect(spoofedRun.error).toMatch(/bundled Kubernetes sandbox provider/);
       expect(adapterExecute).toHaveBeenCalledTimes(1);
+      expect(workerManager.call).not.toHaveBeenCalled();
     } finally {
       await heartbeat.drainActiveRunExecutions();
       vi.unstubAllEnvs();

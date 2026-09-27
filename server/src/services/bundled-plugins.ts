@@ -1,5 +1,6 @@
 import path from "node:path";
 import fs from "node:fs";
+import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import { assertDistributionManifestCapabilities, readDistributionPluginCatalog, type DistributionPlugin } from "./distribution-plugin-catalog.js";
@@ -118,6 +119,31 @@ export function resolveBundledCatalogRoot(
 ): string {
   const override = env[BUNDLED_CATALOG_ROOT_ENV_VAR]?.trim();
   return override ? override : DEFAULT_BUNDLED_CATALOG_ROOT;
+}
+
+/** Registry metadata is not proof that an npm artifact is the bundled provider. */
+export function isTrustedBundledKubernetesProvider(
+  plugin: { pluginKey: string; packageName: string; packagePath: string | null },
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  if (plugin.pluginKey !== "paperclip.kubernetes-sandbox-provider" ||
+      plugin.packageName !== "@paperclipai/plugin-kubernetes" ||
+      !plugin.packagePath) return false;
+
+  const repoBundle = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "../../../packages/plugins/sandbox-providers/kubernetes",
+  );
+  const imageBundle = path.join(resolveBundledCatalogRoot(env), "sandbox-providers/kubernetes");
+  try {
+    const actual = fs.realpathSync(plugin.packagePath);
+    return [repoBundle, imageBundle].some((expected) => {
+      try { return actual === fs.realpathSync(expected); }
+      catch { return false; }
+    });
+  } catch {
+    return false;
+  }
 }
 
 export interface ResolvedBundledPlugin {

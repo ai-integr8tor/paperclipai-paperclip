@@ -220,9 +220,10 @@ The Kubernetes agent pod must exclude the server's key/instance directories,
 host Docker socket, host namespace entry points, and server database credentials
 from the agent filesystem and environment. An agent UID with Docker daemon
 access is root-equivalent and cannot be treated as isolated, even with `0600`.
-In isolation mode, dispatch accepts only the project-owned Kubernetes provider
-package from the registry or its exact bundled directory; a local path override
-outside that directory is refused.
+In isolation mode, the Kubernetes provider must resolve to the exact bundled
+directory. An npm install with the expected package name or plugin key is not
+trusted without artifact verification and is refused before its worker starts;
+a local path override outside the bundled directory is also refused.
 Host workspace provision, cleanup, teardown, and runtime service commands are
 refused in this mode because they would execute as the key-owning service UID.
 Agent-triggered local-stdio MCP connections are also refused, including their
