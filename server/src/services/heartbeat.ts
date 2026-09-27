@@ -25,6 +25,7 @@ import { claimQueuedNativeReviewRun } from "./native-runtime/native-review-dispa
 import { buildNativeReviewRequest } from "./native-runtime/native-review-prompt.js";
 import {
   legacyExecutionNeedsReconciliation,
+  shouldStampBootstrapExecutionRecovery,
   terminalizeLegacyExecution,
 } from "./legacy-execution-recovery.js";
 import {
@@ -25537,13 +25538,19 @@ export function heartbeatService(
               ...(workspaceValidationFailure?.resultJson ??
                 configurationIncompleteFailure?.resultJson ??
                 {}),
-              // Entering the adapter is not provider work. A missing command
-              // throws before spawn, so processPid stays null — stamp bootstrap
-              // evidence so stranded recovery cannot invent an action-outcome hold.
-              ...((!legacyAdapterEntered ||
-                (!(stopSnapshot?.processPid ?? run.processPid) &&
-                  !(stopSnapshot?.processStartedAt ?? run.processStartedAt))) &&
-              run.runtimeMode !== "native"
+              // Entering the adapter is not provider work. Process adapters that
+              // throw before spawn leave processPid null — stamp bootstrap so
+              // stranded recovery cannot invent an action-outcome hold. HTTP /
+              // cloud adapters can fail post-dispatch without process metadata;
+              // do not treat a null PID alone as bootstrap for those.
+              ...(shouldStampBootstrapExecutionRecovery({
+                legacyAdapterEntered,
+                runtimeMode: run.runtimeMode,
+                adapterType: agent.adapterType,
+                processPid: stopSnapshot?.processPid ?? run.processPid,
+                processStartedAt:
+                  stopSnapshot?.processStartedAt ?? run.processStartedAt,
+              })
                 ? {
                     executionRecovery: {
                       kind: "bootstrap",

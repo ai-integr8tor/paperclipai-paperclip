@@ -12,6 +12,51 @@ import { isSupersededConversationRun } from "./agent-conversations.js";
 type Run = typeof heartbeatRuns.$inferSelect;
 export const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
 
+/**
+ * Local process adapters that record processPid/processStartedAt on spawn.
+ * Keep in sync with heartbeat sessioned local adapters — both describe the
+ * same pre-spawn process path.
+ */
+export const PROCESS_PRE_SPAWN_ADAPTER_TYPES = new Set([
+  "claude_local",
+  "codex_local",
+  "cursor",
+  "gemini_local",
+  "hermes_local",
+  "kimi_local",
+  "opencode_local",
+  "pi_local",
+]);
+
+export function isProcessPreSpawnAdapterType(
+  adapterType: string | null | undefined,
+): boolean {
+  return PROCESS_PRE_SPAWN_ADAPTER_TYPES.has(adapterType ?? "");
+}
+
+/**
+ * Decide whether a failed legacy run should record bootstrap evidence
+ * (`executionRecovery.kind = "bootstrap"`, provider never started).
+ *
+ * Missing processPid after adapter entry means the process never launched
+ * (e.g. missing command) for process adapters. HTTP/cloud adapters do not
+ * use those fields, so a null PID after entry must not be classified as
+ * bootstrap — recovery would skip holds for unknown post-dispatch outcomes.
+ */
+export function shouldStampBootstrapExecutionRecovery(input: {
+  legacyAdapterEntered: boolean;
+  runtimeMode: string | null | undefined;
+  adapterType: string | null | undefined;
+  processPid?: number | null;
+  processStartedAt?: Date | string | null;
+}): boolean {
+  if (input.runtimeMode === "native") return false;
+  if (!input.legacyAdapterEntered) return true;
+  if (!isProcessPreSpawnAdapterType(input.adapterType)) return false;
+  return input.processPid == null && input.processStartedAt == null;
+}
+
+
 /** Error families describe availability, not whether earlier actions happened. */
 export function legacyExecutionNeedsReconciliation(
   run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot">>,
