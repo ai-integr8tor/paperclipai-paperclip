@@ -165,6 +165,13 @@ async function setTreeMode(directory: string, readonly: boolean): Promise<void> 
   if (readonly) await fs.chmod(directory, 0o555);
 }
 
+// macOS refuses to rename a directory the caller cannot write (its ".." entry changes);
+// Linux does not check. Only the entry itself is unlocked; its files/ tree stays read-only.
+async function renameDirectory(from: string, to: string): Promise<void> {
+  await fs.chmod(from, 0o700);
+  await fs.rename(from, to);
+}
+
 async function removeTree(directory: string): Promise<void> {
   await setTreeMode(directory, false);
   await fs.rm(directory, { recursive: true, force: true });
@@ -202,9 +209,10 @@ export async function resolveRuntimeSkillCache(
         if (!await matches(spec, staging)) throw new Error("Runtime skill cache validation failed");
         // Lifecycle mutations can update the DB while this builder owns the filesystem lock.
         if (!await stillInstalled()) throw new Error("Skill was renamed or removed during preparation");
-        await fs.rename(spec.entry, path.join(spec.root, `.invalid-${spec.fingerprint}-${randomUUID()}`))
+        await renameDirectory(spec.entry, path.join(spec.root, `.invalid-${spec.fingerprint}-${randomUUID()}`))
           .catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error; });
-        await fs.rename(staging, spec.entry);
+        await renameDirectory(staging, spec.entry);
+        await fs.chmod(spec.entry, 0o555);
         return path.join(spec.entry, "files");
       } finally { await removeTree(staging); }
     });
