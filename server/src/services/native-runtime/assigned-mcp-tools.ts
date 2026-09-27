@@ -10,16 +10,19 @@ const CALL_TOOL = "paperclip_call_assigned_tool";
 // A single valid runner schema can be 512 KiB. Leave room for its description
 // while keeping the complete result below the 768 KiB provider-result bound.
 const SEARCH_PAGE_BYTES = 640 * 1024;
+const SCHEMA_CHUNK_CHARACTERS = 64 * 1024;
 const ON_DEMAND_TOOLS: ToolDefinition[] = [
   {
     name: SEARCH_TOOL,
-    description: "Search your assigned app tools by name or description and read their input schemas. Use an empty query to browse. Pass nextOffset to fetch the next page, then use paperclip_call_assigned_tool with a returned name and arguments matching its inputSchema.",
+    description: "Search your assigned app tools by name or description and read their input schemas. Use an empty query to browse. Pass nextOffset to fetch the next page. A large definition returns inputSchemaRef: set schemaTool to that name with an empty query, then pass nextSchemaOffset until null. Concatenate schemaJson chunks and parse JSON. Use paperclip_call_assigned_tool with a returned name and arguments matching its inputSchema.",
     inputSchema: {
       type: "object", additionalProperties: false,
       properties: {
         query: { type: "string", maxLength: 200 },
         offset: { type: "integer", minimum: 0 },
         limit: { type: "integer", minimum: 1, maximum: 20 },
+        schemaTool: { type: "string", description: "Exact inputSchemaRef from a search result." },
+        schemaOffset: { type: "integer", minimum: 0 },
       },
       required: ["query"],
     },
@@ -94,9 +97,13 @@ export async function createAssignedMcpTools(input: {
     const args = object(argumentsValue);
     const offset = args.offset ?? 0;
     const limit = args.limit ?? 5;
+    const schemaOffset = args.schemaOffset ?? 0;
     if (typeof args.query !== "string" || args.query.length > 200 ||
       typeof offset !== "number" || !Number.isSafeInteger(offset) || offset < 0 ||
-      typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 1 || limit > 20) {
+      typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 1 || limit > 20 ||
+      (args.schemaTool !== undefined && typeof args.schemaTool !== "string") ||
+      typeof schemaOffset !== "number" || !Number.isSafeInteger(schemaOffset) || schemaOffset < 0 ||
+      (args.schemaOffset !== undefined && args.schemaTool === undefined)) {
       throw new Error("assigned_mcp_tool_invalid_arguments");
     }
     // Intersect fresh grants with this session's pinned catalog. Revocations
@@ -105,17 +112,34 @@ export async function createAssignedMcpTools(input: {
       gatewayPublicId: input.gatewayPublicId, bearerToken: input.bearerToken,
     })).map(tool => [tool.name, tool]));
     const terms = args.query.toLowerCase().trim().split(/\s+/).filter(Boolean);
-    const matches = [...tools].filter(([name, tool]) => {
+    const authorized = [...tools].filter(([, tool]) => {
       const fresh = current.get(tool.name);
-      const text = `${name} ${tool.displayName} ${tool.description}`.toLowerCase();
       return fresh && permits(tool) && permits(tool, currentWorkMode) &&
-        permits(fresh) && permits(fresh, currentWorkMode) && terms.every(term => text.includes(term));
-    }).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+        permits(fresh) && permits(fresh, currentWorkMode);
+    });
+    if (typeof args.schemaTool === "string") {
+      const selected = authorized.find(([name]) => name === args.schemaTool);
+      if (!selected) throw new Error("assigned_mcp_tool_unknown");
+      const schema = JSON.stringify(selected[1].parametersSchema);
+      const end = schemaOffset + SCHEMA_CHUNK_CHARACTERS;
+      return {
+        name: selected[0], schemaJson: schema.slice(schemaOffset, end),
+        nextSchemaOffset: end < schema.length ? end : null,
+      };
+    }
+    const matches = authorized.filter(([name, tool]) =>
+      terms.every(term => `${name} ${tool.displayName} ${tool.description}`.toLowerCase().includes(term)))
+      .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
     const page: ToolDefinition[] = [];
     for (const [name, tool] of matches.slice(offset, offset + limit)) {
-      const next = definition(name, tool);
+      let next = definition(name, tool);
+      if (Buffer.byteLength(JSON.stringify([next]), "utf8") > SEARCH_PAGE_BYTES) {
+        // One large schema must not block browsing the tools after it. Expose
+        // a reference whose schema can be fetched in bounded, reauthorized
+        // chunks, without weakening the gateway's argument validation.
+        next = { name, description: String(next.description).slice(0, 2000), inputSchemaRef: name };
+      }
       if (Buffer.byteLength(JSON.stringify([...page, next]), "utf8") > SEARCH_PAGE_BYTES) {
-        if (page.length === 0) throw new Error("assigned_mcp_tool_schema_too_large");
         break;
       }
       page.push(next);

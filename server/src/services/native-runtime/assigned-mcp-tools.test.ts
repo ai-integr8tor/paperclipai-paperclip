@@ -102,6 +102,36 @@ describe("assigned MCP runner tools", () => {
     expect(f.executeTool).not.toHaveBeenCalled();
   });
 
+  it("keeps individually oversized schemas and later tools discoverable with bounded schema chunks", async () => {
+    const schema = { type: "object", description: "\u0000🙂".repeat(150_000), properties: {} };
+    const f = fixture([{ ...descriptor("a_large"), parametersSchema: schema }, descriptor("z_small")]);
+    const assigned = await createAssignedMcpTools(f);
+    const large = assigned.definitions()[0]!.name as string;
+    const page = await assigned.execute({ tool: searchName, arguments: { query: "", limit: 1 } }) as {
+      tools: Array<Record<string, unknown>>; nextOffset: number;
+    };
+    expect(page.tools).toEqual([{ name: large, description: "a_large: Use a_large", inputSchemaRef: large }]);
+    expect(page.nextOffset).toBe(1);
+    await expect(assigned.execute({ tool: searchName, arguments: { query: "", offset: page.nextOffset } }))
+      .resolves.toEqual({ tools: [assigned.definitions()[1]], nextOffset: null });
+    let schemaOffset: number | null = 0;
+    let serialized = "";
+    do {
+      const chunk = await assigned.execute({ tool: searchName, arguments: { query: "", schemaTool: large, schemaOffset } }) as {
+        schemaJson: string; nextSchemaOffset: number | null;
+      };
+      expect(Buffer.byteLength(JSON.stringify(chunk))).toBeLessThan(640 * 1024);
+      serialized += chunk.schemaJson;
+      schemaOffset = chunk.nextSchemaOffset;
+    } while (schemaOffset !== null);
+    expect(JSON.parse(serialized)).toEqual(schema);
+    await assigned.execute({ tool: callName, arguments: { name: large, arguments: {} } });
+    expect(f.executeTool).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ tool: "a_large" }));
+    f.listToolsForNamedGateway.mockResolvedValue([descriptor("z_small")]);
+    await expect(assigned.execute({ tool: searchName, arguments: { query: "", schemaTool: large } })).rejects.toThrow("assigned_mcp_tool_unknown");
+    await expect(assigned.execute({ tool: searchName, arguments: { query: "", schemaOffset: 1 } })).rejects.toThrow("assigned_mcp_tool_invalid_arguments");
+  });
+
   it("requires a configured gateway registered for the exact database instance", () => {
     const firstDb = {} as Db;
     const secondDb = {} as Db;
