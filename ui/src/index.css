@@ -3030,10 +3030,14 @@ span.paperclip-mention-chip[data-mention-kind="external-object"] {
     inset:
       max(calc(var(--spacing) * 4), env(safe-area-inset-top))
       calc(var(--spacing) * 4)
-      max(calc(var(--spacing) * 4), env(safe-area-inset-bottom)) !important;
+      auto !important;
     width: auto !important;
     max-width: none !important;
-    height: auto !important;
+    height: calc(
+      var(--mobile-entity-picker-visual-viewport-height)
+      - max(calc(var(--spacing) * 4), env(safe-area-inset-top))
+      - max(calc(var(--spacing) * 4), env(safe-area-inset-bottom))
+    ) !important;
     max-height: none !important;
     transform: none !important;
     translate: none !important;
