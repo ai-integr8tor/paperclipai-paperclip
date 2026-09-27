@@ -2059,6 +2059,8 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
  *
  * Stamp the checked-out issue only when the run has no source attribution yet.
  * Never overwrite an existing task-scoped wake's issueId/taskId.
+ * Only stamp live checkout runs (`queued` / `running`) so a stale same-agent
+ * run id cannot gain issue attribution after the fact.
  */
 export async function stampMissingIssueIdsOntoRunContext(
   db: Db,
@@ -2083,6 +2085,7 @@ export async function stampMissingIssueIdsOntoRunContext(
         eq(heartbeatRuns.id, input.runId),
         eq(heartbeatRuns.companyId, input.companyId),
         eq(heartbeatRuns.agentId, input.agentId),
+        inArray(heartbeatRuns.status, ["queued", "running"]),
         sql`coalesce(
           nullif(trim(coalesce(${heartbeatRuns.contextSnapshot} ->> 'issueId', '')), ''),
           nullif(trim(coalesce(${heartbeatRuns.contextSnapshot} ->> 'taskId', '')), '')

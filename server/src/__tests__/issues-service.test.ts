@@ -7399,4 +7399,38 @@ describeEmbeddedPostgres("issueService checkout stamps timer-wake run context", 
       (run?.contextSnapshot as Record<string, unknown> | null)?.taskId,
     ).toBeUndefined();
   });
+
+  it("does not stamp a terminal same-agent run", async () => {
+    const seeded = await seedTimerWakeCheckout();
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded" })
+      .where(eq(heartbeatRuns.id, seeded.runId));
+
+    await expect(
+      stampMissingIssueIdsOntoRunContext(db, {
+        companyId: seeded.companyId,
+        agentId: seeded.agentId,
+        runId: seeded.runId,
+        issueId: seeded.issueId,
+      }),
+    ).resolves.toBe(false);
+
+    const run = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, seeded.runId))
+      .then((rows) => rows[0] ?? null);
+
+    expect(run?.contextSnapshot).toMatchObject({
+      wakeReason: "heartbeat_timer",
+      source: "timer",
+    });
+    expect(
+      (run?.contextSnapshot as Record<string, unknown> | null)?.issueId,
+    ).toBeUndefined();
+    expect(
+      (run?.contextSnapshot as Record<string, unknown> | null)?.taskId,
+    ).toBeUndefined();
+  });
 });
