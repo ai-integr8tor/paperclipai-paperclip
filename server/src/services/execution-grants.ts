@@ -1,10 +1,9 @@
 import type { Db } from "@paperclipai/db";
-import { agentConfigRevisions, agents, approvals, executionGrants, issueApprovals, issues, issueThreadInteractions } from "@paperclipai/db";
+import { agentConfigRevisions, agents, approvals, executionGrantPolicies, executionGrants, issueApprovals, issues, issueThreadInteractions } from "@paperclipai/db";
 import { executionGrantRequestPayloadSchema } from "@paperclipai/shared";
 import { and, desc, eq, gt, isNull } from "drizzle-orm";
 import { forbidden, notFound } from "../errors.js";
 import {
-  EXECUTION_GRANT_POLICY_VERSION,
   executionGrantDenial,
   type ExecutionGrant,
   type ExecutionGrantAttempt,
@@ -37,8 +36,13 @@ export async function issueExecutionGrant(input: {
   decisionKind: "agent" | "board";
   decisionId: string;
   executorAgentId: string;
-  decisionStewardAgentId: string;
 }) {
+  const policy = await input.db.select().from(executionGrantPolicies)
+    .where(eq(executionGrantPolicies.companyId, input.companyId))
+    .then((rows) => rows[0] ?? null);
+  if (!policy) throw forbidden("Delegated authority policy is not configured", {
+    code: "execution_grant_policy_missing",
+  });
   const issue = await input.db.select({ id: issues.id })
     .from(issues)
     .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)))
@@ -63,7 +67,8 @@ export async function issueExecutionGrant(input: {
     }
     proposerAgentId = decision.createdByAgentId;
     approverAgentId = decision.resolvedByAgentId;
-    if (!approverAgentId || decision.addresseeAgentId !== approverAgentId) {
+    if (!approverAgentId || decision.addresseeAgentId !== approverAgentId ||
+        approverAgentId !== policy.stewardAgentId) {
       throw forbidden("The named agent approver must resolve the decision", { code: "execution_grant_approver_mismatch" });
     }
     const payload = decision.payload as Record<string, unknown>;
@@ -97,13 +102,13 @@ export async function issueExecutionGrant(input: {
   const request = executionGrantRequestPayloadSchema.safeParse(rawRequest);
   if (!request.success || !proposerAgentId ||
       request.data.executorAgentId !== input.executorAgentId ||
-      request.data.targetAgentId === input.decisionStewardAgentId ||
+      request.data.targetAgentId === policy.stewardAgentId ||
       (input.decisionKind === "agent" &&
         (approverAgentId === proposerAgentId || approverAgentId === input.executorAgentId)) ||
       !displayedDetails?.includes(request.data.requestHash) ||
       !/```diff\b|(^|\n)[+-][^\n]+/i.test(displayedDetails) ||
       Date.parse(request.data.expiresAt) <= Date.now() ||
-      request.data.policyVersion !== EXECUTION_GRANT_POLICY_VERSION) {
+      request.data.policyVersion !== policy.version) {
     throw forbidden("Decision does not authorize the exact proposed execution grant", {
       code: "execution_grant_invalid_decision",
     });
@@ -137,7 +142,7 @@ export async function issueExecutionGrant(input: {
 export async function withConsumedExecutionGrant<T>(input: {
   db: Db;
   grantId: string;
-  attempt: Omit<ExecutionGrantAttempt, "targetRevisionId" | "now">;
+  attempt: Omit<ExecutionGrantAttempt, "targetRevisionId" | "now" | "decisionStewardAgentId" | "currentPolicyVersion">;
   runId: string;
   apply: (txDb: Db) => Promise<T>;
 }): Promise<T> {
@@ -149,6 +154,14 @@ export async function withConsumedExecutionGrant<T>(input: {
       .for("update")
       .then((rows) => rows[0] ?? null);
     if (!target) throw notFound("Agent not found");
+
+    const policy = await txDb.select().from(executionGrantPolicies)
+      .where(eq(executionGrantPolicies.companyId, input.attempt.companyId))
+      .for("update")
+      .then((rows) => rows[0] ?? null);
+    if (!policy) throw forbidden("Delegated authority policy is not configured", {
+      code: "execution_grant_policy_missing",
+    });
 
     const currentRevision = await txDb.select({ id: agentConfigRevisions.id })
       .from(agentConfigRevisions)
@@ -169,6 +182,8 @@ export async function withConsumedExecutionGrant<T>(input: {
     const denial = executionGrantDenial(toContract(grant), {
       ...input.attempt,
       targetRevisionId: currentRevision,
+      decisionStewardAgentId: policy.stewardAgentId,
+      currentPolicyVersion: policy.version,
       now,
     });
     if (denial) throw forbidden("Execution grant does not authorize this write", { code: `execution_grant_${denial}` });

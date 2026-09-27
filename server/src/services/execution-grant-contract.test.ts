@@ -29,6 +29,7 @@ const attempt: ExecutionGrantAttempt = {
   targetRevisionId: "revision-1",
   requestHash: grant.requestHash,
   decisionStewardAgentId: "steward",
+  currentPolicyVersion: EXECUTION_GRANT_POLICY_VERSION,
   now: new Date("2026-09-27T00:00:00Z"),
 };
 

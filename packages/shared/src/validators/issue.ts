@@ -1513,7 +1513,7 @@ export const executionGrantRequestPayloadSchema = z.object({
   targetRevisionId: z.string().guid().nullable(),
   requestHash: z.string().regex(/^[a-f0-9]{64}$/),
   expiresAt: z.string().datetime({ offset: true }),
-  policyVersion: z.literal(1),
+  policyVersion: z.number().int().positive(),
 });
 
 export const requestConfirmationPayloadSchema = z.object({

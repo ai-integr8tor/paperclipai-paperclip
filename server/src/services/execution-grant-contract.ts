@@ -29,6 +29,7 @@ export interface ExecutionGrantAttempt {
   targetRevisionId: string | null;
   requestHash: string;
   decisionStewardAgentId: string;
+  currentPolicyVersion: number;
   now: Date;
 }
 
@@ -77,7 +78,7 @@ export function executionGrantDenial(
   if (grant.targetAgentId === attempt.decisionStewardAgentId) return "steward_powers";
   if (grant.consumedAt !== null) return "already_consumed";
   if (grant.expiresAt.getTime() <= attempt.now.getTime()) return "expired";
-  if (grant.policyVersion !== EXECUTION_GRANT_POLICY_VERSION) return "policy_version_changed";
+  if (grant.policyVersion !== attempt.currentPolicyVersion) return "policy_version_changed";
   if (grant.executorAgentId !== attempt.executorAgentId) return "unauthorized_executor";
   if (grant.targetAgentId !== attempt.targetAgentId) return "target_changed";
   if (grant.operation !== attempt.operation) return "operation_changed";

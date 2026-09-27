@@ -1989,6 +1989,13 @@
       "when": 1790540513598,
       "tag": "0285_plain_fantastic_four",
       "breakpoints": true
+    },
+    {
+      "idx": 286,
+      "version": "7",
+      "when": 1790541143614,
+      "tag": "0286_tense_terrax",
+      "breakpoints": true
     }
   ]
 }

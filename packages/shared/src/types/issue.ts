@@ -1398,7 +1398,7 @@ export interface ExecutionGrantRequestPayload {
   targetRevisionId: string | null;
   requestHash: string;
   expiresAt: string;
-  policyVersion: 1;
+  policyVersion: number;
 }
 
 export interface RequestCheckboxConfirmationOption {
