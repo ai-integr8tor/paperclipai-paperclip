@@ -25515,7 +25515,12 @@ export function heartbeatService(
         });
 
         const stoppedDuringFailure = executionControl.controller.signal.aborted;
-        const stopSnapshot = stoppedDuringFailure ? await getRun(run.id) : null;
+        // Always refresh the run row before bootstrap classification. onSpawn
+        // persists process identity to the DB, but the in-memory `run` stays at
+        // its pre-dispatch snapshot. Ordinary (non-abort) failures used to skip
+        // this refresh and mis-stamp bootstrap after a successful spawn.
+        const currentRun = await getRun(run.id);
+        const stopSnapshot = stoppedDuringFailure ? currentRun : null;
         const failureOutcome = stoppedDuringFailure ? "cancelled" : "failed";
         const failedRunWrite = await setRunStatusIfRunning(run.id, failureOutcome, {
           error: message,
@@ -25538,9 +25543,9 @@ export function heartbeatService(
                 legacyAdapterEntered,
                 runtimeMode: run.runtimeMode,
                 adapterType: agent.adapterType,
-                processPid: stopSnapshot?.processPid ?? run.processPid,
+                processPid: currentRun?.processPid ?? run.processPid,
                 processStartedAt:
-                  stopSnapshot?.processStartedAt ?? run.processStartedAt,
+                  currentRun?.processStartedAt ?? run.processStartedAt,
               })
                 ? {
                     executionRecovery: {
