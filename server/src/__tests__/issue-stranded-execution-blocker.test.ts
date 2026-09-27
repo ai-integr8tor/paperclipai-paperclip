@@ -16,6 +16,9 @@
  *      parked: a declared source is not evidence that the assignment changed
  *  T1e an assignee change committed by the issue update route releases the hold
  *      and creates the run for the new assignee
+ *  T1f an update that both reassigns the issue and moves its execution stage
+ *      still releases the hold: the stage wake that supersedes the assignment
+ *      wake carries the assignment decision
  *  T2  an open (`active`) action still parks the wake
  *  T3  a human owner (`assigneeUserId`) still parks the wake — a person decides
  *  T4  an issue that is not `todo`/`blocked` still parks the wake
@@ -113,6 +116,7 @@ describeEmbeddedPostgres("issue stranded by a settled no-replay hold", () => {
     includeAssignee?: boolean;
     unsafeWorkspace?: boolean;
     terminalSourceRun?: boolean;
+    executionState?: Record<string, unknown> | null;
   } = {}) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -153,6 +157,7 @@ describeEmbeddedPostgres("issue stranded by a settled no-replay hold", () => {
       status: opts.issueStatus ?? "todo",
       assigneeAgentId: opts.includeAssignee === false ? null : agentId,
       assigneeUserId: opts.assigneeUserId ?? null,
+      ...(opts.executionState ? { executionState: opts.executionState } : {}),
     });
     const [action] = await db.insert(issueRecoveryActions).values({
       companyId,
@@ -370,6 +375,67 @@ describeEmbeddedPostgres("issue stranded by a settled no-replay hold", () => {
     expect(action!.evidence.settledNoReplayHoldRelease).toMatchObject({
       agentId: replacementAgentId,
       actorType: "user",
+    });
+    const replacementRuns = (await runsForIssue(seed.issueId))
+      .filter(run => run.agentId === replacementAgentId);
+    expect(replacementRuns).toHaveLength(1);
+  });
+
+  it("T1f: a reassignment that arrives with a stage change still releases the hold", async () => {
+    const stageParticipantId = randomUUID();
+    const seed = await seedBlockedIssue({
+      issueStatus: "todo",
+      replay: "blocked",
+      executionState: {
+        status: "pending",
+        currentStageId: "review-1",
+        currentStageIndex: 1,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: stageParticipantId },
+        returnAssignee: { type: "agent", agentId: null },
+        completedStageIds: ["review-0"],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    });
+    const replacementAgentId = randomUUID();
+    for (const agentId of [stageParticipantId, replacementAgentId]) {
+      await db.insert(agents).values({
+        id: agentId,
+        companyId: seed.companyId,
+        name: agentId === replacementAgentId ? "Replacement" : "Stage participant",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } },
+        permissions: {},
+      });
+    }
+
+    // One board update that both reassigns the issue and moves its execution
+    // stage: the stage wake supersedes the assignment wake for the same agent,
+    // so it has to carry the assignment decision itself.
+    const response = await request(app(seed.companyId))
+      .patch(`/api/issues/${seed.issueId}`)
+      .send({
+        assigneeAgentId: replacementAgentId,
+        executionState: {
+          status: "pending",
+          currentStageId: "review-1",
+          currentStageIndex: 1,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: replacementAgentId },
+          returnAssignee: { type: "agent", agentId: null },
+          completedStageIds: ["review-0"],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      });
+    expect(response.status).toBe(200);
+
+    await vi.waitFor(async () => {
+      expect(await getExecutionBlocker(db, seed.companyId, seed.issueId)).toBeNull();
     });
     const replacementRuns = (await runsForIssue(seed.issueId))
       .filter(run => run.agentId === replacementAgentId);

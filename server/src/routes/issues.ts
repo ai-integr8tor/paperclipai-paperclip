@@ -14664,9 +14664,15 @@ export function issueRoutes(
           });
         };
 
-        if (executionStageWakeup && deferWakeForGoal !== true) {
-          addWakeup(executionStageWakeup.agentId, executionStageWakeup.wakeup);
-        } else if (
+        // A committed assignee change is this update's assignment decision, and
+        // it has to ride *every* wake this update emits: whichever of them runs
+        // is the wake that may retire a settled no-replay hold (the release gate
+        // still requires the waking agent to be the issue's assignee, so a stage
+        // participant who does not own the issue can never use it).
+        const assignmentDecision = assigneeChanged
+          ? { recordedAssignmentDecision: true as const }
+          : {};
+        if (
           assigneeChanged &&
           issue.assigneeAgentId &&
           issue.status !== "backlog" &&
@@ -14678,11 +14684,7 @@ export function issueRoutes(
           addWakeup(issue.assigneeAgentId, {
             source: "assignment",
             triggerDetail: "system",
-            // This is the only place the control plane records an assignment
-            // decision for an existing issue, so it is the only wake allowed to
-            // retire a settled no-replay hold (see heartbeat's
-            // `recordedAssignmentDecision`).
-            recordedAssignmentDecision: true,
+            ...assignmentDecision,
             reason: "issue_assigned",
             payload: {
               issueId: issue.id,
@@ -14710,6 +14712,18 @@ export function issueRoutes(
                 : {}),
               ...(interruptedRunId ? { interruptedRunId } : {}),
             },
+          });
+        }
+
+        if (executionStageWakeup && deferWakeForGoal !== true) {
+          // Added after the assignment wake, so it supersedes it for the same
+          // agent (the map merges per agent+issue). It carries the assignment
+          // decision too: a reassignment that arrives together with a stage
+          // change must not lose the only wake allowed to retire a settled
+          // no-replay hold.
+          addWakeup(executionStageWakeup.agentId, {
+            ...executionStageWakeup.wakeup,
+            ...assignmentDecision,
           });
         }
 

@@ -3655,11 +3655,13 @@ interface WakeupOptions {
   /**
    * Set only by control-plane paths that committed a new assignment decision for
    * the issue — today the issue update route, when it recorded that this issue's
-   * assignee changed. Never derived from the caller-declared `source`,
-   * `triggerDetail`, reason or payload: `POST /agents/:id/wakeup` reads `source`
-   * from the request body, and a plugin wake claims `assignment` for an agent
-   * that is already assigned, so a wake that merely names `assignment` is not
-   * evidence that an assignment happened.
+   * assignee changed. The route marks every wake that update emits, because a
+   * stage wake may supersede the assignment wake for the same agent. Never
+   * derived from the caller-declared `source`, `triggerDetail`, reason or
+   * payload: `POST /agents/:id/wakeup` reads `source` from the request body, and
+   * a plugin wake claims `assignment` for an agent that is already assigned, so
+   * a wake that merely names `assignment` is not evidence that an assignment
+   * happened.
    */
   recordedAssignmentDecision?: boolean;
   /** Internal resume of a queue with persisted board interruption intent. */
