@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { buildAgentParams, normalizePrivateKeyPem, resolveClaimedApiKeyPath, resolveSessionKey } from "./execute.js";
+import {
+  buildAgentParams,
+  normalizePrivateKeyPem,
+  resolveClaimedApiKeyPath,
+  resolveDeviceIdentity,
+  resolveSessionKey,
+} from "./execute.js";
 
 describe("resolveSessionKey", () => {
   it("prefixes run-scoped session keys with the configured agent", () => {
@@ -131,7 +137,8 @@ describe("normalizePrivateKeyPem", () => {
     const validPem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
     // Simulate a PEM mangled in transit: real newlines replaced by literal \n
     const mangledPem = validPem.replace(/\n/g, "\\n");
-    expect(() => createPrivateKey(mangledPem)).toThrow(/DECODER routines::unsupported/);
+    // Normalization must not depend on the exact OpenSSL error wording.
+    expect(() => createPrivateKey(mangledPem)).toThrow();
 
     const normalized = normalizePrivateKeyPem(mangledPem);
     expect(normalized).toBe(validPem);
@@ -143,5 +150,24 @@ describe("normalizePrivateKeyPem", () => {
     const { privateKey } = generateKeyPairSync("ed25519");
     const validPem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
     expect(normalizePrivateKeyPem(validPem)).toBe(validPem);
+  });
+});
+
+describe("resolveDeviceIdentity", () => {
+  it("stores a loadable key when devicePrivateKeyPem arrives with escaped newlines", async () => {
+    const { generateKeyPairSync, createPrivateKey } = await import("node:crypto");
+    const { privateKey } = generateKeyPairSync("ed25519");
+    const validPem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+    // Same key mangled in transit: real newlines replaced by literal \n
+    const mangledPem = validPem.replace(/\n/g, "\\n");
+
+    const identity = resolveDeviceIdentity({ devicePrivateKeyPem: mangledPem });
+    expect(identity.source).toBe("configured");
+    // The stored PEM is what signDevicePayload loads, so it must be loadable.
+    expect(() => createPrivateKey(identity.privateKeyPem)).not.toThrow();
+    // And it must be the same key, not just any loadable key.
+    const expected = resolveDeviceIdentity({ devicePrivateKeyPem: validPem });
+    expect(identity.deviceId).toBe(expected.deviceId);
+    expect(identity.publicKeyRawBase64Url).toBe(expected.publicKeyRawBase64Url);
   });
 });

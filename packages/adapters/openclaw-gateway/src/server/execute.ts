@@ -622,7 +622,7 @@ function buildDeviceAuthPayloadV3(params: {
   ].join("|");
 }
 
-function resolveDeviceIdentity(config: Record<string, unknown>): GatewayDeviceIdentity {
+export function resolveDeviceIdentity(config: Record<string, unknown>): GatewayDeviceIdentity {
   const configuredPrivateKey = nonEmpty(config.devicePrivateKeyPem);
   if (configuredPrivateKey) {
     const normalizedPem = normalizePrivateKeyPem(configuredPrivateKey);
