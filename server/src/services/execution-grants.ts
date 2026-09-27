@@ -71,7 +71,7 @@ export async function issueExecutionGrant(input: {
         approverAgentId !== policy.stewardAgentId) {
       throw forbidden("The named agent approver must resolve the decision", { code: "execution_grant_approver_mismatch" });
     }
-    const payload = decision.payload as Record<string, unknown>;
+    const payload = decision.payload as unknown as Record<string, unknown>;
     rawRequest = payload.executionGrant;
     displayedDetails = typeof payload.detailsMarkdown === "string" ? payload.detailsMarkdown : null;
   } else {
@@ -147,7 +147,7 @@ export async function withConsumedExecutionGrant<T>(input: {
   apply: (txDb: Db) => Promise<T>;
 }): Promise<T> {
   return input.db.transaction(async (tx) => {
-    const txDb = tx as Db;
+    const txDb = tx as unknown as Db;
     const target = await txDb.select({ id: agents.id })
       .from(agents)
       .where(and(eq(agents.id, input.attempt.targetAgentId), eq(agents.companyId, input.attempt.companyId)))

@@ -1,14 +1,18 @@
 import { randomUUID } from "node:crypto";
+import express from "express";
+import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import {
-  agentConfigRevisions, agents, approvals, companies, createDb,
+  activityLog, agentConfigRevisions, agents, approvals, companies, companyMemberships, createDb,
   executionGrantPolicies, executionGrants, heartbeatRuns, issueApprovals,
-  issueThreadInteractions, issues,
+  issueThreadInteractions, issues, principalPermissionGrants,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { executionGrantRequestHash } from "../services/execution-grant-contract.js";
 import { issueExecutionGrant, withConsumedExecutionGrant } from "../services/execution-grants.js";
+import { executionGrantRoutes } from "../routes/execution-grants.js";
+import { agentRoutes } from "../routes/agents.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const describeDb = support.supported ? describe : describe.skip;
@@ -23,6 +27,7 @@ describeDb("execution grants", () => {
   }, 30_000);
 
   afterEach(async () => {
+    await db.delete(activityLog);
     await db.delete(executionGrants);
     await db.delete(executionGrantPolicies);
     await db.delete(issueThreadInteractions);
@@ -31,6 +36,8 @@ describeDb("execution grants", () => {
     await db.delete(issues);
     await db.delete(heartbeatRuns);
     await db.delete(agentConfigRevisions);
+    await db.delete(principalPermissionGrants);
+    await db.delete(companyMemberships);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -61,6 +68,13 @@ describeDb("execution grants", () => {
         adapterConfig: {}, runtimeConfig: {}, permissions: {},
       });
     }
+    await db.insert(companyMemberships).values({
+      companyId, principalType: "agent", principalId: executorAgentId,
+    });
+    await db.insert(principalPermissionGrants).values({
+      companyId, principalType: "agent", principalId: executorAgentId,
+      permissionKey: "agents:suggest-changes",
+    });
     await db.insert(executionGrantPolicies).values({
       companyId, stewardAgentId, version: 1, updatedByUserId: "board-user",
     });
@@ -107,6 +121,19 @@ describeDb("execution grants", () => {
         return true;
       },
     };
+  }
+
+  function appAs(actor: Express.Request["actor"]) {
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => { req.actor = actor; next(); });
+    app.use("/api", executionGrantRoutes(db));
+    app.use("/api", agentRoutes(db));
+    app.use((err: { status?: number; message: string; details?: unknown }, _req: express.Request,
+      res: express.Response, _next: express.NextFunction) => {
+      res.status(err.status ?? 500).json({ error: err.message, details: err.details });
+    });
+    return app;
   }
 
   it("applies a steward-approved Chief config change once and rejects replay, changed request and executor", async () => {
@@ -206,5 +233,67 @@ describeDb("execution grants", () => {
     expect((await db.select().from(executionGrants).where(eq(executionGrants.id, grant!.id)))[0].consumedAt)
       .toBeNull();
     await expect(withConsumedExecutionGrant(input)).resolves.toBe(true);
+  });
+
+  it("requires a board actor to appoint the Steward and a named executor run to issue", async () => {
+    const fixture = await seed();
+    const agentActor: Express.Request["actor"] = {
+      type: "agent", companyId: fixture.companyId, agentId: fixture.executorAgentId,
+      runId: fixture.executorRunId, source: "agent_jwt",
+    };
+    await request(appAs(agentActor))
+      .put(`/api/companies/${fixture.companyId}/execution-grant-policy`)
+      .send({ stewardAgentId: fixture.executorAgentId })
+      .expect(403);
+    const boardActor: Express.Request["actor"] = {
+      type: "board", source: "local_implicit", userId: "board-user",
+    };
+    const policyResponse = await request(appAs(boardActor))
+      .put(`/api/companies/${fixture.companyId}/execution-grant-policy`)
+      .send({ stewardAgentId: fixture.stewardAgentId })
+      .expect(200);
+    expect(policyResponse.body.version).toBe(2);
+    await db.update(executionGrantPolicies).set({ version: 1 })
+      .where(eq(executionGrantPolicies.companyId, fixture.companyId));
+
+    const issued = await request(appAs(agentActor))
+      .post(`/api/issues/${fixture.issueId}/execution-grants`)
+      .send({ decisionKind: "agent", decisionId: fixture.decisionId })
+      .expect(201);
+    expect(issued.body).toMatchObject({
+      decisionId: fixture.decisionId, executorAgentId: fixture.executorAgentId,
+      targetAgentId: fixture.targetAgentId,
+    });
+    await request(appAs({ ...agentActor, agentId: fixture.proposerAgentId }))
+      .post(`/api/issues/${fixture.issueId}/execution-grants`)
+      .send({ decisionKind: "agent", decisionId: fixture.decisionId })
+      .expect(403);
+  });
+
+  it("applies the approved PATCH once through the agent API", async () => {
+    const fixture = await seed();
+    const actor: Express.Request["actor"] = {
+      type: "agent", companyId: fixture.companyId, agentId: fixture.executorAgentId,
+      runId: fixture.executorRunId, source: "agent_jwt",
+    };
+    const grant = await issueExecutionGrant({
+      db, companyId: fixture.companyId, issueId: fixture.issueId,
+      decisionKind: "agent", decisionId: fixture.decisionId,
+      executorAgentId: fixture.executorAgentId,
+    });
+    const path = `/api/agents/${fixture.targetAgentId}`;
+    const app = appAs(actor);
+    await request(app).patch(path)
+      .set("X-Paperclip-Execution-Grant", grant!.id)
+      .send({ name: "unapproved change" }).expect(403);
+    const approvedResponse = await request(app).patch(path)
+      .set("X-Paperclip-Execution-Grant", grant!.id)
+      .send(fixture.body);
+    expect(approvedResponse.status, JSON.stringify(approvedResponse.body)).toBe(200);
+    await request(app).patch(path)
+      .set("X-Paperclip-Execution-Grant", grant!.id)
+      .send(fixture.body).expect(403);
+    expect((await db.select().from(agents).where(eq(agents.id, fixture.targetAgentId)))[0].name)
+      .toBe(fixture.body.name);
   });
 });
