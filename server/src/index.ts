@@ -229,6 +229,9 @@ async function startServerWithDatabaseTeardown(
     if (config.secretsProvider !== "local_encrypted") {
       throw new Error("Isolated local secrets require the local_encrypted provider.");
     }
+    if (config.deploymentMode !== "authenticated") {
+      throw new Error("Isolated local secrets require authenticated deployment mode; local_trusted grants implicit board access to requests without credentials.");
+    }
     assertIsolatedLocalSecretsKey({
       enabled: true,
       keyFilePath: config.secretsMasterKeyFilePath,

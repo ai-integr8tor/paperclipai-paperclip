@@ -193,6 +193,10 @@ Kubernetes sandbox provider. The agent pod gets an isolated filesystem and no
 host Docker socket. A normal local run, local ACPX run, or SSH target is
 refused in this mode. The server still mints run-scoped agent API JWTs for
 sandbox runs; the JWT signing secret is independent of the local encryption key.
+Use `authenticated` deployment mode for this boundary. Startup refuses
+`local_trusted` while isolation is enabled because a request without credentials
+would otherwise receive implicit instance-admin authority, including through a
+proxy that lets an agent reach the loopback API.
 
 Set the following in the **server's** config after the host boundary is ready:
 
