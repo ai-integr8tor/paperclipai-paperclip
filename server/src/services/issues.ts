@@ -11666,13 +11666,28 @@ export function issueService(db: Db) {
                 .from(issues)
                 .where(eq(issues.id, id))
                 .then((rows) => rows[0] ?? null);
+              const conflictingCheckoutRunId =
+                lockedIssue?.checkoutRunId &&
+                lockedIssue.checkoutRunId !== checkoutRunId
+                  ? lockedIssue.checkoutRunId
+                  : null;
+              if (conflictingCheckoutRunId) {
+                await tx.execute(
+                  sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${conflictingCheckoutRunId} for update`,
+                );
+              }
+              const checkoutClaimAvailable =
+                !conflictingCheckoutRunId ||
+                (await isTerminalOrMissingHeartbeatRun(
+                  conflictingCheckoutRunId,
+                  tx,
+                ));
               const primaryCheckoutAllowed = Boolean(
                 lockedIssue &&
                   expectedStatuses.includes(lockedIssue.status) &&
+                  checkoutClaimAvailable &&
                   (lockedIssue.assigneeAgentId === null ||
-                    (lockedIssue.assigneeAgentId === agentId &&
-                      (lockedIssue.checkoutRunId === null ||
-                        lockedIssue.checkoutRunId === checkoutRunId))),
+                    lockedIssue.assigneeAgentId === agentId),
               );
               if (!primaryCheckoutAllowed) return null;
 
