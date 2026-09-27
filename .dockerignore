@@ -13,9 +13,12 @@ packages/paperclip-runner/runner/target
 packages/paperclip-runner/devtools
 packages/paperclip-runner/docs
 packages/paperclip-runner/examples
-packages/paperclip-runner/test
-packages/paperclip-runner/test-fixtures
-packages/paperclip-runner/test-support
+# Runner test trees (test fixtures + support helpers) intentionally ship in
+# the production build context: agent workspaces are provisioned from this
+# context, so the runner's vitest suites must run without a manual fixture
+# restore. The *.test.* rules below keep the dev-only node --test
+# entrypoints out of the image. 2026-09-27: removing the three directory
+# rules above changed the Daytona image content identity (v6).
 packages/paperclip-runner/**/*.md
 packages/paperclip-runner/**/*.spec.ts
 packages/paperclip-runner/**/*.spec.tsx

@@ -6,7 +6,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const repositoryRoot = path.resolve(import.meta.dirname, "../..");
 
 export const DAYTONA_IMAGE_CONTENT_SCHEMA =
-  "paperclip-daytona-runner-image-content/v5";
+  "paperclip-daytona-runner-image-content/v6";
 export const DAYTONA_IMAGE_PLATFORM = "linux/amd64";
 export const DAYTONA_IMAGE_DOCKERFILE_PATH = "docker/daytona-runner/Dockerfile";
 
@@ -47,9 +47,6 @@ const ignoredRunnerDevelopmentDirectoryPaths = new Set([
   "packages/paperclip-runner/devtools",
   "packages/paperclip-runner/docs",
   "packages/paperclip-runner/examples",
-  "packages/paperclip-runner/test",
-  "packages/paperclip-runner/test-fixtures",
-  "packages/paperclip-runner/test-support",
 ]);
 
 const runnerDocumentationFilePattern = /\.md$/;
