@@ -6,6 +6,25 @@ import { unprocessable } from "../errors.js";
 export const DECISION_BRIEF_REQUIRED_MESSAGE =
   "This company requires a decision brief for human-facing questions. Add brief.whatIsHappening, brief.whyStopped and brief.whatWeNeed.";
 
+/**
+ * Server-authored brief for the system-generated attention-archive proposal
+ * decision (`POST /companies/:companyId/decision-archive-proposals`). That
+ * route has no user-supplied `brief` field, but the created decision is
+ * human-facing (a standalone decision), so `decisionBriefGuard` requires one
+ * whenever the company opts into `requireDecisionBrief`. This helper is pure
+ * so it can be unit-tested without pulling in the route module's heavier
+ * dependencies (Router, attentionService, authorizationService, etc.).
+ */
+export function buildArchiveProposalBrief(count: number): DecisionBrief {
+  const items = `${count} aging decision${count === 1 ? "" : "s"}`;
+  return {
+    version: 1,
+    whatIsHappening: `An agent reviewed the aging decisions shelf and proposes archiving ${items}. Each item and the agent's reason are listed below.`,
+    whyStopped: "Archiving removes these items from the Decisions feed, so a person must confirm before anything is hidden.",
+    whatWeNeed: "Archive the reviewed items, or keep them on the shelf. Keeping them changes nothing.",
+  };
+}
+
 function uniqueIds(values: Array<string | undefined>) {
   return [...new Set(values.filter((value): value is string => Boolean(value)))];
 }

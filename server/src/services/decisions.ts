@@ -211,6 +211,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
         return existing;
       }
     }
+    // Runs after the idempotency short-circuit; concurrent same-key retries are serialized by the advisory lock above.
     await decisionBriefGuard(dbOrTx).assertAllowed({
       companyId: input.companyId,
       brief: input.brief ?? null,

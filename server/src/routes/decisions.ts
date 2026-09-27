@@ -18,6 +18,7 @@ import { attentionService } from "../services/attention.js";
 import { authorizationDeniedDetails, authorizationService } from "../services/authorization.js";
 import { canReadDecisionSource } from "../services/decision-queues.js";
 import { hashAttentionArchiveManifest } from "../services/decision-retention.js";
+import { buildArchiveProposalBrief } from "../services/decision-brief.js";
 import { forbidden, unprocessable } from "../errors.js";
 
 const createSchema = z.object({
@@ -124,6 +125,7 @@ export function decisionRoutes(db: Db, options: DecisionServiceOptions) {
         ...agent,
         title: `Archive ${manifest.length} aging decision${manifest.length === 1 ? "" : "s"}?`,
         body,
+        brief: buildArchiveProposalBrief(manifest.length),
         ruleKey: "attention.bulk_archive",
         idempotencyKey: proposal.idempotencyKey ?? `attention-archive:${manifestHash}:${agent.runId}`,
         continuationPolicy: "wake_origin_agent",
