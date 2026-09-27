@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { buildAgentParams, resolveClaimedApiKeyPath, resolveSessionKey } from "./execute.js";
+import {
+  buildAgentParams,
+  normalizePrivateKeyPem,
+  resolveClaimedApiKeyPath,
+  resolveDeviceIdentity,
+  resolveSessionKey,
+} from "./execute.js";
 
 describe("resolveSessionKey", () => {
   it("prefixes run-scoped session keys with the configured agent", () => {
@@ -121,5 +127,47 @@ describe("resolveClaimedApiKeyPath", () => {
   it("falls back to the shared default when value is not a string", () => {
     expect(resolveClaimedApiKeyPath(42)).toBe(DEFAULT_PATH);
     expect(resolveClaimedApiKeyPath({})).toBe(DEFAULT_PATH);
+  });
+});
+
+describe("normalizePrivateKeyPem", () => {
+  it("restores real newlines when PEM contains literal backslash-n sequences", async () => {
+    const { generateKeyPairSync, createPrivateKey } = await import("node:crypto");
+    const { privateKey } = generateKeyPairSync("ed25519");
+    const validPem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+    // Simulate a PEM mangled in transit: real newlines replaced by literal \n
+    const mangledPem = validPem.replace(/\n/g, "\\n");
+    // Normalization must not depend on the exact OpenSSL error wording.
+    expect(() => createPrivateKey(mangledPem)).toThrow();
+
+    const normalized = normalizePrivateKeyPem(mangledPem);
+    expect(normalized).toBe(validPem);
+    expect(() => createPrivateKey(normalized)).not.toThrow();
+  });
+
+  it("leaves a valid PEM unchanged", async () => {
+    const { generateKeyPairSync } = await import("node:crypto");
+    const { privateKey } = generateKeyPairSync("ed25519");
+    const validPem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+    expect(normalizePrivateKeyPem(validPem)).toBe(validPem);
+  });
+});
+
+describe("resolveDeviceIdentity", () => {
+  it("stores a loadable key when devicePrivateKeyPem arrives with escaped newlines", async () => {
+    const { generateKeyPairSync, createPrivateKey } = await import("node:crypto");
+    const { privateKey } = generateKeyPairSync("ed25519");
+    const validPem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+    // Same key mangled in transit: real newlines replaced by literal \n
+    const mangledPem = validPem.replace(/\n/g, "\\n");
+
+    const identity = resolveDeviceIdentity({ devicePrivateKeyPem: mangledPem });
+    expect(identity.source).toBe("configured");
+    // The stored PEM is what signDevicePayload loads, so it must be loadable.
+    expect(() => createPrivateKey(identity.privateKeyPem)).not.toThrow();
+    // And it must be the same key, not just any loadable key.
+    const expected = resolveDeviceIdentity({ devicePrivateKeyPem: validPem });
+    expect(identity.deviceId).toBe(expected.deviceId);
+    expect(identity.publicKeyRawBase64Url).toBe(expected.publicKeyRawBase64Url);
   });
 });
