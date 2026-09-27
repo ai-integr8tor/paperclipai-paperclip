@@ -10,6 +10,7 @@ import {
   parseLocalProcessNetworkAllowlist,
   parseLocalProcessNetworkScope,
   parseLocalProcessSandboxExtraPaths,
+  SANDBOX_NETWORK_EVENT_SCHEMA_VERSION,
   type SandboxNetworkDecision,
   type SandboxNetworkEvent,
   type SandboxNetworkProxyStarted,
@@ -273,7 +274,7 @@ describe("local process sandbox", () => {
 
       // One structured decision per egress attempt, in order: allowed http, denied http, denied CONNECT.
       const decisions = decisionEvents(events);
-      expect(decisions.map(({ ts, ...event }) => event)).toEqual([
+      expect(decisions.map(({ ts, schemaVersion, ...event }) => event)).toEqual([
         {
           event: "sandbox.network.decision",
           decision: "allow",
@@ -330,6 +331,7 @@ describe("local process sandbox", () => {
     expect(stoppedEvents(events)).toEqual([{
       event: "sandbox.network.proxy.stopped",
       ts: expect.any(String),
+      schemaVersion: SANDBOX_NETWORK_EVENT_SCHEMA_VERSION,
       allowCount: 1,
       denyCount: 2,
       sinkErrorCount: 0,
@@ -549,6 +551,69 @@ describe("local process sandbox", () => {
     }
   });
 
+  it.runIf(process.platform === "linux")("stamps a schema version on every event kind and the emitter version on startup", async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-network-schema-"));
+    cleanup.push(workspace);
+    const upstream = net.createServer((socket) => {
+      socket.on("data", () => socket.end("schema-upstream-reply"));
+    });
+    await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+    const address = upstream.address();
+    if (!address || typeof address === "string") throw new Error("Expected TCP upstream address.");
+    const events: SandboxNetworkEvent[] = [];
+    const target = await buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath,
+      args: ["-e", "process.exit(0)"],
+      cwd: workspace,
+      options: {
+        workspaceDir: workspace,
+        networkScope: "allowlist",
+        networkAllowlist: [`127.0.0.1:${address.port}`],
+        onNetworkDecision: (event) => events.push(event),
+      },
+    });
+    const socketPath = proxySocketPath(target.args);
+
+    try {
+      // One allowed CONNECT plus one denial: between them the run produces all four event kinds.
+      await new Promise<void>((resolve, reject) => {
+        const socket = net.createConnection(socketPath, () => {
+          socket.write(`CONNECT 127.0.0.1:${address.port} HTTP/1.1\r\nHost: 127.0.0.1:${address.port}\r\n\r\n`);
+        });
+        let established = false;
+        socket.setEncoding("utf8");
+        socket.on("data", (chunk: string) => {
+          if (!established && chunk.includes("200 Connection Established")) {
+            established = true;
+            socket.write("schema-client-payload");
+          }
+        });
+        socket.on("close", () => resolve());
+        socket.on("error", reject);
+      });
+      await connectThroughProxy(socketPath, "denied.example:443");
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    } finally {
+      await target.cleanup?.();
+      await new Promise<void>((resolve) => upstream.close(() => resolve()));
+    }
+
+    // All four kinds present, so the assertion below is a statement about the family, not one event.
+    expect(new Set(events.map((event) => event.event))).toEqual(new Set([
+      "sandbox.network.proxy.started",
+      "sandbox.network.decision",
+      "sandbox.network.tunnel.closed",
+      "sandbox.network.proxy.stopped",
+    ]));
+    // The sink stamps the envelope, so a future event kind cannot ship without a version on it.
+    for (const event of events) {
+      expect(event.schemaVersion).toBe(SANDBOX_NETWORK_EVENT_SCHEMA_VERSION);
+    }
+    // Which build enforced the allowlist, stated rather than inferred from the absence of a complaint.
+    expect(startedEvents(events)[0].emitterVersion).toEqual(expect.any(String));
+    expect(startedEvents(events)[0].emitterVersion).not.toBe("");
+  });
+
   it.runIf(process.platform === "linux")("bounds and scrubs the event hostname without flagging a valid IPv6 target", async () => {
     const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-network-hostname-"));
     cleanup.push(workspace);
@@ -655,6 +720,7 @@ describe("local process sandbox", () => {
     expect(stoppedEvents(events)).toEqual([{
       event: "sandbox.network.proxy.stopped",
       ts: expect.any(String),
+      schemaVersion: SANDBOX_NETWORK_EVENT_SCHEMA_VERSION,
       allowCount: 0,
       denyCount: 0,
       sinkErrorCount: 0,

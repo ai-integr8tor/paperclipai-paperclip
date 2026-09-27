@@ -1,9 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 export type LocalProcessSandboxAccess = "ro" | "rw";
 export type LocalProcessNetworkScope = "deny" | "allowlist";
@@ -16,6 +18,31 @@ export interface LocalProcessSandboxPath {
 export interface LocalProcessSandboxPathAlias {
   path: string;
   target: string;
+}
+
+/**
+ * Schema version carried by every `sandbox.network.*` event.
+ *
+ * Bump it for a rename, a removal, or a type change on any field of any event in this family. Do
+ * **not** bump it for a purely additive field, or for a new event kind: a reader that ignores
+ * unknown fields keeps working, and pushing churn at consumers trains them to widen their accepted
+ * range until the check means nothing.
+ *
+ * The reason this exists: every liveness rule downstream keys on the *presence* of
+ * `sandbox.network.proxy.started`, not on the readability of the decision events. A release that
+ * renames a decision field while leaving the lifecycle event intact would leave the control looking
+ * live while every decision line silently failed its reader's field access — deny alerting goes
+ * quiet, and that is byte-indistinguishable from a quiet, healthy fleet. A version on the line lets
+ * a reader alert on "I cannot read this" instead of skipping it.
+ */
+export const SANDBOX_NETWORK_EVENT_SCHEMA_VERSION = 1;
+
+/** Fields stamped on every `sandbox.network.*` event by the sink, never by an emit site. */
+export interface SandboxNetworkEventEnvelope {
+  /** Host clock at the moment of emission, ISO 8601 UTC. */
+  ts: string;
+  /** See {@link SANDBOX_NETWORK_EVENT_SCHEMA_VERSION} for the bump rule. */
+  schemaVersion: number;
 }
 
 export type SandboxNetworkDecisionOutcome = "allow" | "deny";
@@ -34,10 +61,8 @@ export type SandboxNetworkDecisionReason =
  * Deliberately carries only the inputs to the decision. The request path, query string, headers and
  * body are attacker-influenced and never included, so a reviewer can trust every field here.
  */
-export interface SandboxNetworkDecision {
+export interface SandboxNetworkDecision extends SandboxNetworkEventEnvelope {
   event: "sandbox.network.decision";
-  /** Host clock at the moment of the decision, ISO 8601 UTC. */
-  ts: string;
   decision: SandboxNetworkDecisionOutcome;
   reason: SandboxNetworkDecisionReason;
   /**
@@ -63,9 +88,15 @@ export interface SandboxNetworkDecision {
  * Emitted once the proxy is listening. Without it, an empty decision stream cannot distinguish "no
  * egress attempted" from "proxy never started" from "sink broken".
  */
-export interface SandboxNetworkProxyStarted {
+export interface SandboxNetworkProxyStarted extends SandboxNetworkEventEnvelope {
   event: "sandbox.network.proxy.started";
-  ts: string;
+  /**
+   * Version of the `@paperclipai/adapter-utils` that emitted this event, read from its own package
+   * manifest. Makes a dropped or replaced install pin visible *positively* — a reader can assert
+   * which build is enforcing the allowlist instead of inferring it from the absence of a complaint.
+   * Null only when the manifest could not be read, which never blocks the proxy from starting.
+   */
+  emitterVersion: string | null;
   /** Configured `networkAllowlist` entries — the input count. */
   allowlistEntryCount: number;
   /** Configured `networkTrustedUrls` entries — the input count. */
@@ -80,9 +111,8 @@ export interface SandboxNetworkProxyStarted {
  * Emitted on the graceful teardown path only. A hard death of the host process yields no stopped
  * event, which is the intended reading: a `started` with no `stopped` is abnormal termination.
  */
-export interface SandboxNetworkProxyStopped {
+export interface SandboxNetworkProxyStopped extends SandboxNetworkEventEnvelope {
   event: "sandbox.network.proxy.stopped";
-  ts: string;
   allowCount: number;
   denyCount: number;
   /**
@@ -96,9 +126,8 @@ export interface SandboxNetworkProxyStopped {
  * Byte accounting for one closed CONNECT tunnel. Forensic, not real-time: it fires at tunnel close
  * and is the only signal covering exfiltration to an already-allowlisted host.
  */
-export interface SandboxNetworkTunnelClosed {
+export interface SandboxNetworkTunnelClosed extends SandboxNetworkEventEnvelope {
   event: "sandbox.network.tunnel.closed";
-  ts: string;
   tunnelId: string;
   hostname: string | null;
   port: string | null;
@@ -378,12 +407,39 @@ function parseTrustedNetworkUrl(value: string): NetworkAllowlistRule | null {
 }
 
 type SandboxNetworkEventInput = SandboxNetworkEvent extends infer Event
-  ? Event extends SandboxNetworkEvent ? Omit<Event, "ts"> : never
+  ? Event extends SandboxNetworkEvent ? Omit<Event, keyof SandboxNetworkEventEnvelope> : never
   : never;
 
 interface SandboxNetworkEventSink {
   emit: (event: SandboxNetworkEventInput) => void;
   counters: () => { allowCount: number; denyCount: number; sinkErrorCount: number };
+}
+
+let emitterVersion: string | null | undefined;
+
+/**
+ * This package's own version, read from its manifest at runtime rather than imported.
+ *
+ * Read rather than imported for two reasons: `rootDir` is `src`, so a JSON import of
+ * `../package.json` does not compile; and the published manifest carries a release version the
+ * source tree never holds, so the literal in the repo is not the number a reader needs. Both `src/`
+ * and `dist/` sit one level under the package root, so the relative path is the same either way.
+ *
+ * Cached after the first read, and never fatal: this field is provenance, and failing to read it
+ * must not keep the proxy — a security control — from starting.
+ */
+function readEmitterVersion(): string | null {
+  if (emitterVersion !== undefined) return emitterVersion;
+  try {
+    const manifest: unknown = JSON.parse(
+      readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8"),
+    );
+    const version = (manifest as { version?: unknown }).version;
+    emitterVersion = typeof version === "string" && version.length > 0 ? version : null;
+  } catch {
+    emitterVersion = null;
+  }
+  return emitterVersion;
 }
 
 /**
@@ -405,7 +461,13 @@ function createNetworkEventSink(
       }
       if (!onNetworkDecision) return;
       try {
-        onNetworkDecision({ ts: new Date().toISOString(), ...event } as SandboxNetworkEvent);
+        // Envelope is stamped here and only here. An emit site cannot forget the version, and a
+        // future event kind gets it by construction rather than by review.
+        onNetworkDecision({
+          ts: new Date().toISOString(),
+          schemaVersion: SANDBOX_NETWORK_EVENT_SCHEMA_VERSION,
+          ...event,
+        } as SandboxNetworkEvent);
       } catch {
         // Intentionally swallowed: see the doc comment above.
         sinkErrorCount += 1;
@@ -606,6 +668,7 @@ async function startNetworkAllowlistProxy(
       // profile this event makes visible.
       sink.emit({
         event: "sandbox.network.proxy.started",
+        emitterVersion: readEmitterVersion(),
         allowlistEntryCount: allowlist.length,
         trustedUrlCount: trustedUrls.length,
         ruleCount: rules.length,
