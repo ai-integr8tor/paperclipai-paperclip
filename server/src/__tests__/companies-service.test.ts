@@ -6,6 +6,8 @@ import {
   agentConfigRevisions,
   agents,
   agentWakeupRequests,
+  approvalComments,
+  approvals,
   builtInManagedResources,
   companies,
   companySkillVersions,
@@ -18,6 +20,7 @@ import {
   routines,
   routineTriggers,
   issues,
+  issueApprovals,
   projects,
 } from "@paperclipai/db";
 import {
@@ -25,6 +28,8 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { companyService } from "../services/companies.js";
+import { approvalService } from "../services/approvals.js";
+import { attentionService } from "../services/attention.js";
 import { readBuiltInAgentMarker } from "../services/built-in-agent-metadata.js";
 import { reconcileBuiltInAgentsOnStartup } from "../services/built-in-agents.js";
 
@@ -55,6 +60,9 @@ describeEmbeddedPostgres("companyService", () => {
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
+    await db.delete(approvalComments);
+    await db.delete(issueApprovals);
+    await db.delete(approvals);
     await db.delete(agentConfigRevisions);
     await db.delete(issues);
     await db.delete(projects);
@@ -869,7 +877,7 @@ describeEmbeddedPostgres("companyService", () => {
     });
   });
 
-  it("consolidates an inactive legacy company into its holding without leaving a second company surface", async () => {
+  it("requires an exact holding marker before projecting any operator records", async () => {
     const sourceCompanyId = randomUUID();
     const targetCompanyId = randomUUID();
     const agentId = randomUUID();
@@ -888,7 +896,7 @@ describeEmbeddedPostgres("companyService", () => {
       {
         id: targetCompanyId,
         name: "Digital Services Products — Holding",
-        description: "AgentSwarm holding authority\n\nagentswarm:holding-provider-onboarding-company=digital_services_products",
+        description: "AgentSwarm holding authority\n\nagentswarm:holding-provider-onboarding-company=digital_services_products_other",
         issuePrefix: `D${targetCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
         requireBoardApprovalForNewAgents: false,
       },
@@ -930,7 +938,7 @@ describeEmbeddedPostgres("companyService", () => {
       status: "in_review",
     });
 
-    const result = await companyService(db).consolidateLegacyAgentSwarmBusiness({
+    await expect(companyService(db).consolidateLegacyAgentSwarmBusiness({
       sourceCompanyId,
       targetCompanyId,
       businessId: "digital_services_products_worker_tool_publisher",
@@ -941,17 +949,11 @@ describeEmbeddedPostgres("companyService", () => {
         agentId: null,
         runId: null,
       },
-    });
-
-    expect(result).toMatchObject({
-      state: "consolidated",
-      sourceCompanyId,
-      targetCompanyId,
-      sourceCompanyArchived: true,
-    });
+    })).rejects.toThrow("Company markers do not authorize this AgentSwarm consolidation");
     await expect(companyService(db).getById(sourceCompanyId)).resolves.toMatchObject({
       id: sourceCompanyId,
-      status: "archived",
+      status: "active",
+      operatorVisible: true,
     });
 
     const [migratedAgent] = await db
@@ -967,10 +969,10 @@ describeEmbeddedPostgres("companyService", () => {
       .from(issues)
       .where(eq(issues.id, issueId));
 
-    expect(migratedAgent).toEqual({ companyId: targetCompanyId });
-    expect(migratedProject).toEqual({ companyId: targetCompanyId });
+    expect(migratedAgent).toEqual({ companyId: sourceCompanyId });
+    expect(migratedProject).toEqual({ companyId: sourceCompanyId });
     expect(migratedIssue).toEqual({
-      companyId: targetCompanyId,
+      companyId: sourceCompanyId,
       projectId,
       assigneeAgentId: agentId,
     });
@@ -981,7 +983,7 @@ describeEmbeddedPostgres("companyService", () => {
     expect(retainedEscalation).toEqual({ companyId: sourceCompanyId, status: "in_review" });
   });
 
-  it("refuses consolidation while the source company has an active execution", async () => {
+  it("projects the operator surface even while the source company has an active execution", async () => {
     const sourceCompanyId = randomUUID();
     const targetCompanyId = randomUUID();
     const agentId = randomUUID();
@@ -1027,13 +1029,147 @@ describeEmbeddedPostgres("companyService", () => {
       holdingId: "digital_services_products",
       actor: { actorType: "system", actorId: "agentswarm-holding-reconciler", agentId: null, runId: null },
     })).resolves.toMatchObject({
-      state: "deferred_active_execution",
+      state: "runtime_deferred",
       sourceCompanyId,
       targetCompanyId,
     });
 
-    await expect(companyService(db).getById(sourceCompanyId)).resolves.toMatchObject({ id: sourceCompanyId });
+    await expect(companyService(db).getById(sourceCompanyId)).resolves.toMatchObject({
+      id: sourceCompanyId,
+      status: "active",
+      operatorVisible: false,
+      operatorCompanyId: targetCompanyId,
+    });
     const [agent] = await db.select({ companyId: agents.companyId }).from(agents).where(eq(agents.id, agentId));
     expect(agent).toEqual({ companyId: sourceCompanyId });
+  });
+
+  it("projects formal approvals to the marked holding without moving a live source runtime", async () => {
+    const sourceCompanyId = randomUUID();
+    const targetCompanyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const approvalId = randomUUID();
+
+    await db.insert(companies).values([
+      {
+        id: sourceCompanyId,
+        name: "Worker Tool Publisher",
+        description: "agentswarm:business=digital_services_products_worker_tool_publisher",
+        issuePrefix: `W${sourceCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      },
+      {
+        id: targetCompanyId,
+        name: "Digital Services Products — Holding",
+        description: "agentswarm:holding-provider-onboarding-company=digital_services_products",
+        issuePrefix: `D${targetCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      },
+    ]);
+    await db.insert(agents).values({
+      id: agentId,
+      companyId: sourceCompanyId,
+      name: "Executor Provisioner",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId: sourceCompanyId,
+      assigneeAgentId: agentId,
+      title: "Runtime stage",
+      identifier: "WOR-12",
+    });
+    await db.insert(heartbeatRuns).values({
+      companyId: sourceCompanyId,
+      agentId,
+      invocationSource: "timer",
+      status: "scheduled_retry",
+    });
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId: sourceCompanyId,
+      type: "provider_commitment",
+      requestedByAgentId: agentId,
+      payload: { provider: "cloudflare" },
+    });
+    await db.insert(issueApprovals).values({
+      companyId: sourceCompanyId,
+      issueId,
+      approvalId,
+      linkedByAgentId: agentId,
+    });
+    await db.insert(approvalComments).values({
+      companyId: sourceCompanyId,
+      approvalId,
+      authorAgentId: agentId,
+      body: "Formal operator decision",
+    });
+
+    await expect(companyService(db).consolidateLegacyAgentSwarmBusiness({
+      sourceCompanyId,
+      targetCompanyId,
+      businessId: "digital_services_products_worker_tool_publisher",
+      holdingId: "digital_services_products",
+      actor: { actorType: "system", actorId: "agentswarm-holding-reconciler", agentId: null, runId: null },
+    })).resolves.toMatchObject({ state: "runtime_deferred", sourceCompanyId, targetCompanyId });
+
+    await expect(db.select({
+      status: companies.status,
+      operatorVisible: companies.operatorVisible,
+      operatorCompanyId: companies.operatorCompanyId,
+    }).from(companies).where(eq(companies.id, sourceCompanyId))).resolves.toEqual([
+      { status: "active", operatorVisible: false, operatorCompanyId: targetCompanyId },
+    ]);
+    await expect(db.select({ companyId: agents.companyId }).from(agents).where(eq(agents.id, agentId))).resolves.toEqual([
+      { companyId: sourceCompanyId },
+    ]);
+    await expect(db.select({ companyId: issues.companyId }).from(issues).where(eq(issues.id, issueId))).resolves.toEqual([
+      { companyId: sourceCompanyId },
+    ]);
+    await expect(db.select({ companyId: heartbeatRuns.companyId }).from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).resolves.toEqual([
+      { companyId: sourceCompanyId },
+    ]);
+    await expect(db.select({ companyId: approvals.companyId, operatorCompanyId: approvals.operatorCompanyId }).from(approvals).where(eq(approvals.id, approvalId))).resolves.toEqual([
+      { companyId: sourceCompanyId, operatorCompanyId: targetCompanyId },
+    ]);
+    await expect(db.select({ companyId: issueApprovals.companyId }).from(issueApprovals).where(eq(issueApprovals.approvalId, approvalId))).resolves.toEqual([
+      { companyId: sourceCompanyId },
+    ]);
+    await expect(db.select({ companyId: approvalComments.companyId }).from(approvalComments).where(eq(approvalComments.approvalId, approvalId))).resolves.toEqual([
+      { companyId: sourceCompanyId },
+    ]);
+
+    const holdingApprovals = await approvalService(db).list(targetCompanyId, "pending");
+    expect(holdingApprovals.map((approval) => approval.id)).toContain(approvalId);
+    const sourceApprovals = await approvalService(db).list(sourceCompanyId, "pending");
+    expect(sourceApprovals.map((approval) => approval.id)).toContain(approvalId);
+    const [laterApproval] = await db.insert(approvals).values({
+      companyId: sourceCompanyId,
+      type: "provider_commitment",
+      requestedByAgentId: agentId,
+      payload: { provider: "cloudflare", stage: "later" },
+    }).returning();
+    expect(laterApproval.operatorCompanyId).toBe(targetCompanyId);
+    expect((await approvalService(db).list(targetCompanyId, "pending")).map((approval) => approval.id))
+      .toContain(laterApproval.id);
+    const holdingFeed = await attentionService(db).list(targetCompanyId, { userId: "board-user" });
+    expect(holdingFeed.items.some((item) => item.sourceKind === "approval" && item.subject.id === approvalId)).toBe(true);
+
+    await expect(companyService(db).consolidateLegacyAgentSwarmBusiness({
+      sourceCompanyId,
+      targetCompanyId,
+      businessId: "digital_services_products_worker_tool_publisher",
+      holdingId: "digital_services_products",
+      actor: { actorType: "system", actorId: "agentswarm-holding-reconciler", agentId: null, runId: null },
+    })).resolves.toMatchObject({ state: "runtime_deferred" });
+    const projectionLogs = await db.select({ id: activityLog.id }).from(activityLog).where(and(
+      eq(activityLog.companyId, targetCompanyId),
+      eq(activityLog.action, "company.legacy_agentswarm_operator_surface_projected"),
+    ));
+    expect(projectionLogs).toHaveLength(1);
   });
 });

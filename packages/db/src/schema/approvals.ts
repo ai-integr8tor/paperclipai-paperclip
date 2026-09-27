@@ -7,6 +7,7 @@ export const approvals = pgTable(
   {
     id: uuid("id").primaryKey().defaultRandom(),
     companyId: uuid("company_id").notNull().references(() => companies.id),
+    operatorCompanyId: uuid("operator_company_id").references(() => companies.id, { onDelete: "set null" }),
     type: text("type").notNull(),
     requestedByAgentId: uuid("requested_by_agent_id").references(() => agents.id),
     requestedByUserId: text("requested_by_user_id"),

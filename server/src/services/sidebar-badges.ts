@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, not } from "drizzle-orm";
+import { and, desc, eq, inArray, not, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, approvals, heartbeatRuns } from "@paperclipai/db";
 import type { SidebarBadges } from "@paperclipai/shared";
@@ -37,7 +37,7 @@ export function sidebarBadgeService(db: Db) {
         .from(approvals)
         .where(
           and(
-            eq(approvals.companyId, companyId),
+            or(eq(approvals.companyId, companyId), eq(approvals.operatorCompanyId, companyId)),
             inArray(approvals.status, ACTIONABLE_APPROVAL_STATUSES),
           ),
         )

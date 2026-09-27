@@ -3,6 +3,7 @@ import type { ApprovalStatus, ApprovalType } from "../constants.js";
 export interface Approval {
   id: string;
   companyId: string;
+  operatorCompanyId: string | null;
   type: ApprovalType;
   requestedByAgentId: string | null;
   requestedByUserId: string | null;

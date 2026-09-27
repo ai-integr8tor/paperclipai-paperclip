@@ -528,9 +528,8 @@ export function companyRoutes(db: Db, storage?: StorageService) {
     res.json(company);
   });
 
-  // Platform-only migration for the legacy AgentSwarm per-business surface.
-  // This is not an approval action: it is marker validated by the service and
-  // returns a deferred result while the legacy company has an active run.
+  // Platform-only operator projection for a marker-bound AgentSwarm business.
+  // Native runtime state remains source-scoped; the response is runtime_deferred.
   router.post("/:companyId/consolidate-legacy-agentswarm-business", async (req, res) => {
     assertBoard(req);
     const sourceCompanyId = req.params.companyId as string;

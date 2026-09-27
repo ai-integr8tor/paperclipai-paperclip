@@ -132,6 +132,8 @@ export function companyService(db: Db) {
     name: companies.name,
     description: companies.description,
     status: companies.status,
+    operatorVisible: companies.operatorVisible,
+    operatorCompanyId: companies.operatorCompanyId,
     issuePrefix: companies.issuePrefix,
     issueCounter: companies.issueCounter,
     budgetMonthlyCents: companies.budgetMonthlyCents,
@@ -250,12 +252,9 @@ export function companyService(db: Db) {
     throw new Error("Unable to allocate unique issue prefix");
   }
 
-  /**
-   * Consolidates the one legacy AgentSwarm per-business Paperclip surface into
-   * its marked holding. This is intentionally not a generic company merge:
-   * both marker checks are required, only the named business may move, and an
-   * active native execution produces a deferred result instead of a mutation.
-   */
+  /** Projects formal approvals into the holding's operator surface. The
+   * legacy company retains its agents, issues and execution state so native
+   * retries and issue approval gates continue to use their original scope. */
   async function consolidateLegacyAgentSwarmBusiness(input: {
     sourceCompanyId: string;
     targetCompanyId: string;
@@ -264,90 +263,86 @@ export function companyService(db: Db) {
     actor: CompanyActivityActor;
   }): Promise<
     | { state: "consolidated"; sourceCompanyId: string; targetCompanyId: string; sourceCompanyArchived: true }
-    | { state: "deferred_active_execution"; sourceCompanyId: string; targetCompanyId: string }
+    | { state: "runtime_deferred"; sourceCompanyId: string; targetCompanyId: string }
   > {
     if (input.sourceCompanyId === input.targetCompanyId) {
       throw unprocessable("Legacy company and holding company must be distinct");
     }
 
     const result = await db.transaction(async (tx) => {
-      const [source, target] = await Promise.all([
-        tx.select({ id: companies.id, description: companies.description, status: companies.status })
-          .from(companies).where(eq(companies.id, input.sourceCompanyId)).then((rows) => rows[0] ?? null),
-        tx.select({ id: companies.id, description: companies.description })
-          .from(companies).where(eq(companies.id, input.targetCompanyId)).then((rows) => rows[0] ?? null),
-      ]);
+      const [source] = await tx.select({
+        id: companies.id,
+        description: companies.description,
+        status: companies.status,
+        operatorVisible: companies.operatorVisible,
+        operatorCompanyId: companies.operatorCompanyId,
+      }).from(companies).where(eq(companies.id, input.sourceCompanyId)).for("update");
+      const [target] = await tx.select({
+        id: companies.id,
+        description: companies.description,
+        status: companies.status,
+      }).from(companies).where(eq(companies.id, input.targetCompanyId));
       if (!source || !target) throw notFound("Company not found");
 
       const businessMarker = `agentswarm:business=${input.businessId}`;
       const holdingMarker = `agentswarm:holding-provider-onboarding-company=${input.holdingId}`;
-      if (!source.description?.includes(businessMarker) || !target.description?.includes(holdingMarker)) {
+      const hasMarker = (description: string | null, marker: string) =>
+        description?.split(/\r?\n/).some((line) => line.trim() === marker) ?? false;
+      if (
+        !input.businessId.startsWith(`${input.holdingId}_`)
+        || !hasMarker(source.description, businessMarker)
+        || !hasMarker(target.description, holdingMarker)
+        || target.status !== "active"
+      ) {
         throw unprocessable("Company markers do not authorize this AgentSwarm consolidation");
       }
       if (source.status === "archived") {
         return { state: "consolidated" as const, sourceCompanyId: input.sourceCompanyId, targetCompanyId: input.targetCompanyId, sourceCompanyArchived: true as const };
       }
 
-      const activeRuns = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
-        eq(heartbeatRuns.companyId, input.sourceCompanyId),
-        inArray(heartbeatRuns.status, ["queued", "running", "scheduled"]),
-      )).limit(1);
-      if (activeRuns.length > 0) {
-        return { state: "deferred_active_execution" as const, sourceCompanyId: input.sourceCompanyId, targetCompanyId: input.targetCompanyId };
+      if (source.operatorCompanyId && source.operatorCompanyId !== input.targetCompanyId) {
+        throw unprocessable("Legacy company already belongs to a different operator holding");
       }
 
-      // AgentSwarm's legacy integration emitted its actual run/stage work with
-      // this stable, machine-authored description prefix. Generic agent
-      // escalations have no approval record and remain in the archived source
-      // for audit; they must not be rehomed as holding operator work.
-      const operationalIssueIds = await tx
-        .select({ id: issues.id })
-        .from(issues)
+      // Preserve source ownership of approvals, comments and issue links: the
+      // requesting agent and native heartbeat gates still query source scope.
+      // The operatorCompanyId projects the same decision to the holding.
+      const movedApprovals = await tx.update(approvals)
+        .set({ operatorCompanyId: input.targetCompanyId })
         .where(and(
-          eq(issues.companyId, input.sourceCompanyId),
-          sql`${issues.description} ~ '^AgentSwarm run(:|\\s)'`,
+          eq(approvals.companyId, input.sourceCompanyId),
+          isNull(approvals.operatorCompanyId),
         ))
-        .then((rows) => rows.map((row) => row.id));
-
-      // These records are the operational surface of the legacy AgentSwarm
-      // business. The source is archived (not deleted) afterward, preserving
-      // unrelated historic issues and extensions for audit.
-      if (operationalIssueIds.length > 0) {
-        await tx
-          .update(issueComments)
-          .set({ companyId: input.targetCompanyId })
-          .where(and(
-            eq(issueComments.companyId, input.sourceCompanyId),
-            inArray(issueComments.issueId, operationalIssueIds),
-          ));
-        await tx
-          .update(issues)
-          .set({ companyId: input.targetCompanyId })
-          .where(inArray(issues.id, operationalIssueIds));
+        .returning({ id: approvals.id });
+      if (source.operatorVisible || !source.operatorCompanyId) {
+        await tx.update(companies)
+          .set({ operatorVisible: false, operatorCompanyId: input.targetCompanyId, updatedAt: new Date() })
+          .where(eq(companies.id, input.sourceCompanyId));
       }
-      await tx.update(approvalComments).set({ companyId: input.targetCompanyId }).where(eq(approvalComments.companyId, input.sourceCompanyId));
-      await tx.update(approvals).set({ companyId: input.targetCompanyId }).where(eq(approvals.companyId, input.sourceCompanyId));
-      await tx.update(projects).set({ companyId: input.targetCompanyId }).where(eq(projects.companyId, input.sourceCompanyId));
-      await tx.update(agentRuntimeState).set({ companyId: input.targetCompanyId }).where(eq(agentRuntimeState.companyId, input.sourceCompanyId));
-      await tx.update(agentTaskSessions).set({ companyId: input.targetCompanyId }).where(eq(agentTaskSessions.companyId, input.sourceCompanyId));
-      await tx.update(agentWakeupRequests).set({ companyId: input.targetCompanyId }).where(eq(agentWakeupRequests.companyId, input.sourceCompanyId));
-      await tx.update(agents).set({ companyId: input.targetCompanyId }).where(eq(agents.companyId, input.sourceCompanyId));
-      await tx.update(companies).set({ status: "archived", updatedAt: new Date() }).where(eq(companies.id, input.sourceCompanyId));
-      return { state: "consolidated" as const, sourceCompanyId: input.sourceCompanyId, targetCompanyId: input.targetCompanyId, sourceCompanyArchived: true as const };
+      return {
+        state: "runtime_deferred" as const,
+        sourceCompanyId: input.sourceCompanyId,
+        targetCompanyId: input.targetCompanyId,
+        projectionApplied: source.operatorVisible || !source.operatorCompanyId || movedApprovals.length > 0,
+      };
     });
 
-    if (result.state === "consolidated") {
+    if (result.state === "runtime_deferred" && result.projectionApplied) {
       await logActivity(db, {
         companyId: input.targetCompanyId,
         actorType: input.actor.actorType,
         actorId: input.actor.actorId,
         agentId: input.actor.agentId ?? null,
         runId: input.actor.runId ?? null,
-        action: "company.legacy_agentswarm_business_consolidated",
+        action: "company.legacy_agentswarm_operator_surface_projected",
         entityType: "company",
         entityId: input.sourceCompanyId,
         details: { businessId: input.businessId, holdingId: input.holdingId },
       });
+    }
+    if (result.state === "runtime_deferred") {
+      const { projectionApplied: _, ...publicResult } = result;
+      return publicResult;
     }
     return result;
   }

@@ -310,6 +310,7 @@ describe("CommentThread", () => {
     const approval: Approval = {
       id: "approval-1",
       companyId: "company-1",
+      operatorCompanyId: null,
       type: "request_board_approval",
       requestedByAgentId: "agent-1",
       requestedByUserId: null,

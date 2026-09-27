@@ -39,6 +39,7 @@ import { queryKeys } from "@/lib/queryKeys";
 import { cn, SIDEBAR_RAIL_HIDDEN_LABEL } from "@/lib/utils";
 import { useSidebar } from "../context/SidebarContext";
 import { CompanyPatternIcon } from "./CompanyPatternIcon";
+import { isOperatorVisible } from "../lib/company-visibility";
 
 interface SidebarCompanyMenuProps {
   open?: boolean;
@@ -149,7 +150,7 @@ export function SidebarCompanyMenu({ open: controlledOpen, onOpenChange }: Sideb
     }),
   );
   const sidebarCompanies = useMemo(
-    () => companies.filter((company) => company.status !== "archived"),
+    () => companies.filter((company) => company.status !== "archived" && isOperatorVisible(company)),
     [companies],
   );
   const { data: session } = useQuery({

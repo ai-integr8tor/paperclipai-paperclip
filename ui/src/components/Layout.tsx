@@ -34,6 +34,7 @@ import { useCompanyPageMemory } from "../hooks/useCompanyPageMemory";
 import { healthApi } from "../api/health";
 import { instanceSettingsApi } from "../api/instanceSettings";
 import { shouldSyncCompanySelectionFromRoute } from "../lib/company-selection";
+import { isOperatorVisible } from "../lib/company-visibility";
 import {
   applyMainContentScrollTop,
   NavigationScrollMemory,
@@ -92,6 +93,7 @@ export function Layout() {
     selectedCompanyId,
     selectionSource,
     setSelectedCompanyId,
+    resolveHiddenCompanyHoldingByPrefix,
   } = useCompany();
   const {
     companyPrefix,
@@ -127,8 +129,12 @@ export function Layout() {
   const matchedCompany = useMemo(() => {
     if (!companyPrefix) return null;
     const requestedPrefix = companyPrefix.toUpperCase();
-    return companies.find((company) => company.issuePrefix.toUpperCase() === requestedPrefix) ?? null;
+    return companies.find((company) => isOperatorVisible(company) && company.issuePrefix.toUpperCase() === requestedPrefix) ?? null;
   }, [companies, companyPrefix]);
+  const hiddenRouteHolding = useMemo(
+    () => companyPrefix ? resolveHiddenCompanyHoldingByPrefix?.(companyPrefix) ?? null : null,
+    [companyPrefix, resolveHiddenCompanyHoldingByPrefix],
+  );
   const hasUnknownCompanyPrefix =
     Boolean(companyPrefix) && !companiesLoading && companies.length > 0 && !matchedCompany;
   const pluginRoutePath = useMemo(
@@ -212,6 +218,11 @@ export function Layout() {
   useEffect(() => {
     if (!companyPrefix || companiesLoading || companies.length === 0) return;
 
+    if (hiddenRouteHolding) {
+      navigate(`/${hiddenRouteHolding.issuePrefix}/dashboard`, { replace: true });
+      return;
+    }
+
     if (!matchedCompany) {
       const fallback = (selectedCompanyId ? companies.find((company) => company.id === selectedCompanyId) : null)
         ?? companies[0]
@@ -241,6 +252,7 @@ export function Layout() {
     companyPrefix,
     companies,
     companiesLoading,
+    hiddenRouteHolding,
     matchedCompany,
     location.pathname,
     location.search,

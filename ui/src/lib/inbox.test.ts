@@ -76,6 +76,7 @@ function makeApproval(status: Approval["status"]): Approval {
   return {
     id: `approval-${status}`,
     companyId: "company-1",
+    operatorCompanyId: null,
     type: "hire_agent",
     requestedByAgentId: null,
     requestedByUserId: null,

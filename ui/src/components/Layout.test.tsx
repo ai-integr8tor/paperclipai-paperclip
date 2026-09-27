@@ -20,8 +20,8 @@ const mockSetSelectedCompanyId = vi.hoisted(() => vi.fn());
 const mockSetSidebarOpen = vi.hoisted(() => vi.fn());
 const mockSetForceCollapsed = vi.hoisted(() => vi.fn());
 const mockCompanyState = vi.hoisted(() => ({
-  companies: [{ id: "company-1", issuePrefix: "PAP", name: "Paperclip" }],
-  selectedCompany: { id: "company-1", issuePrefix: "PAP", name: "Paperclip" },
+  companies: [{ id: "company-1", issuePrefix: "PAP", name: "Paperclip", operatorVisible: true, operatorCompanyId: null as string | null }],
+  selectedCompany: { id: "company-1", issuePrefix: "PAP", name: "Paperclip", operatorVisible: true, operatorCompanyId: null as string | null },
   selectedCompanyId: "company-1",
 }));
 const mockPluginSlots = vi.hoisted(() => ({
@@ -54,6 +54,10 @@ vi.mock("@/lib/router", () => ({
 
 vi.mock("./Sidebar", () => ({
   Sidebar: () => <div>Main company nav</div>,
+}));
+
+vi.mock("../pages/NotFound", () => ({
+  NotFoundPage: () => <div>Company route unavailable</div>,
 }));
 
 vi.mock("./CompanySettingsSidebar", () => ({
@@ -178,6 +182,14 @@ vi.mock("../context/CompanyContext", () => ({
     selectedCompanyId: mockCompanyState.selectedCompanyId,
     selectionSource: "manual",
     setSelectedCompanyId: mockSetSelectedCompanyId,
+    resolveHiddenCompanyHoldingByPrefix: (companyPrefix: string) => {
+      const source = mockCompanyState.companies.find((company) =>
+        company.issuePrefix.toUpperCase() === companyPrefix.toUpperCase() && !company.operatorVisible
+      );
+      return source?.operatorCompanyId
+        ? mockCompanyState.companies.find((company) => company.id === source.operatorCompanyId) ?? null
+        : null;
+    },
   }),
 }));
 
@@ -248,8 +260,8 @@ describe("Layout", () => {
     container = document.createElement("div");
     document.body.appendChild(container);
     currentPathname = "/PAP/dashboard";
-    mockCompanyState.companies = [{ id: "company-1", issuePrefix: "PAP", name: "Paperclip" }];
-    mockCompanyState.selectedCompany = { id: "company-1", issuePrefix: "PAP", name: "Paperclip" };
+    mockCompanyState.companies = [{ id: "company-1", issuePrefix: "PAP", name: "Paperclip", operatorVisible: true, operatorCompanyId: null }];
+    mockCompanyState.selectedCompany = { id: "company-1", issuePrefix: "PAP", name: "Paperclip", operatorVisible: true, operatorCompanyId: null };
     mockCompanyState.selectedCompanyId = "company-1";
     mockHealthApi.get.mockResolvedValue({
       status: "ok",
@@ -864,10 +876,10 @@ describe("Layout", () => {
   it("uses the route company context for plugin route sidebars on the first render", async () => {
     currentPathname = "/ALT/wiki";
     mockCompanyState.companies = [
-      { id: "company-1", issuePrefix: "PAP", name: "Paperclip" },
-      { id: "company-2", issuePrefix: "ALT", name: "Alternate" },
+      { id: "company-1", issuePrefix: "PAP", name: "Paperclip", operatorVisible: true, operatorCompanyId: null },
+      { id: "company-2", issuePrefix: "ALT", name: "Alternate", operatorVisible: true, operatorCompanyId: null },
     ];
-    mockCompanyState.selectedCompany = { id: "company-1", issuePrefix: "PAP", name: "Paperclip" };
+    mockCompanyState.selectedCompany = { id: "company-1", issuePrefix: "PAP", name: "Paperclip", operatorVisible: true, operatorCompanyId: null };
     mockCompanyState.selectedCompanyId = "company-1";
     mockPluginSlots.slots = [
       {
@@ -926,6 +938,29 @@ describe("Layout", () => {
     await act(async () => {
       root.unmount();
     });
+  });
+
+  it("redirects a legacy runtime company route to its holding dashboard", async () => {
+    currentPathname = "/WOR/issues/WOR-12";
+    mockCompanyState.companies = [
+      { id: "company-1", issuePrefix: "DIG", name: "Digital Services Products — Holding", operatorVisible: true, operatorCompanyId: null },
+      { id: "company-2", issuePrefix: "WOR", name: "Worker Tool Publisher", operatorVisible: false, operatorCompanyId: "company-1" },
+    ];
+    mockCompanyState.selectedCompany = mockCompanyState.companies[0];
+    mockCompanyState.selectedCompanyId = "company-1";
+    const root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(<QueryClientProvider client={queryClient}><Layout /></QueryClientProvider>);
+    });
+    await flushReact();
+
+    expect(mockNavigate).toHaveBeenCalledWith("/DIG/dashboard", { replace: true });
+    expect(mockSetSelectedCompanyId).not.toHaveBeenCalledWith("company-2", expect.anything());
+    expect(container.textContent).not.toContain("Outlet content");
+
+    await act(async () => { root.unmount(); });
   });
 
   it("keeps the normal company sidebar when a plugin page route is ambiguous", async () => {

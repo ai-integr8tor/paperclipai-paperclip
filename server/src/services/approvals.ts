@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { approvalComments, approvals } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
@@ -87,7 +87,7 @@ export function approvalService(db: Db) {
 
   return {
     list: (companyId: string, status?: string) => {
-      const conditions = [eq(approvals.companyId, companyId)];
+      const conditions = [or(eq(approvals.companyId, companyId), eq(approvals.operatorCompanyId, companyId))!];
       if (status) conditions.push(eq(approvals.status, status));
       return db.select().from(approvals).where(and(...conditions));
     },

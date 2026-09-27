@@ -5,6 +5,7 @@ import { useDialogActions } from "../context/DialogContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { companiesApi } from "../api/companies";
 import { queryKeys } from "../lib/queryKeys";
+import { isOperatorVisible } from "../lib/company-visibility";
 import { formatCents, relativeTime } from "../lib/utils";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -104,7 +105,7 @@ export function Companies() {
       </div>
 
       <div className="grid gap-4">
-        {companies.map((company) => {
+        {companies.filter(isOperatorVisible).map((company) => {
           const selected = company.id === selectedCompanyId;
           const isEditing = editingId === company.id;
           const isConfirmingDelete = confirmDeleteId === company.id;

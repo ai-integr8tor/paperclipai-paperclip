@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
+import { agents, approvals, companies, createDb, heartbeatRuns } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -47,6 +47,7 @@ describeEmbeddedPostgres("dashboard service", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(approvals);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(companies);
@@ -54,6 +55,19 @@ describeEmbeddedPostgres("dashboard service", () => {
 
   afterAll(async () => {
     await tempDb?.cleanup();
+  });
+
+  it("counts source-owned approvals projected into the holding", async () => {
+    const holdingId = randomUUID();
+    const sourceId = randomUUID();
+    await db.insert(companies).values([
+      { id: holdingId, name: "Holding", issuePrefix: `H${holdingId.replace(/-/g, "").slice(0, 6).toUpperCase()}` },
+      { id: sourceId, name: "Source", issuePrefix: `S${sourceId.replace(/-/g, "").slice(0, 6).toUpperCase()}`, operatorVisible: false, operatorCompanyId: holdingId },
+    ]);
+    await db.insert(approvals).values({ companyId: sourceId, type: "provider_commitment", payload: {} });
+
+    const summary = await dashboardService(db).summary(holdingId);
+    expect(summary.pendingApprovals).toBe(1);
   });
 
   it("aggregates the full 14-day run activity window without recent-run truncation", async () => {

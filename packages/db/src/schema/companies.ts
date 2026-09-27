@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, integer, timestamp, boolean, uniqueIndex } from "drizzle-orm/pg-core";
+import { type AnyPgColumn, pgTable, uuid, text, integer, timestamp, boolean, uniqueIndex } from "drizzle-orm/pg-core";
 
 export const companies = pgTable(
   "companies",
@@ -8,6 +8,7 @@ export const companies = pgTable(
     description: text("description"),
     status: text("status").notNull().default("active"),
     operatorVisible: boolean("operator_visible").notNull().default(true),
+    operatorCompanyId: uuid("operator_company_id").references((): AnyPgColumn => companies.id, { onDelete: "set null" }),
     pauseReason: text("pause_reason"),
     pausedAt: timestamp("paused_at", { withTimezone: true }),
     issuePrefix: text("issue_prefix").notNull().default("PAP"),

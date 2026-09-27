@@ -32,7 +32,7 @@ export function ApprovalDetail() {
     queryFn: () => approvalsApi.get(approvalId!),
     enabled: !!approvalId,
   });
-  const resolvedCompanyId = approval?.companyId ?? selectedCompanyId;
+  const resolvedCompanyId = approval?.operatorCompanyId ?? approval?.companyId ?? selectedCompanyId;
 
   const { data: comments } = useQuery({
     queryKey: queryKeys.approvals.comments(approvalId!),
@@ -81,6 +81,10 @@ export function ApprovalDetail() {
         queryKey: queryKeys.approvals.list(approval.companyId, "pending"),
       });
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.list(approval.companyId) });
+      if (approval.operatorCompanyId) {
+        queryClient.invalidateQueries({ queryKey: queryKeys.approvals.list(approval.operatorCompanyId) });
+        queryClient.invalidateQueries({ queryKey: queryKeys.approvals.list(approval.operatorCompanyId, "pending") });
+      }
     }
   };
 
@@ -151,8 +155,11 @@ export function ApprovalDetail() {
   const TypeIcon = typeIcon[approval.type] ?? defaultTypeIcon;
   const showApprovedBanner = searchParams.get("resolved") === "approved" && approval.status === "approved";
   const primaryLinkedIssue = linkedIssues?.[0] ?? null;
+  const isHoldingProjection = Boolean(approval.operatorCompanyId && approval.operatorCompanyId === selectedCompanyId);
   const resolvedCta =
-    primaryLinkedIssue
+    isHoldingProjection
+      ? { label: "Back to approvals", to: "/approvals" }
+      : primaryLinkedIssue
       ? {
           label:
             (linkedIssues?.length ?? 0) > 1
@@ -243,7 +250,10 @@ export function ApprovalDetail() {
             <p className="text-xs text-muted-foreground mb-1.5">Linked Tasks</p>
             <div className="space-y-1.5">
               {linkedIssues.map((issue) => (
-                <Link
+                isHoldingProjection ? <div key={issue.id} className="block text-xs rounded border border-border/70 px-2 py-1.5">
+                  <span className="font-mono text-muted-foreground mr-2">{issue.identifier ?? issue.id.slice(0, 8)}</span>
+                  <span>{issue.title}</span>
+                </div> : <Link
                   key={issue.id}
                   to={`/issues/${issue.identifier ?? issue.id}`}
                   className="block text-xs rounded border border-border/70 px-2 py-1.5 hover:bg-accent/20"

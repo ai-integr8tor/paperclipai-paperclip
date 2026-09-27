@@ -220,6 +220,54 @@ describe("approval routes idempotent retries", () => {
     expect(mockApprovalService.approve).not.toHaveBeenCalled();
   });
 
+  it("lets a holding board decide a projected source approval without source membership", async () => {
+    mockApprovalService.getById.mockResolvedValue({
+      id: "approval-projected",
+      companyId: "company-2",
+      operatorCompanyId: "company-1",
+      type: "provider_commitment",
+      status: "pending",
+      payload: {},
+    });
+    mockApprovalService.approve.mockResolvedValue({
+      approval: {
+        id: "approval-projected",
+        companyId: "company-2",
+        operatorCompanyId: "company-1",
+        type: "provider_commitment",
+        status: "approved",
+        payload: {},
+      },
+      applied: false,
+    });
+
+    const res = await request(await createApp())
+      .post("/api/approvals/approval-projected/approve")
+      .send({});
+
+    expect(res.status).toBe(200);
+    expect(mockApprovalService.approve).toHaveBeenCalledWith("approval-projected", "user-1", undefined);
+  });
+
+  it("keeps the source agent's read access to a projected approval", async () => {
+    mockApprovalService.getById.mockResolvedValue({
+      id: "approval-projected",
+      companyId: "company-1",
+      operatorCompanyId: "company-2",
+      type: "provider_commitment",
+      status: "pending",
+      payload: {},
+    });
+
+    const res = await request(await createAgentApp({ runId: "" }))
+      .get("/api/approvals/approval-projected");
+
+    expect(res.status).toBe(200);
+    expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+      resource: { type: "company", companyId: "company-1" },
+    }));
+  });
+
   it("rejects approval revision requests for companies outside the caller scope", async () => {
     mockApprovalService.getById.mockResolvedValue({
       id: "approval-3",

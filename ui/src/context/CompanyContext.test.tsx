@@ -32,6 +32,8 @@ function makeCompany(id: string): Company {
     name: "Paperclip",
     description: null,
     status: "active",
+    operatorVisible: true,
+    operatorCompanyId: null,
     pauseReason: null,
     pausedAt: null,
     issuePrefix: "PAP",
@@ -59,6 +61,15 @@ function Probe({ onSelectedCompanyId }: { onSelectedCompanyId: (companyId: strin
     onSelectedCompanyId(selectedCompanyId);
   }, [onSelectedCompanyId, selectedCompanyId]);
   return <div data-selected-company-id={selectedCompanyId ?? ""} />;
+}
+
+function VisibilityProbe() {
+  const { companies, selectedCompanyId, setSelectedCompanyId } = useCompany();
+  return <div>
+    <span data-testid="visible-companies">{companies.map((company) => company.id).join(",")}</span>
+    <span data-testid="selection">{selectedCompanyId}</span>
+    <button onClick={() => setSelectedCompanyId("hidden-company")}>Select hidden</button>
+  </div>;
 }
 
 describe("resolveBootstrapCompanySelection", () => {
@@ -192,5 +203,35 @@ describe("CompanyProvider", () => {
 
     expect(seen).toEqual([null, "company-1"]);
     expect(localStorage.getItem("paperclip.selectedCompanyId")).toBe("company-1");
+  });
+
+  it("excludes an active internal company from bootstrap and rejects manual selection", async () => {
+    localStorage.setItem("paperclip.selectedCompanyId", "hidden-company");
+    queryClient.setQueryData(queryKeys.companies.all, {
+      companies: [
+        { ...makeCompany("hidden-company"), operatorVisible: false, operatorCompanyId: "holding-company" },
+        makeCompany("holding-company"),
+      ],
+      unauthorized: false,
+    });
+    mockCompaniesApi.list.mockImplementation(() => new Promise(() => {}));
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <CompanyProvider><VisibilityProbe /></CompanyProvider>
+        </QueryClientProvider>,
+      );
+    });
+
+    expect(container.querySelector('[data-testid="visible-companies"]')?.textContent).toBe("holding-company");
+    expect(container.querySelector('[data-testid="selection"]')?.textContent).toBe("holding-company");
+    expect(localStorage.getItem("paperclip.selectedCompanyId")).toBe("holding-company");
+
+    await act(async () => {
+      container.querySelector("button")?.click();
+    });
+    expect(container.querySelector('[data-testid="selection"]')?.textContent).toBe("holding-company");
+    expect(localStorage.getItem("paperclip.selectedCompanyId")).toBe("holding-company");
   });
 });

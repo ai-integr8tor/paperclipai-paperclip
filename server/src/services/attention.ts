@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -608,7 +608,10 @@ export function attentionService(db: Db) {
           updatedAt: approvals.updatedAt,
         })
         .from(approvals)
-        .where(and(eq(approvals.companyId, companyId), eq(approvals.status, "pending")))
+        .where(and(
+          or(eq(approvals.companyId, companyId), eq(approvals.operatorCompanyId, companyId)),
+          eq(approvals.status, "pending"),
+        ))
         .orderBy(desc(approvals.updatedAt), desc(approvals.id));
 
       const pendingApprovalIds = pendingApprovals.map((approval) => approval.id);

@@ -13,6 +13,7 @@ import { companiesApi } from "../api/companies";
 import { companiesListQueryOptions, type CompanyListResult } from "../api/companies-query";
 import { queryKeys } from "../lib/queryKeys";
 import type { CompanySelectionSource } from "../lib/company-selection";
+import { isOperatorVisible } from "../lib/company-visibility";
 type CompanySelectionOptions = { source?: CompanySelectionSource };
 
 interface CompanyContextValue {
@@ -23,6 +24,7 @@ interface CompanyContextValue {
   loading: boolean;
   error: Error | null;
   setSelectedCompanyId: (companyId: string, options?: CompanySelectionOptions) => void;
+  resolveHiddenCompanyHoldingByPrefix: (companyPrefix: string) => Company | null;
   reloadCompanies: () => Promise<void>;
   createCompany: (data: {
     name: string;
@@ -36,7 +38,7 @@ const STORAGE_KEY = "paperclip.selectedCompanyId";
 const CompanyContext = createContext<CompanyContextValue | null>(null);
 
 export function resolveBootstrapCompanySelection(input: {
-  companies: Array<Pick<Company, "id">>;
+  companies: Array<Pick<Company, "id"> & Partial<Pick<Company, "operatorCompanyId" | "operatorVisible">>>;
   sidebarCompanies: Array<Pick<Company, "id">>;
   selectedCompanyId: string | null;
   storedCompanyId: string | null;
@@ -45,13 +47,17 @@ export function resolveBootstrapCompanySelection(input: {
 
   const selectableCompanies = input.sidebarCompanies.length > 0
     ? input.sidebarCompanies
-    : input.companies;
-  if (input.selectedCompanyId && selectableCompanies.some((company) => company.id === input.selectedCompanyId)) {
-    return input.selectedCompanyId;
-  }
-  if (input.storedCompanyId && selectableCompanies.some((company) => company.id === input.storedCompanyId)) {
-    return input.storedCompanyId;
-  }
+    : input.companies.filter(isOperatorVisible);
+  const resolve = (id: string | null) => {
+    if (!id) return null;
+    if (selectableCompanies.some((company) => company.id === id)) return id;
+    const holdingId = input.companies.find((company) => company.id === id)?.operatorCompanyId;
+    return holdingId && selectableCompanies.some((company) => company.id === holdingId) ? holdingId : null;
+  };
+  const selected = resolve(input.selectedCompanyId);
+  if (selected) return selected;
+  const stored = resolve(input.storedCompanyId);
+  if (stored) return stored;
   return selectableCompanies[0]?.id ?? null;
 }
 
@@ -70,7 +76,10 @@ export function CompanyProvider({ children }: { children: ReactNode }) {
 
   const { data: companiesResult = { companies: [], unauthorized: false }, isLoading, error } =
     useQuery<CompanyListResult>(companiesListQueryOptions);
-  const companies = companiesResult.companies;
+  const companies = useMemo(
+    () => companiesResult.companies.filter(isOperatorVisible),
+    [companiesResult.companies],
+  );
   const companyListUnauthorized = companiesResult.unauthorized;
   const sidebarCompanies = useMemo(
     () => companies.filter((company) => company.status !== "archived"),
@@ -91,7 +100,7 @@ export function CompanyProvider({ children }: { children: ReactNode }) {
     }
 
     const next = resolveBootstrapCompanySelection({
-      companies,
+      companies: companiesResult.companies,
       sidebarCompanies,
       selectedCompanyId,
       storedCompanyId: localStorage.getItem(STORAGE_KEY),
@@ -100,13 +109,25 @@ export function CompanyProvider({ children }: { children: ReactNode }) {
     setSelectedCompanyIdState(next);
     setSelectionSource("bootstrap");
     localStorage.setItem(STORAGE_KEY, next);
-  }, [companies, companyListUnauthorized, isLoading, selectedCompanyId, sidebarCompanies]);
+  }, [companies, companiesResult.companies, companyListUnauthorized, isLoading, selectedCompanyId, sidebarCompanies]);
 
   const setSelectedCompanyId = useCallback((companyId: string, options?: CompanySelectionOptions) => {
-    setSelectedCompanyIdState(companyId);
+    const requested = companiesResult.companies.find((company) => company.id === companyId);
+    if (!requested) return;
+    const resolvedCompanyId = isOperatorVisible(requested) ? companyId : requested.operatorCompanyId;
+    if (!resolvedCompanyId || !companies.some((company) => company.id === resolvedCompanyId)) return;
+    setSelectedCompanyIdState(resolvedCompanyId);
     setSelectionSource(options?.source ?? "manual");
-    localStorage.setItem(STORAGE_KEY, companyId);
-  }, []);
+    localStorage.setItem(STORAGE_KEY, resolvedCompanyId);
+  }, [companies, companiesResult.companies]);
+
+  const resolveHiddenCompanyHoldingByPrefix = useCallback((companyPrefix: string) => {
+    const source = companiesResult.companies.find((company) =>
+      company.issuePrefix.toUpperCase() === companyPrefix.toUpperCase()
+    );
+    if (!source || isOperatorVisible(source) || !source.operatorCompanyId) return null;
+    return companies.find((company) => company.id === source.operatorCompanyId) ?? null;
+  }, [companies, companiesResult.companies]);
 
   const reloadCompanies = useCallback(async () => {
     await queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
@@ -119,9 +140,12 @@ export function CompanyProvider({ children }: { children: ReactNode }) {
       budgetMonthlyCents?: number;
     }) =>
       companiesApi.create(data),
-    onSuccess: (company) => {
-      queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
-      setSelectedCompanyId(company.id);
+    onSuccess: async (company) => {
+      await queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
+      if (!isOperatorVisible(company)) return;
+      setSelectedCompanyIdState(company.id);
+      setSelectionSource("manual");
+      localStorage.setItem(STORAGE_KEY, company.id);
     },
   });
 
@@ -150,6 +174,7 @@ export function CompanyProvider({ children }: { children: ReactNode }) {
       loading: isLoading,
       error: error as Error | null,
       setSelectedCompanyId,
+      resolveHiddenCompanyHoldingByPrefix,
       reloadCompanies,
       createCompany,
     }),
@@ -161,6 +186,7 @@ export function CompanyProvider({ children }: { children: ReactNode }) {
       isLoading,
       error,
       setSelectedCompanyId,
+      resolveHiddenCompanyHoldingByPrefix,
       reloadCompanies,
       createCompany,
     ],

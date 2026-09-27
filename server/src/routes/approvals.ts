@@ -1,4 +1,4 @@
-import { Router, type Request } from "express";
+import { Router, type Request, type Response } from "express";
 import { eq } from "drizzle-orm";
 import { heartbeatRuns, type Db } from "@paperclipai/db";
 import {
@@ -18,7 +18,7 @@ import {
   logActivity,
   secretService,
 } from "../services/index.js";
-import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
+import { assertBoard, assertCompanyAccess, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { redactEventPayload } from "../redaction.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 
@@ -53,12 +53,25 @@ export function approvalRoutes(
   const secretsSvc = secretService(db);
   const strictSecretsMode = process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true";
 
+  function approvalAccessCompanyId(req: Request, approval: { companyId: string; operatorCompanyId: string | null }) {
+    if (req.actor.type === "board" && approval.operatorCompanyId && hasCompanyAccess(req, approval.operatorCompanyId)) {
+      return approval.operatorCompanyId;
+    }
+    return hasCompanyAccess(req, approval.companyId) ? approval.companyId : null;
+  }
+
   async function requireApprovalAccess(req: Request, id: string) {
     const approval = await svc.getById(id);
-    if (!approval || !hasCompanyAccess(req, approval.companyId)) {
-      return null;
-    }
-    assertCompanyAccess(req, approval.companyId);
+    if (!approval) return null;
+    const accessCompanyId = approvalAccessCompanyId(req, approval);
+    if (!accessCompanyId) return null;
+    assertCompanyAccess(req, accessCompanyId);
+    return approval;
+  }
+
+  async function getAccessibleApproval(req: Request, res: Response, id: string) {
+    const approval = await requireApprovalAccess(req, id);
+    if (!approval) res.status(404).json({ error: "Approval not found" });
     return approval;
   }
 
@@ -115,9 +128,9 @@ export function approvalRoutes(
 
   router.get("/approvals/:id", async (req, res) => {
     const id = req.params.id as string;
-    const approval = await getAccessibleResource(req, res, svc.getById(id), "Approval not found");
+    const approval = await getAccessibleApproval(req, res, id);
     if (!approval) return;
-    if (!(await assertApprovalAccessAllowed(req, res, approval.companyId))) return;
+    if (!(await assertApprovalAccessAllowed(req, res, approvalAccessCompanyId(req, approval)!))) return;
     res.json(redactApprovalPayload(approval));
   });
 
@@ -178,9 +191,9 @@ export function approvalRoutes(
 
   router.get("/approvals/:id/issues", async (req, res) => {
     const id = req.params.id as string;
-    const approval = await getAccessibleResource(req, res, svc.getById(id), "Approval not found");
+    const approval = await getAccessibleApproval(req, res, id);
     if (!approval) return;
-    if (!(await assertApprovalAccessAllowed(req, res, approval.companyId))) return;
+    if (!(await assertApprovalAccessAllowed(req, res, approvalAccessCompanyId(req, approval)!))) return;
     const issues = await issueApprovalsSvc.listIssuesForApproval(id);
     res.json(issues);
   });
@@ -335,7 +348,7 @@ export function approvalRoutes(
 
   router.post("/approvals/:id/resubmit", validate(resubmitApprovalSchema), async (req, res) => {
     const id = req.params.id as string;
-    const existing = await getAccessibleResource(req, res, svc.getById(id), "Approval not found");
+    const existing = await getAccessibleApproval(req, res, id);
     if (!existing) return;
     if (!(await assertApprovalMutationAllowedByRunContext(req, res, existing.companyId))) return;
 
@@ -370,7 +383,7 @@ export function approvalRoutes(
 
   router.get("/approvals/:id/comments", async (req, res) => {
     const id = req.params.id as string;
-    const approval = await getAccessibleResource(req, res, svc.getById(id), "Approval not found");
+    const approval = await getAccessibleApproval(req, res, id);
     if (!approval) return;
     const comments = await svc.listComments(id);
     res.json(comments);
@@ -378,7 +391,7 @@ export function approvalRoutes(
 
   router.post("/approvals/:id/comments", validate(addApprovalCommentSchema), async (req, res) => {
     const id = req.params.id as string;
-    const approval = await getAccessibleResource(req, res, svc.getById(id), "Approval not found");
+    const approval = await getAccessibleApproval(req, res, id);
     if (!approval) return;
     if (!(await assertApprovalMutationAllowedByRunContext(req, res, approval.companyId))) return;
     const actor = getActorInfo(req);
