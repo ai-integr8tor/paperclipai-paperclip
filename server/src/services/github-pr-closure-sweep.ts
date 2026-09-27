@@ -1,5 +1,5 @@
-import { and, eq, inArray, sql } from "drizzle-orm";
-import { approvals, issueApprovals, issues, type Db } from "@paperclipai/db";
+import { and, eq, inArray, notInArray, sql } from "drizzle-orm";
+import { approvals, issueApprovals, issueRelations, issues, type Db } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { issueService } from "./issues.js";
 
@@ -175,17 +175,36 @@ export function githubPrClosureSweepService(
           }
 
           // Move the task back to todo so the assignee can pick it up again.
+          // Skip the status change if the task is blocked for other reasons too.
           try {
-            await db
-              .update(issues)
-              .set({ status: "todo", updatedAt: now() })
-              .where(
-                and(
-                  eq(issues.id, issue.id),
-                  inArray(issues.status, ["in_review", "blocked"]),
-                ),
-              );
-            totalIssuesRouted += 1;
+            let skipStatusChange = false;
+            if (issue.status === "blocked") {
+              const otherBlockers = await db
+                .select({ id: issueRelations.id })
+                .from(issueRelations)
+                .innerJoin(issues, eq(issueRelations.issueId, issues.id))
+                .where(
+                  and(
+                    eq(issueRelations.relatedIssueId, issue.id),
+                    eq(issueRelations.type, "blocks"),
+                    notInArray(issues.status, ["done", "cancelled"]),
+                  ),
+                )
+                .limit(1);
+              skipStatusChange = otherBlockers.length > 0;
+            }
+            if (!skipStatusChange) {
+              await db
+                .update(issues)
+                .set({ status: "todo", updatedAt: now() })
+                .where(
+                  and(
+                    eq(issues.id, issue.id),
+                    inArray(issues.status, ["in_review", "blocked"]),
+                  ),
+                );
+              totalIssuesRouted += 1;
+            }
           } catch (err) {
             logger.warn({ err, issueId: issue.id }, "github-pr-closure-sweep: status update failed");
           }
