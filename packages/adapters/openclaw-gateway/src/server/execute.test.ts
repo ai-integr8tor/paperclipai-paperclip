@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildAgentParams, resolveClaimedApiKeyPath, resolveSessionKey } from "./execute.js";
+import { buildAgentParams, normalizePrivateKeyPem, resolveClaimedApiKeyPath, resolveSessionKey } from "./execute.js";
 
 describe("resolveSessionKey", () => {
   it("prefixes run-scoped session keys with the configured agent", () => {
@@ -121,5 +121,27 @@ describe("resolveClaimedApiKeyPath", () => {
   it("falls back to the shared default when value is not a string", () => {
     expect(resolveClaimedApiKeyPath(42)).toBe(DEFAULT_PATH);
     expect(resolveClaimedApiKeyPath({})).toBe(DEFAULT_PATH);
+  });
+});
+
+describe("normalizePrivateKeyPem", () => {
+  it("restores real newlines when PEM contains literal backslash-n sequences", async () => {
+    const { generateKeyPairSync, createPrivateKey } = await import("node:crypto");
+    const { privateKey } = generateKeyPairSync("ed25519");
+    const validPem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+    // Simulate a PEM mangled in transit: real newlines replaced by literal \n
+    const mangledPem = validPem.replace(/\n/g, "\\n");
+    expect(() => createPrivateKey(mangledPem)).toThrow(/DECODER routines::unsupported/);
+
+    const normalized = normalizePrivateKeyPem(mangledPem);
+    expect(normalized).toBe(validPem);
+    expect(() => createPrivateKey(normalized)).not.toThrow();
+  });
+
+  it("leaves a valid PEM unchanged", async () => {
+    const { generateKeyPairSync } = await import("node:crypto");
+    const { privateKey } = generateKeyPairSync("ed25519");
+    const validPem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+    expect(normalizePrivateKeyPem(validPem)).toBe(validPem);
   });
 });

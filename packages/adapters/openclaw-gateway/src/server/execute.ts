@@ -111,6 +111,21 @@ function nonEmpty(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
+/**
+ * Normalizes a PEM string that may have been mangled in transit.
+ * Some storage/transmission paths escape newlines as literal backslash-n
+ * sequences; crypto.createPrivateKey rejects those with
+ * "error:1E08010C:DECODER routines::unsupported". If the value looks like a
+ * PEM but contains literal \n sequences instead of real newlines, restore
+ * the real newlines. Valid PEMs are returned unchanged.
+ */
+export function normalizePrivateKeyPem(pem: string): string {
+  if (pem.includes("\\n") && !pem.includes("\n")) {
+    return pem.replace(/\\n/g, "\n");
+  }
+  return pem;
+}
+
 function parseOptionalPositiveInteger(value: unknown): number | null {
   if (typeof value === "number" && Number.isFinite(value)) {
     return Math.max(1, Math.floor(value));
@@ -610,14 +625,15 @@ function buildDeviceAuthPayloadV3(params: {
 function resolveDeviceIdentity(config: Record<string, unknown>): GatewayDeviceIdentity {
   const configuredPrivateKey = nonEmpty(config.devicePrivateKeyPem);
   if (configuredPrivateKey) {
-    const privateKey = crypto.createPrivateKey(configuredPrivateKey);
+    const normalizedPem = normalizePrivateKeyPem(configuredPrivateKey);
+    const privateKey = crypto.createPrivateKey(normalizedPem);
     const publicKey = crypto.createPublicKey(privateKey);
     const publicKeyPem = publicKey.export({ type: "spki", format: "pem" }).toString();
     const raw = derivePublicKeyRaw(publicKeyPem);
     return {
       deviceId: crypto.createHash("sha256").update(raw).digest("hex"),
       publicKeyRawBase64Url: base64UrlEncode(raw),
-      privateKeyPem: configuredPrivateKey,
+      privateKeyPem: normalizedPem,
       source: "configured",
     };
   }
