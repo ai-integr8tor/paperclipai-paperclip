@@ -4,6 +4,7 @@ import {
   discoverOpenCodeModels,
   ensureOpenCodeModelConfiguredAndAvailable,
   listOpenCodeModels,
+  refreshOpenCodeModels,
   requireOpenCodeModelId,
   resetOpenCodeModelsCacheForTests,
 } from "./models.js";
@@ -18,9 +19,64 @@ describe("openCode models", () => {
   });
 
   it("returns an empty list when discovery command is unavailable", async () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
     process.env.PAPERCLIP_OPENCODE_COMMAND =
       "__paperclip_missing_opencode_command__";
     await expect(listOpenCodeModels()).resolves.toEqual([]);
+    expect(warning).toHaveBeenCalledWith(
+      expect.stringContaining("`opencode models` discovery failed"),
+    );
+  });
+
+  it("re-reads the models.dev cache on an explicit refresh instead of the discovery cache", async () => {
+    const spy = vi
+      .spyOn(serverUtils, "runChildProcess")
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "Models cache refreshed\n",
+        stderr: "",
+        pid: 1,
+        startedAt: new Date().toISOString(),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "opencode/longcat-2.5-preview-free\n",
+        stderr: "",
+        pid: 1,
+        startedAt: new Date().toISOString(),
+      });
+
+    await expect(refreshOpenCodeModels()).resolves.toEqual([
+      {
+        id: "opencode/longcat-2.5-preview-free",
+        label: "opencode/longcat-2.5-preview-free",
+      },
+    ]);
+    expect(spy.mock.calls[0]?.[2]).toEqual(["models", "--refresh"]);
+    expect(spy.mock.calls[1]?.[2]).toEqual(["models"]);
+    // The refreshed catalog is cached, so a subsequent list call does not
+    // spawn another discovery.
+    await expect(listOpenCodeModels()).resolves.toEqual([
+      {
+        id: "opencode/longcat-2.5-preview-free",
+        label: "opencode/longcat-2.5-preview-free",
+      },
+    ]);
+    expect(spy).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps a failed refresh soft so the caller can fall back to the cached catalog", async () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    process.env.PAPERCLIP_OPENCODE_COMMAND =
+      "__paperclip_missing_opencode_command__";
+    await expect(refreshOpenCodeModels()).resolves.toEqual([]);
+    expect(warning).toHaveBeenCalledWith(
+      expect.stringContaining("`opencode models --refresh` failed"),
+    );
   });
 
   it("rejects when model is missing", async () => {

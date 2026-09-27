@@ -31,6 +31,7 @@ const mockEnvironmentService = vi.hoisted(() => ({
   getById: vi.fn(),
 }));
 const mockListOpenCodeModels = vi.hoisted(() => vi.fn());
+const mockRefreshOpenCodeModels = vi.hoisted(() => vi.fn());
 
 const mockAgentInstructionsService = vi.hoisted(() => ({
   materializeManagedBundle: vi.fn(),
@@ -72,6 +73,7 @@ function registerModuleMocks() {
     return {
       ...actual,
       listOpenCodeModels: mockListOpenCodeModels,
+      refreshOpenCodeModels: mockRefreshOpenCodeModels,
     };
   });
 
@@ -176,6 +178,8 @@ describe("adapter model refresh route", () => {
     mockEnvironmentService.getById.mockResolvedValue(null);
     mockListOpenCodeModels.mockReset();
     mockListOpenCodeModels.mockResolvedValue([{ id: "dynamic-opencode-model", label: "dynamic-opencode-model" }]);
+    mockRefreshOpenCodeModels.mockReset();
+    mockRefreshOpenCodeModels.mockResolvedValue([{ id: "refreshed-opencode-model", label: "refreshed-opencode-model" }]);
     await unregisterTestAdapter(refreshableAdapterType);
   });
 
@@ -229,6 +233,31 @@ describe("adapter model refresh route", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body).toEqual(openCodeFallbackModels);
     expect(mockListOpenCodeModels).not.toHaveBeenCalled();
+  });
+
+  it("refreshes the OpenCode models.dev cache when refresh=1 is requested", async () => {
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).get("/api/companies/company-1/adapters/opencode_local/models?refresh=1"),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body).toEqual([{ id: "refreshed-opencode-model", label: "refreshed-opencode-model" }]);
+    expect(mockRefreshOpenCodeModels).toHaveBeenCalledTimes(1);
+    expect(mockListOpenCodeModels).not.toHaveBeenCalled();
+  });
+
+  it("falls back to OpenCode discovery when an explicit refresh yields no models", async () => {
+    mockRefreshOpenCodeModels.mockResolvedValue([]);
+
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).get("/api/companies/company-1/adapters/opencode_local/models?refresh=1"),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body).toEqual([{ id: "dynamic-opencode-model", label: "dynamic-opencode-model" }]);
+    expect(mockListOpenCodeModels).toHaveBeenCalledTimes(1);
   });
 
   it("keeps OpenCode model discovery enabled for local environments", async () => {

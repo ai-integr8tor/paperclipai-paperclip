@@ -353,10 +353,46 @@ export async function ensureOpenCodeModelConfiguredAndAvailable(input: {
   return models;
 }
 
+function describeDiscoveryError(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 export async function listOpenCodeModels(): Promise<AdapterModel[]> {
   try {
     return await discoverOpenCodeModelsCached();
-  } catch {
+  } catch (err) {
+    // A swallowed failure here is indistinguishable from an empty catalog, so
+    // a missing/unauthenticated `opencode` install silently degrades the UI to
+    // the static fallback list and hides every model OpenCode actually serves.
+    console.warn(
+      `[opencode-local] \`opencode models\` discovery failed (${describeDiscoveryError(
+        err,
+      )}); the adapter will serve its static model list.`,
+    );
+    return [];
+  }
+}
+
+/**
+ * Force a re-read of OpenCode's on-disk models.dev cache and return the
+ * resulting catalog. `opencode models` serves a persistent snapshot, so a
+ * long-lived host can omit a model OpenCode now serves until that cache is
+ * refreshed. The agent form exposes a "Refresh models" control for this
+ * adapter, so an explicit refresh must run `opencode models --refresh` instead
+ * of re-reading the short-lived discovery cache.
+ *
+ * Failures stay soft on purpose: an empty result lets the caller fall back to
+ * the cached and then the static list instead of failing the models endpoint.
+ */
+export async function refreshOpenCodeModels(): Promise<AdapterModel[]> {
+  try {
+    return await refreshOpenCodeModelsCached({});
+  } catch (err) {
+    console.warn(
+      `[opencode-local] \`opencode models --refresh\` failed (${describeDiscoveryError(
+        err,
+      )}); preserving the previously discovered catalog.`,
+    );
     return [];
   }
 }
