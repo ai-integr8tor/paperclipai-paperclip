@@ -11663,7 +11663,10 @@ describeEmbeddedPostgres("tool access service", () => {
     expect((await service.getConnection(connected.connectionId, company.id)).credentialSecretRefs).toEqual([]);
   });
 
-  it("replaces a legacy company-scoped personal credential with a user-owned value on reconnect", async () => {
+  it.each([
+    { shared: false, outcome: "revokes" },
+    { shared: true, outcome: "keeps" },
+  ])("replaces a legacy company-scoped personal credential on reconnect and $outcome the old secret (shared with the organization slot: $shared)", async ({ shared }) => {
     const company = await createCompany(db);
     const service = createTestToolAccessService(db);
     mockToolsList([{ name: "search_memories", annotations: { readOnlyHint: true } }]);
@@ -11683,6 +11686,7 @@ describeEmbeddedPostgres("tool access service", () => {
     const [row] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
     await db.update(toolConnections).set({
       credentialRefs: row!.credentialRefs.map((ref) => ({ ...ref, secretId: legacy.id })),
+      credentialSecretRefs: shared ? [{ ...grantRef!, secretId: legacy.id }] : [],
     }).where(eq(toolConnections.id, connected.connectionId));
 
     await service.reconnectGalleryApp(connected.connectionId, company.id,
@@ -11699,7 +11703,7 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(resolved?.value).toBe("new-key");
     const connection = await service.getConnection(connected.connectionId, company.id);
     expect(connection.credentialRefs.map((credentialRef) => credentialRef.secretId)).toEqual([ref.secretId]);
-    expect(await db.select().from(companySecrets).where(eq(companySecrets.id, legacy.id))).toHaveLength(0);
+    expect(await db.select().from(companySecrets).where(eq(companySecrets.id, legacy.id))).toHaveLength(shared ? 1 : 0);
   });
 
   it("keeps rejected Mem0 API keys on the key-entry path rather than switching to OAuth", async () => {

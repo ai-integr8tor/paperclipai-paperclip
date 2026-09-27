@@ -13943,8 +13943,9 @@ export function toolAccessService(
    * Replace the credential(s) on an existing connection and re-run the health
    * check — the "Replace key" / reconnect flow (M7, PAP-10859). Rotates the
    * secret in place when a ref already exists so the connection keeps its
-   * profile, policies, and catalog; creates a fresh secret only when the field
-   * had none (e.g. a link connection added a key after the fact).
+   * profile, policies, and catalog; creates a fresh secret when the field had
+   * none (e.g. a link connection added a key after the fact) or when a personal
+   * grant points at a value its owner does not hold.
    */
   async function reconnectGalleryApp(
     connectionId: string,
@@ -14075,6 +14076,17 @@ export function toolAccessService(
       }
     }
 
+    // Revoke replaced values before committing the new refs. A replaced value
+    // was never resolvable, and a retry that finds its ref still in place
+    // replaces it again, so a failure at either step stays recoverable.
+    await removeReplacedConnectionSecrets(connection, replacedSecretIds, {
+      grantId: personalIdentity?.grant?.id ?? null,
+      keptSecretIds: [
+        ...credentialRefs.map((ref) => ref.secretId),
+        ...connection.credentialSecretRefs.map((ref) => ref.secretId),
+        ...credentialSecretRefs.map((ref) => ref.secretId),
+      ],
+    });
     const updated = await db.transaction(async (tx) => {
       const updatedAt = new Date();
       if (personalIdentity) {
@@ -14123,7 +14135,6 @@ export function toolAccessService(
       updated,
       personalIdentity ? credentialSecretRefs : [],
     );
-    await removeReplacedConnectionSecrets(updated, replacedSecretIds);
     const health = await checkConnectionHealth(updated.id, actor);
     const refresh = await refreshCatalog(updated.id, actor, {
       enableAllByDefault: true,
@@ -14147,27 +14158,28 @@ export function toolAccessService(
 
   /**
    * Revoke credentials a reconnect replaced. `classifyConnectionSecrets` only
-   * looks at other consumers, so first keep any secret this connection still
-   * references through its own refs or another of its grants.
+   * looks at other connections, so also keep any secret this connection will
+   * still reference: the refs being committed and its other grants' refs.
    */
   async function removeReplacedConnectionSecrets(
     connection: typeof toolConnections.$inferSelect,
     secretIds: string[],
+    kept: { grantId: string | null; keptSecretIds: string[] },
   ) {
     if (secretIds.length === 0) return;
-    const grantRows = await db
+    const otherGrants = await db
       .select({ refs: connectionGrants.credentialSecretRefs })
       .from(connectionGrants)
       .where(
         and(
           eq(connectionGrants.companyId, connection.companyId),
           eq(connectionGrants.connectionId, connection.id),
+          kept.grantId ? ne(connectionGrants.id, kept.grantId) : undefined,
         ),
       );
     const stillReferenced = new Set([
-      ...connection.credentialRefs.map((ref) => ref.secretId),
-      ...connection.credentialSecretRefs.map((ref) => ref.secretId),
-      ...grantRows.flatMap((row) => (row.refs ?? []).map((ref) => ref.secretId)),
+      ...kept.keptSecretIds,
+      ...otherGrants.flatMap((row) => (row.refs ?? []).map((ref) => ref.secretId)),
     ]);
     const { owned } = await classifyConnectionSecrets(
       connection,
