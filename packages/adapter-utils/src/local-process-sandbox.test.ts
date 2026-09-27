@@ -11,10 +11,48 @@ import {
   parseLocalProcessNetworkScope,
   parseLocalProcessSandboxExtraPaths,
   type SandboxNetworkDecision,
+  type SandboxNetworkEvent,
+  type SandboxNetworkProxyStarted,
+  type SandboxNetworkProxyStopped,
+  type SandboxNetworkTunnelClosed,
 } from "./local-process-sandbox.js";
 import { runChildProcess } from "./server-utils.js";
 
 const cleanup: string[] = [];
+
+function decisionEvents(events: SandboxNetworkEvent[]): SandboxNetworkDecision[] {
+  return events.filter((event): event is SandboxNetworkDecision => event.event === "sandbox.network.decision");
+}
+
+function startedEvents(events: SandboxNetworkEvent[]): SandboxNetworkProxyStarted[] {
+  return events.filter((event): event is SandboxNetworkProxyStarted => event.event === "sandbox.network.proxy.started");
+}
+
+function stoppedEvents(events: SandboxNetworkEvent[]): SandboxNetworkProxyStopped[] {
+  return events.filter((event): event is SandboxNetworkProxyStopped => event.event === "sandbox.network.proxy.stopped");
+}
+
+function tunnelEvents(events: SandboxNetworkEvent[]): SandboxNetworkTunnelClosed[] {
+  return events.filter((event): event is SandboxNetworkTunnelClosed => event.event === "sandbox.network.tunnel.closed");
+}
+
+/** Reads the proxy socket path out of the bridge argv the sandbox builder produced. */
+function proxySocketPath(args: string[]): string {
+  return args[args.indexOf("--") + 3];
+}
+
+function connectThroughProxy(socketPath: string, requestLine: string): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const socket = net.createConnection(socketPath, () => {
+      socket.end(`CONNECT ${requestLine} HTTP/1.1\r\nHost: ${requestLine}\r\n\r\n`);
+    });
+    let response = "";
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => { response += chunk; });
+    socket.on("end", () => resolve(response));
+    socket.on("error", reject);
+  });
+}
 
 async function withTmpDir<T>(tmpDir: string, run: () => Promise<T>): Promise<T> {
   const previousTmpDir = process.env.TMPDIR;
@@ -169,7 +207,7 @@ describe("local process sandbox", () => {
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("Expected TCP test server address.");
-    const decisions: SandboxNetworkDecision[] = [];
+    const events: SandboxNetworkEvent[] = [];
     const target = await withTmpDir(deepTmpDir, () =>
       buildLocalProcessSandboxSpawnTarget({
         executable: process.execPath,
@@ -180,7 +218,7 @@ describe("local process sandbox", () => {
           filesystemScope: "workspace",
           networkScope: "allowlist",
           networkAllowlist: [`127.0.0.1:${address.port}`],
-          onNetworkDecision: (event) => decisions.push(event),
+          onNetworkDecision: (event) => events.push(event),
         },
       }),
     );
@@ -234,30 +272,40 @@ describe("local process sandbox", () => {
       );
 
       // One structured decision per egress attempt, in order: allowed http, denied http, denied CONNECT.
+      const decisions = decisionEvents(events);
       expect(decisions.map(({ ts, ...event }) => event)).toEqual([
         {
+          event: "sandbox.network.decision",
           decision: "allow",
           reason: "allowlist_match",
           hostname: "127.0.0.1",
           port: String(address.port),
           method: "GET",
           scheme: "http",
+          hostnameSanitized: false,
+          tunnelId: null,
         },
         {
+          event: "sandbox.network.decision",
           decision: "deny",
           reason: "network_target_denied",
           hostname: "example.com",
           port: "80",
           method: "GET",
           scheme: "http",
+          hostnameSanitized: false,
+          tunnelId: null,
         },
         {
+          event: "sandbox.network.decision",
           decision: "deny",
           reason: "network_target_denied",
           hostname: "example.com",
           port: "443",
           method: "CONNECT",
           scheme: null,
+          hostnameSanitized: false,
+          tunnelId: null,
         },
       ]);
       for (const event of decisions) {
@@ -265,10 +313,27 @@ describe("local process sandbox", () => {
       }
       // The decision record must never carry request paths, query strings, headers or bodies.
       expect(JSON.stringify(decisions)).not.toMatch(/canary/);
+      // The proxy announces itself before any decision, so an empty decision stream is never ambiguous.
+      expect(events[0]).toMatchObject({
+        event: "sandbox.network.proxy.started",
+        allowlistEntryCount: 1,
+        trustedUrlCount: 0,
+        ruleCount: 1,
+      });
+      expect(startedEvents(events)[0].rulesetDigest).toMatch(/^[0-9a-f]{16}$/);
     } finally {
       await target.cleanup?.();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+
+    // Teardown closes the record: the counters are the host-side tally of what the stream carried.
+    expect(stoppedEvents(events)).toEqual([{
+      event: "sandbox.network.proxy.stopped",
+      ts: expect.any(String),
+      allowCount: 1,
+      denyCount: 2,
+      sinkErrorCount: 0,
+    }]);
   });
 
   it.runIf(process.platform === "linux")("contains a throwing network decision sink without changing egress", async () => {
@@ -278,7 +343,7 @@ describe("local process sandbox", () => {
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("Expected TCP test server address.");
-    let observed = 0;
+    const events: SandboxNetworkEvent[] = [];
     const target = await buildLocalProcessSandboxSpawnTarget({
       executable: process.execPath,
       args: ["-e", "process.exit(0)"],
@@ -288,8 +353,8 @@ describe("local process sandbox", () => {
         filesystemScope: "workspace",
         networkScope: "allowlist",
         networkAllowlist: [`127.0.0.1:${address.port}`],
-        onNetworkDecision: () => {
-          observed += 1;
+        onNetworkDecision: (event) => {
+          events.push(event);
           throw new Error("network decision sink is intentionally broken");
         },
       },
@@ -328,17 +393,24 @@ describe("local process sandbox", () => {
         socket.on("error", reject);
       });
       expect(connectResponse).toContain("HTTP/1.1 403 Forbidden\r\n");
-      expect(observed).toBe(4);
+      // Every decision still reached the sink and every one of them threw.
+      expect(decisionEvents(events)).toHaveLength(4);
     } finally {
       await target.cleanup?.();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+
+    // A sink cannot report its own failure in real time, so the swallowed throws surface at teardown.
+    const stopped = stoppedEvents(events);
+    expect(stopped).toHaveLength(1);
+    expect(stopped[0].sinkErrorCount).toBe(events.length - 1);
+    expect(stopped[0].sinkErrorCount).toBeGreaterThan(0);
   });
 
   it.runIf(process.platform === "linux")("reports a malformed CONNECT target separately from a policy denial", async () => {
     const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-network-malformed-"));
     cleanup.push(workspace);
-    const decisions: SandboxNetworkDecision[] = [];
+    const events: SandboxNetworkEvent[] = [];
     const target = await buildLocalProcessSandboxSpawnTarget({
       executable: process.execPath,
       args: ["-e", "process.exit(0)"],
@@ -348,35 +420,270 @@ describe("local process sandbox", () => {
         filesystemScope: "workspace",
         networkScope: "allowlist",
         networkAllowlist: ["api.openai.com"],
-        onNetworkDecision: (event) => decisions.push(event),
+        onNetworkDecision: (event) => events.push(event),
       },
     });
-    const delimiterIndex = target.args.indexOf("--");
-    const socketPath = target.args[delimiterIndex + 3];
+    const socketPath = proxySocketPath(target.args);
 
     try {
-      const connectResponse = await new Promise<string>((resolve, reject) => {
-        const socket = net.createConnection(socketPath, () => {
-          socket.end("CONNECT example.com:not-a-port HTTP/1.1\r\nHost: example.com\r\n\r\n");
-        });
-        let response = "";
-        socket.setEncoding("utf8");
-        socket.on("data", (chunk) => { response += chunk; });
-        socket.on("end", () => resolve(response));
-        socket.on("error", reject);
-      });
-      // The wire response is unchanged; only the event distinguishes the cause.
-      expect(connectResponse).toContain("HTTP/1.1 403 Forbidden\r\n");
+      const malformedPort = await connectThroughProxy(socketPath, "example.com:not-a-port");
+      const missingPort = await connectThroughProxy(socketPath, "badhost");
+      const policyDenial = await connectThroughProxy(socketPath, "denied.example:443");
+      // The wire response is unchanged across all three; only the event distinguishes the cause. The
+      // confined process must not learn which branch it hit.
+      expect(malformedPort).toContain("HTTP/1.1 403 Forbidden\r\n");
+      expect(missingPort).toEqual(policyDenial);
+      expect(malformedPort).toEqual(policyDenial);
+      const decisions = decisionEvents(events);
+      expect(decisions.map((event) => event.reason)).toEqual([
+        "invalid_connect_target",
+        "invalid_connect_target",
+        "network_target_denied",
+      ]);
+      for (const event of decisions) {
+        expect(event).toMatchObject({ decision: "deny", method: "CONNECT", scheme: null, tunnelId: null });
+      }
+      expect(decisions[2]).toMatchObject({ hostname: "denied.example", port: "443" });
+    } finally {
+      await target.cleanup?.();
+    }
+  });
+
+  it.runIf(process.platform === "linux")("records an allow for an allowlisted host that is unreachable", async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-network-unreachable-"));
+    cleanup.push(workspace);
+    // A port nothing is listening on: the policy decision must be recorded even though the upstream
+    // TCP connect fails. Emitting from the net.connect callback would drop exactly this case, which is
+    // what an attacker enumerating the allowlist produces.
+    const probe = net.createServer();
+    await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+    const probeAddress = probe.address();
+    if (!probeAddress || typeof probeAddress === "string") throw new Error("Expected TCP probe address.");
+    const closedPort = probeAddress.port;
+    await new Promise<void>((resolve) => probe.close(() => resolve()));
+    const events: SandboxNetworkEvent[] = [];
+    const target = await buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath,
+      args: ["-e", "process.exit(0)"],
+      cwd: workspace,
+      options: {
+        workspaceDir: workspace,
+        networkScope: "allowlist",
+        networkAllowlist: [`127.0.0.1:${closedPort}`],
+        onNetworkDecision: (event) => events.push(event),
+      },
+    });
+    const socketPath = proxySocketPath(target.args);
+
+    try {
+      await connectThroughProxy(socketPath, `127.0.0.1:${closedPort}`).catch(() => "");
+      const decisions = decisionEvents(events);
       expect(decisions).toHaveLength(1);
       expect(decisions[0]).toMatchObject({
-        decision: "deny",
-        reason: "invalid_connect_target",
+        decision: "allow",
+        reason: "allowlist_match",
+        hostname: "127.0.0.1",
+        port: String(closedPort),
         method: "CONNECT",
-        scheme: null,
+      });
+      expect(decisions[0].tunnelId).toEqual(expect.any(String));
+    } finally {
+      await target.cleanup?.();
+    }
+  });
+
+  it.runIf(process.platform === "linux")("accounts for tunnel bytes and correlates them to the CONNECT decision", async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-network-tunnel-"));
+    cleanup.push(workspace);
+    const upstream = net.createServer((socket) => {
+      socket.on("data", () => socket.end("tunnel-upstream-reply"));
+    });
+    await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+    const address = upstream.address();
+    if (!address || typeof address === "string") throw new Error("Expected TCP upstream address.");
+    const events: SandboxNetworkEvent[] = [];
+    const target = await buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath,
+      args: ["-e", "process.exit(0)"],
+      cwd: workspace,
+      options: {
+        workspaceDir: workspace,
+        networkScope: "allowlist",
+        networkAllowlist: [`127.0.0.1:${address.port}`],
+        onNetworkDecision: (event) => events.push(event),
+      },
+    });
+    const socketPath = proxySocketPath(target.args);
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const socket = net.createConnection(socketPath, () => {
+          socket.write(`CONNECT 127.0.0.1:${address.port} HTTP/1.1\r\nHost: 127.0.0.1:${address.port}\r\n\r\n`);
+        });
+        let established = false;
+        socket.setEncoding("utf8");
+        socket.on("data", (chunk: string) => {
+          if (!established && chunk.includes("200 Connection Established")) {
+            established = true;
+            socket.write("tunnel-client-payload");
+          }
+        });
+        socket.on("close", () => resolve());
+        socket.on("error", reject);
+      });
+      // The tunnel event fires from the client-socket close seam, which also covers the error path.
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      const tunnels = tunnelEvents(events);
+      expect(tunnels).toHaveLength(1);
+      expect(tunnels[0].bytesOut).toBeGreaterThan(0);
+      expect(tunnels[0].bytesIn).toBeGreaterThan(0);
+      expect(tunnels[0].durationMs).toBeGreaterThanOrEqual(0);
+      expect(tunnels[0]).toMatchObject({ hostname: "127.0.0.1", port: String(address.port) });
+      // Without the shared tunnelId the byte totals cannot be attributed to a hostname decision.
+      expect(tunnels[0].tunnelId).toBe(decisionEvents(events)[0].tunnelId);
+      // Payload bytes are counted, never recorded.
+      expect(JSON.stringify(tunnels)).not.toMatch(/tunnel-client-payload/);
+    } finally {
+      await target.cleanup?.();
+      await new Promise<void>((resolve) => upstream.close(() => resolve()));
+    }
+  });
+
+  it.runIf(process.platform === "linux")("bounds and scrubs the event hostname without flagging a valid IPv6 target", async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-network-hostname-"));
+    cleanup.push(workspace);
+    const events: SandboxNetworkEvent[] = [];
+    const target = await buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath,
+      args: ["-e", "process.exit(0)"],
+      cwd: workspace,
+      options: {
+        workspaceDir: workspace,
+        networkScope: "allowlist",
+        networkAllowlist: ["api.openai.com"],
+        onNetworkDecision: (event) => events.push(event),
+      },
+    });
+    const socketPath = proxySocketPath(target.args);
+
+    try {
+      await connectThroughProxy(socketPath, `${"a".repeat(4096)}:443`);
+      // Underscore is legal in a request target and outside the event charset, so it exercises the
+      // scrub without the HTTP parser rejecting the request line before the proxy ever sees it.
+      await connectThroughProxy(socketPath, "under_score.example:443");
+      await connectThroughProxy(socketPath, "[2001:db8::1]:443");
+      const decisions = decisionEvents(events);
+      expect(decisions).toHaveLength(3);
+      // A 4KB request-line hostname is capped at the longest legal DNS name and flagged.
+      expect(Buffer.byteLength(decisions[0].hostname ?? "")).toBe(253);
+      expect(decisions[0].hostnameSanitized).toBe(true);
+      // Anything outside [a-z0-9.\-:] is replaced, so a run log reader is never handed control bytes.
+      expect(decisions[1].hostname).toBe("under?score.example");
+      expect(decisions[1].hostnameSanitized).toBe(true);
+      // The charset permits ":", or every IPv6 target would be falsely flagged.
+      expect(decisions[2]).toMatchObject({ hostname: "2001:db8::1", hostnameSanitized: false });
+    } finally {
+      await target.cleanup?.();
+    }
+  });
+
+  it.runIf(process.platform === "linux")("matches an IPv6 allowlist entry against an IPv6 CONNECT target", async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-network-ipv6-"));
+    cleanup.push(workspace);
+    const events: SandboxNetworkEvent[] = [];
+    // WHATWG URL keeps the brackets on the rule side while the target side strips them, so before the
+    // fix this entry parsed cleanly and then denied every IPv6 target.
+    const [allowlistEntry] = parseLocalProcessNetworkAllowlist(["[::1]:8443"]);
+    expect(allowlistEntry).toBe("[::1]:8443");
+    const target = await buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath,
+      args: ["-e", "process.exit(0)"],
+      cwd: workspace,
+      options: {
+        workspaceDir: workspace,
+        networkScope: "allowlist",
+        networkAllowlist: [allowlistEntry],
+        onNetworkDecision: (event) => events.push(event),
+      },
+    });
+    const socketPath = proxySocketPath(target.args);
+
+    try {
+      await connectThroughProxy(socketPath, "[::1]:8443").catch(() => "");
+      const decisions = decisionEvents(events);
+      expect(decisions).toHaveLength(1);
+      expect(decisions[0]).toMatchObject({
+        decision: "allow",
+        reason: "allowlist_match",
+        hostname: "::1",
+        port: "8443",
+        hostnameSanitized: false,
       });
     } finally {
       await target.cleanup?.();
     }
+  });
+
+  it.runIf(process.platform === "linux")("brackets lifecycle events around a run that attempts no egress", async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-network-lifecycle-"));
+    cleanup.push(workspace);
+    const events: SandboxNetworkEvent[] = [];
+    const target = await buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath,
+      args: ["-e", "process.exit(0)"],
+      cwd: workspace,
+      options: {
+        workspaceDir: workspace,
+        networkScope: "allowlist",
+        networkAllowlist: ["api.openai.com"],
+        // One valid trusted URL and one that cannot parse: the dropped entry must stay visible.
+        networkTrustedUrls: ["https://control.example/api", "not-a-url"],
+        onNetworkDecision: (event) => events.push(event),
+      },
+    });
+
+    expect(startedEvents(events)).toHaveLength(1);
+    expect(startedEvents(events)[0]).toMatchObject({
+      allowlistEntryCount: 1,
+      trustedUrlCount: 2,
+      // One allowlist rule plus one surviving trusted URL: the invalid entry was filtered out.
+      ruleCount: 2,
+    });
+    await target.cleanup?.();
+    // Zero egress attempts is now distinguishable from a proxy that never started or a broken sink.
+    expect(decisionEvents(events)).toHaveLength(0);
+    expect(stoppedEvents(events)).toEqual([{
+      event: "sandbox.network.proxy.stopped",
+      ts: expect.any(String),
+      allowCount: 0,
+      denyCount: 0,
+      sinkErrorCount: 0,
+    }]);
+  });
+
+  it("digests the effective ruleset independently of configuration order", async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-network-digest-"));
+    cleanup.push(workspace);
+    const digestFor = async (allowlist: string[]): Promise<string> => {
+      const events: SandboxNetworkEvent[] = [];
+      const target = await buildLocalProcessSandboxSpawnTarget({
+        executable: process.execPath,
+        args: ["-e", "process.exit(0)"],
+        cwd: workspace,
+        options: { workspaceDir: workspace, networkScope: "allowlist", networkAllowlist: allowlist, onNetworkDecision: (event) => events.push(event) },
+      }).catch(() => null);
+      if (!target) return "";
+      await target.cleanup?.();
+      return startedEvents(events)[0]?.rulesetDigest ?? "";
+    };
+    if (process.platform !== "linux") return;
+    // Sorting is what makes the digest comparable between two runs holding the same effective rules.
+    const first = await digestFor(["api.openai.com", "control.example:8443"]);
+    const second = await digestFor(["control.example:8443", "api.openai.com"]);
+    const different = await digestFor(["api.openai.com"]);
+    expect(first).toMatch(/^[0-9a-f]{16}$/);
+    expect(second).toBe(first);
+    expect(different).not.toBe(first);
   });
 
   it.runIf(process.platform === "linux")("always permits trusted Paperclip control-plane URLs", async () => {
@@ -386,7 +693,7 @@ describe("local process sandbox", () => {
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("Expected TCP test server address.");
-    const decisions: SandboxNetworkDecision[] = [];
+    const events: SandboxNetworkEvent[] = [];
     const target = await buildLocalProcessSandboxSpawnTarget({
       executable: process.execPath,
       args: ["-e", "process.exit(0)"],
@@ -396,7 +703,7 @@ describe("local process sandbox", () => {
         networkScope: "allowlist",
         networkAllowlist: ["api.openai.com"],
         networkTrustedUrls: [`http://127.0.0.1:${address.port}/api/issues/issue-1`],
-        onNetworkDecision: (event) => decisions.push(event),
+        onNetworkDecision: (event) => events.push(event),
       },
     });
     const delimiterIndex = target.args.indexOf("--");
@@ -418,6 +725,7 @@ describe("local process sandbox", () => {
       });
       expect(response).toEqual({ status: 200, body: "control-plane-response" });
       // A control-plane allow is attributed to the trusted-URL surface, not the operator allowlist.
+      const decisions = decisionEvents(events);
       expect(decisions).toHaveLength(1);
       expect(decisions[0]).toMatchObject({
         decision: "allow",

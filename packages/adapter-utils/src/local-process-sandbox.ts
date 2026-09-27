@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import http from "node:http";
 import net from "node:net";
@@ -34,6 +35,7 @@ export type SandboxNetworkDecisionReason =
  * body are attacker-influenced and never included, so a reviewer can trust every field here.
  */
 export interface SandboxNetworkDecision {
+  event: "sandbox.network.decision";
   /** Host clock at the moment of the decision, ISO 8601 UTC. */
   ts: string;
   decision: SandboxNetworkDecisionOutcome;
@@ -41,6 +43,9 @@ export interface SandboxNetworkDecision {
   /**
    * Hostname normalized by the same helper the policy check uses, so the event and the decision
    * cannot disagree. Null only when the request URL could not be parsed at all.
+   *
+   * Byte-equal to the string the policy check compared whenever `hostnameSanitized` is false. When
+   * that flag is true this is a bounded, charset-scrubbed rendering of that input instead.
    */
   hostname: string | null;
   port: string | null;
@@ -48,7 +53,68 @@ export interface SandboxNetworkDecision {
   method: string | null;
   /** Null on the CONNECT path: the proxy does not terminate TLS and must not infer a scheme. */
   scheme: string | null;
+  /** True when `hostname` was truncated or charset-scrubbed, so a reader never trusts a mangled name. */
+  hostnameSanitized: boolean;
+  /** Correlates a CONNECT decision with its `sandbox.network.tunnel.closed` event. Null off that path. */
+  tunnelId: string | null;
 }
+
+/**
+ * Emitted once the proxy is listening. Without it, an empty decision stream cannot distinguish "no
+ * egress attempted" from "proxy never started" from "sink broken".
+ */
+export interface SandboxNetworkProxyStarted {
+  event: "sandbox.network.proxy.started";
+  ts: string;
+  /** Configured `networkAllowlist` entries — the input count. */
+  allowlistEntryCount: number;
+  /** Configured `networkTrustedUrls` entries — the input count. */
+  trustedUrlCount: number;
+  /** Rules that survived parsing. Below the input total means a trusted URL was silently dropped. */
+  ruleCount: number;
+  /** SHA-256 over the sorted `hostname:port` rule tuples, 16 hex chars, comparable across runs. */
+  rulesetDigest: string;
+}
+
+/**
+ * Emitted on the graceful teardown path only. A hard death of the host process yields no stopped
+ * event, which is the intended reading: a `started` with no `stopped` is abnormal termination.
+ */
+export interface SandboxNetworkProxyStopped {
+  event: "sandbox.network.proxy.stopped";
+  ts: string;
+  allowCount: number;
+  denyCount: number;
+  /**
+   * Sink invocations that threw and were swallowed. Reported here because the sink is the transport:
+   * a failing sink cannot report its own failure in real time.
+   */
+  sinkErrorCount: number;
+}
+
+/**
+ * Byte accounting for one closed CONNECT tunnel. Forensic, not real-time: it fires at tunnel close
+ * and is the only signal covering exfiltration to an already-allowlisted host.
+ */
+export interface SandboxNetworkTunnelClosed {
+  event: "sandbox.network.tunnel.closed";
+  ts: string;
+  tunnelId: string;
+  hostname: string | null;
+  port: string | null;
+  /** Bytes the confined process sent upstream. */
+  bytesOut: number;
+  /** Bytes the upstream returned. */
+  bytesIn: number;
+  durationMs: number;
+}
+
+/** Every event the proxy can emit, all carried on the one observer — no second seam. */
+export type SandboxNetworkEvent =
+  | SandboxNetworkDecision
+  | SandboxNetworkProxyStarted
+  | SandboxNetworkProxyStopped
+  | SandboxNetworkTunnelClosed;
 
 export interface LocalProcessSandboxOptions {
   workspaceDir: string;
@@ -62,10 +128,11 @@ export interface LocalProcessSandboxOptions {
   networkAllowlist?: string[];
   networkTrustedUrls?: string[];
   /**
-   * Observer for every egress decision. Runs in the host process, never inside the sandbox.
-   * Throwing from it is contained: it cannot change a policy outcome or stop the proxy.
+   * Observer for every egress decision and for proxy/tunnel lifecycle. Runs in the host process,
+   * never inside the sandbox. Throwing from it is contained: it cannot change a policy outcome or
+   * stop the proxy.
    */
-  onNetworkDecision?: (event: SandboxNetworkDecision) => void;
+  onNetworkDecision?: (event: SandboxNetworkEvent) => void;
   command?: string;
 }
 
@@ -168,7 +235,9 @@ function parseNetworkAllowlistEntry(entry: string, index: number): NetworkAllowl
     if (parsed.username || parsed.password || parsed.pathname !== "/" || parsed.search || parsed.hash) {
       throw new Error("path");
     }
-    hostname = parsed.hostname.toLowerCase();
+    // WHATWG URL retains brackets on an IPv6 literal while the target side strips them, so an
+    // unnormalized rule could never match and quietly denied every IPv6 target.
+    hostname = normalizeNetworkHostname(parsed.hostname);
     port = parsed.port || null;
   } catch {
     throw new Error(`networkAllowlist[${index}] must be a hostname, hostname:port, or origin URL.`);
@@ -184,7 +253,7 @@ export function parseLocalProcessNetworkAllowlist(value: unknown): string[] {
   return value.map((entry, index) => {
     if (typeof entry !== "string") throw new Error(`networkAllowlist[${index}] must be a string.`);
     const rule = parseNetworkAllowlistEntry(entry, index);
-    return rule.port ? `${rule.hostname}:${rule.port}` : rule.hostname;
+    return formatNetworkRuleTarget(rule);
   });
 }
 
@@ -206,6 +275,49 @@ export function parseLocalProcessFilesystemScope(value: unknown): "workspace" | 
  */
 function normalizeNetworkHostname(hostname: string): string {
   return hostname.toLowerCase().replace(/^\[|\]$/g, "");
+}
+
+/**
+ * Renders a rule back into allowlist syntax. IPv6 needs its brackets restored: rules are normalized
+ * without them, and `hostname:port` is unparseable for an address that already contains colons.
+ */
+function formatNetworkRuleTarget(rule: NetworkAllowlistRule): string {
+  const hostname = rule.hostname.includes(":") ? `[${rule.hostname}]` : rule.hostname;
+  return rule.port ? `${hostname}:${rule.port}` : hostname;
+}
+
+/** Longest legal DNS name. A CONNECT target is arbitrary request-line bytes and gets capped here. */
+const EVENT_HOSTNAME_MAX_BYTES = 253;
+/** `:` is permitted so a valid IPv6 literal is not scrubbed; `%` is not, as downstream readers decode it. */
+const EVENT_HOSTNAME_DISALLOWED = /[^a-z0-9.\-:]/g;
+
+interface EventHostname {
+  hostname: string | null;
+  hostnameSanitized: boolean;
+}
+
+/**
+ * Bounds and scrubs a hostname for the event record. Fixed order — normalize, truncate, scrub — so
+ * the result is deterministic, and the flag makes any mutation visible rather than silent.
+ */
+function describeEventHostname(rawHostname: string | null): EventHostname {
+  if (!rawHostname) return { hostname: null, hostnameSanitized: false };
+  const normalized = normalizeNetworkHostname(rawHostname);
+  let value = normalized;
+  let hostnameSanitized = false;
+  if (Buffer.byteLength(value) > EVENT_HOSTNAME_MAX_BYTES) {
+    value = Buffer.from(value).subarray(0, EVENT_HOSTNAME_MAX_BYTES).toString("utf8");
+    hostnameSanitized = true;
+  }
+  const scrubbed = value.replace(EVENT_HOSTNAME_DISALLOWED, "?");
+  if (scrubbed !== value) hostnameSanitized = true;
+  return { hostname: scrubbed, hostnameSanitized };
+}
+
+/** Sorted, or the digest is not comparable between two runs holding the same effective ruleset. */
+function computeRulesetDigest(rules: NetworkAllowlistRule[]): string {
+  const tuples = rules.map((rule) => `${rule.hostname}:${rule.port ?? "*"}`).sort();
+  return createHash("sha256").update(JSON.stringify(tuples)).digest("hex").slice(0, 16);
 }
 
 /** Returns the rule that permitted the target, or null when policy denies it. */
@@ -256,7 +368,7 @@ function parseTrustedNetworkUrl(value: string): NetworkAllowlistRule | null {
     const parsed = new URL(value);
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
     return {
-      hostname: parsed.hostname.toLowerCase(),
+      hostname: normalizeNetworkHostname(parsed.hostname),
       port: parsed.port || (parsed.protocol === "https:" ? "443" : "80"),
       source: "trusted_url",
     };
@@ -265,20 +377,42 @@ function parseTrustedNetworkUrl(value: string): NetworkAllowlistRule | null {
   }
 }
 
+type SandboxNetworkEventInput = SandboxNetworkEvent extends infer Event
+  ? Event extends SandboxNetworkEvent ? Omit<Event, "ts"> : never
+  : never;
+
+interface SandboxNetworkEventSink {
+  emit: (event: SandboxNetworkEventInput) => void;
+  counters: () => { allowCount: number; denyCount: number; sinkErrorCount: number };
+}
+
 /**
- * Hands one decision to the observer without letting it affect egress. A sink that throws is an
- * observability bug; it must never become a policy bug or take the proxy down.
+ * Hands events to the observer without letting it affect egress. A sink that throws is an
+ * observability bug; it must never become a policy bug or take the proxy down. Swallowed throws are
+ * counted instead and reported once at teardown, because the sink is the only transport available.
  */
-function emitNetworkDecision(
-  onNetworkDecision: ((event: SandboxNetworkDecision) => void) | undefined,
-  event: Omit<SandboxNetworkDecision, "ts">,
-): void {
-  if (!onNetworkDecision) return;
-  try {
-    onNetworkDecision({ ts: new Date().toISOString(), ...event });
-  } catch {
-    // Intentionally swallowed: see the doc comment above.
-  }
+function createNetworkEventSink(
+  onNetworkDecision: ((event: SandboxNetworkEvent) => void) | undefined,
+): SandboxNetworkEventSink {
+  let allowCount = 0;
+  let denyCount = 0;
+  let sinkErrorCount = 0;
+  return {
+    emit: (event) => {
+      if (event.event === "sandbox.network.decision") {
+        if (event.decision === "allow") allowCount += 1;
+        else denyCount += 1;
+      }
+      if (!onNetworkDecision) return;
+      try {
+        onNetworkDecision({ ts: new Date().toISOString(), ...event } as SandboxNetworkEvent);
+      } catch {
+        // Intentionally swallowed: see the doc comment above.
+        sinkErrorCount += 1;
+      }
+    },
+    counters: () => ({ allowCount, denyCount, sinkErrorCount }),
+  };
 }
 
 function writeProxyError(response: http.ServerResponse, status: number, code: string, message: string): void {
@@ -305,9 +439,10 @@ async function startNetworkAllowlistProxy(
   allowlist: string[],
   trustedUrls: string[],
   socketPath: string,
-  onNetworkDecision?: (event: SandboxNetworkDecision) => void,
+  onNetworkDecision?: (event: SandboxNetworkEvent) => void,
 ): Promise<NetworkAllowlistProxy> {
   assertUnixSocketPathLength(socketPath);
+  const sink = createNetworkEventSink(onNetworkDecision);
   const rules = [
     ...allowlist.map(parseNetworkAllowlistEntry),
     ...trustedUrls.map(parseTrustedNetworkUrl).filter((rule): rule is NetworkAllowlistRule => rule !== null),
@@ -323,52 +458,64 @@ async function startNetworkAllowlistProxy(
     try {
       target = new URL(request.url ?? "");
     } catch {
-      emitNetworkDecision(onNetworkDecision, {
+      sink.emit({
+        event: "sandbox.network.decision",
         decision: "deny",
         reason: "invalid_request_url",
         hostname: null,
         port: null,
         method,
         scheme: null,
+        hostnameSanitized: false,
+        tunnelId: null,
       });
       writeProxyError(response, 400, "invalid_request_url", "Paperclip sandbox proxy requires an absolute request URL.");
       return;
     }
     const port = target.port || (target.protocol === "https:" ? "443" : "80");
-    const hostname = normalizeNetworkHostname(target.hostname);
+    const { hostname, hostnameSanitized } = describeEventHostname(target.hostname);
     const scheme = target.protocol.replace(/:$/, "");
     if (target.protocol !== "http:") {
-      emitNetworkDecision(onNetworkDecision, {
+      sink.emit({
+        event: "sandbox.network.decision",
         decision: "deny",
         reason: "https_requires_connect",
         hostname,
         port,
         method,
         scheme,
+        hostnameSanitized,
+        tunnelId: null,
       });
       writeProxyError(response, 400, "https_requires_connect", "HTTPS targets must use CONNECT through the Paperclip sandbox proxy.");
       return;
     }
     const matchedRule = matchNetworkTarget(target.hostname, port, rules);
     if (!matchedRule) {
-      emitNetworkDecision(onNetworkDecision, {
+      sink.emit({
+        event: "sandbox.network.decision",
         decision: "deny",
         reason: "network_target_denied",
         hostname,
         port,
         method,
         scheme,
+        hostnameSanitized,
+        tunnelId: null,
       });
       writeProxyError(response, 403, "network_target_denied", "Network target denied by Paperclip sandbox policy.");
       return;
     }
-    emitNetworkDecision(onNetworkDecision, {
+    sink.emit({
+      event: "sandbox.network.decision",
       decision: "allow",
       reason: matchedRule.source === "trusted_url" ? "trusted_url_match" : "allowlist_match",
       hostname,
       port,
       method,
       scheme,
+      hostnameSanitized,
+      tunnelId: null,
     });
     const upstream = http.request(target, {
       method: request.method,
@@ -382,25 +529,27 @@ async function startNetworkAllowlistProxy(
   });
   server.on("connect", (request, clientSocket, head) => {
     const separator = request.url?.lastIndexOf(":") ?? -1;
-    const hostname = separator > 0 ? request.url!.slice(0, separator).replace(/^\[|\]$/g, "") : "";
+    const hostname = separator > 0 ? normalizeNetworkHostname(request.url!.slice(0, separator)) : "";
     const port = separator > 0 ? request.url!.slice(separator + 1) : "443";
     // The proxy tunnels CONNECT opaquely, so the method is always the literal verb and the scheme is
     // unknowable. Neither is ever inferred.
     const connectEvent = {
+      event: "sandbox.network.decision",
       method: "CONNECT",
       scheme: null,
-      hostname: hostname ? normalizeNetworkHostname(hostname) : null,
+      ...describeEventHostname(hostname),
       port: port || null,
     } as const;
     const malformedTarget = !hostname || !/^\d+$/.test(port);
     const matchedRule = malformedTarget ? null : matchNetworkTarget(hostname, port, rules);
     if (malformedTarget || !matchedRule) {
-      emitNetworkDecision(onNetworkDecision, {
+      sink.emit({
         ...connectEvent,
         decision: "deny",
         // A malformed CONNECT line and a real policy miss are different signals for alerting, even
         // though the wire response stays identical so egress behaviour does not change.
         reason: malformedTarget ? "invalid_connect_target" : "network_target_denied",
+        tunnelId: null,
       });
       clientSocket.end(connectProxyError(
         "network_target_denied",
@@ -410,11 +559,14 @@ async function startNetworkAllowlistProxy(
     }
     // Emitted at the decision point, not in the net.connect callback: this records the policy
     // outcome, which is independent of whether the upstream TCP connection later succeeds.
-    emitNetworkDecision(onNetworkDecision, {
+    const tunnelId = randomUUID();
+    sink.emit({
       ...connectEvent,
       decision: "allow",
       reason: matchedRule.source === "trusted_url" ? "trusted_url_match" : "allowlist_match",
+      tunnelId,
     });
+    const tunnelOpenedAt = Date.now();
     const upstream = net.connect(Number(port), hostname, () => {
       clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
       if (head.length > 0) upstream.write(head);
@@ -422,7 +574,23 @@ async function startNetworkAllowlistProxy(
       clientSocket.pipe(upstream);
     });
     upstream.on("error", () => clientSocket.destroy());
-    clientSocket.on("close", () => upstream.destroy());
+    clientSocket.on("close", () => {
+      // Counters come off the socket rather than a transform in the pipe path: Node maintains both
+      // natively, so byte accounting costs nothing on the path carrying all confined egress. This
+      // seam also covers the failure path, since an upstream error destroys the client socket.
+      const bytesOut = upstream.bytesWritten;
+      const bytesIn = upstream.bytesRead;
+      upstream.destroy();
+      sink.emit({
+        event: "sandbox.network.tunnel.closed",
+        tunnelId,
+        hostname: connectEvent.hostname,
+        port: connectEvent.port,
+        bytesOut,
+        bytesIn,
+        durationMs: Date.now() - tunnelOpenedAt,
+      });
+    });
   });
   const sockets = new Set<net.Socket>();
   server.on("connection", (socket) => {
@@ -433,13 +601,29 @@ async function startNetworkAllowlistProxy(
     server.once("error", reject);
     server.listen(socketPath, () => {
       server.off("error", reject);
+      // Both count sides are reported deliberately: invalid trusted URLs are filtered out silently
+      // above, so trustedUrlCount above the trusted rules inside ruleCount is a misconfigured
+      // profile this event makes visible.
+      sink.emit({
+        event: "sandbox.network.proxy.started",
+        allowlistEntryCount: allowlist.length,
+        trustedUrlCount: trustedUrls.length,
+        ruleCount: rules.length,
+        rulesetDigest: computeRulesetDigest(rules),
+      });
       resolve();
     });
   });
+  let stopEventEmitted = false;
   return {
     close: async () => {
       for (const socket of sockets) socket.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));
+      if (stopEventEmitted) return;
+      stopEventEmitted = true;
+      // Best effort by design: this is the graceful path only, so a hard death of the host process
+      // yields a started event with no stopped event — which reads as abnormal termination.
+      sink.emit({ event: "sandbox.network.proxy.stopped", ...sink.counters() });
     },
   };
 }

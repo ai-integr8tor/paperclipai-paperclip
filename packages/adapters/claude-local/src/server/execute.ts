@@ -588,7 +588,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           // takes down the run or changes an egress outcome.
           onNetworkDecision: (event) => {
             void onLog("stdout", `${JSON.stringify({
-              event: "sandbox.network.decision",
+              // The event name comes from the event itself: decisions, proxy lifecycle and tunnel
+              // accounting all arrive on this one sink and must stay distinguishable in the log.
               ...event,
               runId,
               agentId: agent.id,
