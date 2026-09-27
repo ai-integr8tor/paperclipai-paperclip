@@ -976,7 +976,7 @@ POST /api/issues/{issueId}/interactions
 
 Use `ask_user_questions` for a short question card. Each `payload.questions` entry requires `id`, `prompt`, `selectionMode`, and options with `id` and `label`. Choice questions must offer at least two distinct, meaningful choices; use the canonical text presentation above for open-ended questions. Do not send `question`/`type: "text"` or an empty options array in a `payload.questions` entry. Set `resolverPolicy: "human_only"` when the answer must come from the user.
 
-If you have a recommendation, mark that option with `recommended: true` in the matching `payload.questionSet` option, and give the reason in one sentence in the question's `helpText`. The card then shows the option as recommended. The `payload.questions` storage entries have no `recommended` field.
+If you have a recommendation, mark that option with `recommended: true` in the matching `payload.questionSet` option, and give the reason in one sentence in the `helpText` of the matching `payload.questionSet` question. The `payload.questions` storage entries have no `recommended` field.
 
 ```json
 POST /api/issues/{issueId}/interactions
