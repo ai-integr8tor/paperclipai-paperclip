@@ -59,6 +59,7 @@ import {
   parseLocalProcessNetworkScope,
   type LocalProcessSandboxOptions,
 } from "@paperclipai/adapter-utils/local-process-sandbox";
+import { createSandboxNetworkEventChannel } from "@paperclipai/adapter-utils/sandbox-network-event-channel";
 import {
   claudeModelUsageTotals,
   parseClaudeStreamJson,
@@ -414,7 +415,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     return executeClaudeAcp(ctx);
   }
 
-  const { runId, agent, runtime, config, context, onLog, onMeta, onSpawn, authToken } = ctx;
+  const { runId, agent, runtime, config, context, onLog, onMeta, onEvent, onSpawn, authToken } = ctx;
   const executionTarget = readAdapterExecutionTarget({
     executionTarget: ctx.executionTarget,
     legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
@@ -583,19 +584,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             env.PAPERCLIP_API_URL,
             ...runtimeMcpServers.map((server) => server.url),
           ].filter((value): value is string => typeof value === "string" && value.length > 0),
-          // Fire-and-forget by design: the proxy must not await a log write. Rejections are swallowed
-          // here because a failed observability write must never become an unhandled rejection that
-          // takes down the run or changes an egress outcome.
-          onNetworkDecision: (event) => {
-            void onLog("stdout", `${JSON.stringify({
-              // The event name comes from the event itself: decisions, proxy lifecycle and tunnel
-              // accounting all arrive on this one sink and must stay distinguishable in the log.
-              ...event,
-              runId,
-              agentId: agent.id,
-              companyId: agent.companyId,
-            })}\n`).catch(() => {});
-          },
+          // Host-authored run-event channel, never the child's log stream: a confined process can
+          // forge and suppress lines on its own stdout, and it cannot write a run event at all.
+          // See createSandboxNetworkEventChannel for the full reasoning and the ordering guarantee.
+          onNetworkDecision: createSandboxNetworkEventChannel({
+            identity: { runId, agentId: agent.id, companyId: agent.companyId },
+            onEvent,
+            onLog,
+          }),
           command: asString(config.filesystemSandboxCommand, "bwrap"),
         }
       : null;

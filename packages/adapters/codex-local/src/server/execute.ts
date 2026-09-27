@@ -58,6 +58,7 @@ import {
   parseLocalProcessNetworkScope,
   type LocalProcessSandboxOptions,
 } from "@paperclipai/adapter-utils/local-process-sandbox";
+import { createSandboxNetworkEventChannel } from "@paperclipai/adapter-utils/sandbox-network-event-channel";
 import {
   parseCodexJsonl,
   classifyCodexAuthRefreshFailure,
@@ -1011,19 +1012,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
               paperclipBaseEnv.PAPERCLIP_API_URL,
               ...runtimeMcpGateways.map((gateway) => gateway.endpointPath),
             ],
-            // Fire-and-forget by design: the proxy must not await a log write. Rejections are swallowed
-            // here because a failed observability write must never become an unhandled rejection that
-            // takes down the run or changes an egress outcome.
-            onNetworkDecision: (event) => {
-              void onLog("stdout", `${JSON.stringify({
-                // The event name comes from the event itself: decisions, proxy lifecycle and tunnel
-                // accounting all arrive on this one sink and must stay distinguishable in the log.
-                ...event,
-                runId,
-                agentId: agent.id,
-                companyId: agent.companyId,
-              })}\n`).catch(() => {});
-            },
+            // Host-authored run-event channel, never the child's log stream: a confined process can
+            // forge and suppress lines on its own stdout, and it cannot write a run event at all.
+            // See createSandboxNetworkEventChannel for the full reasoning and the ordering guarantee.
+            onNetworkDecision: createSandboxNetworkEventChannel({
+              identity: { runId, agentId: agent.id, companyId: agent.companyId },
+              onEvent,
+              onLog,
+            }),
             command: asString(config.filesystemSandboxCommand, "bwrap"),
           }
         : null;
