@@ -7472,6 +7472,80 @@ export function issueService(db: Db) {
     });
   }
 
+  async function clearTerminalRunLocksForCheckout(
+    tx: DbTransaction,
+    issueId: string,
+  ): Promise<boolean> {
+    const issue = await tx
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    if (!issue) return false;
+
+    const runIds = [issue.checkoutRunId, issue.executionRunId]
+      .filter((runId): runId is string => Boolean(runId))
+      .filter((runId, index, values) => values.indexOf(runId) === index)
+      .sort();
+    for (const runId of runIds) {
+      await tx.execute(
+        sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${runId} for update`,
+      );
+    }
+    const runRows = runIds.length > 0
+      ? await tx
+          .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(inArray(heartbeatRuns.id, runIds))
+      : [];
+    const runStatuses = new Map(
+      runRows.map((run) => [run.id, run.status] as const),
+    );
+    const isTerminalOrMissing = (runId: string | null) =>
+      Boolean(
+        runId &&
+          (!runStatuses.has(runId) ||
+            TERMINAL_HEARTBEAT_RUN_STATUSES.has(runStatuses.get(runId)!)),
+      );
+    const executionRunIsStale = isTerminalOrMissing(issue.executionRunId);
+    const checkoutRunIsStale = isTerminalOrMissing(issue.checkoutRunId);
+    const canClearCheckoutRun =
+      checkoutRunIsStale &&
+      (!issue.executionRunId ||
+        issue.executionRunId === issue.checkoutRunId ||
+        executionRunIsStale);
+    if (!executionRunIsStale && !canClearCheckoutRun) return false;
+
+    const now = new Date();
+    const updated = await tx
+      .update(issues)
+      .set({
+        ...(canClearCheckoutRun ? { checkoutRunId: null } : {}),
+        executionRunId: null,
+        executionAgentNameKey: null,
+        executionLockedAt: null,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(issues.id, issueId),
+          issue.checkoutRunId
+            ? eq(issues.checkoutRunId, issue.checkoutRunId)
+            : isNull(issues.checkoutRunId),
+          issue.executionRunId
+            ? eq(issues.executionRunId, issue.executionRunId)
+            : isNull(issues.executionRunId),
+        ),
+      )
+      .returning({ id: issues.id })
+      .then((rows) => rows[0] ?? null);
+
+    return Boolean(updated);
+  }
+
   async function adoptStaleCheckoutRun(input: {
     issueId: string;
     actorAgentId: string;
@@ -11506,18 +11580,15 @@ export function issueService(db: Db) {
         });
       }
 
-      if (checkoutRunId) {
-        await withActiveCheckoutRun({
-          issueId: id,
-          companyId: issueCompany.companyId,
-          agentId,
-          checkoutRunId,
-          operation: async () => undefined,
-        });
+      // Run-bound checkout validates the actor run, clears stale lock columns,
+      // and performs the issue mutation under one issue -> run transaction.
+      // A run that terminalizes after preflight therefore either wins before
+      // this transaction (and no cleanup commits) or waits until checkout has
+      // committed; checkout cannot reject after partially changing the locks.
+      if (!checkoutRunId) {
+        await clearExecutionRunIfTerminal(id);
+        await clearCheckoutRunIfTerminal(id);
       }
-
-      await clearExecutionRunIfTerminal(id);
-      await clearCheckoutRunIfTerminal(id);
 
       const dependencyReadiness = await listIssueDependencyReadinessMap(
         db,
@@ -11585,7 +11656,10 @@ export function issueService(db: Db) {
             companyId: issueCompany.companyId,
             agentId,
             checkoutRunId,
-            operation: updateIssue,
+            operation: async (tx) => {
+              await clearTerminalRunLocksForCheckout(tx, id);
+              return updateIssue(tx);
+            },
           })
         : await updateIssue(db);
 

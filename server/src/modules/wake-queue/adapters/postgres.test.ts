@@ -359,6 +359,20 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
       status: "running",
       contextSnapshot: { issueId },
     });
+    const staleRunId = await seedRun({
+      companyId,
+      agentId,
+      status: "failed",
+      contextSnapshot: { issueId },
+    });
+    await db
+      .update(issues)
+      .set({
+        checkoutRunId: staleRunId,
+        executionRunId: staleRunId,
+        executionLockedAt: new Date("2026-09-27T03:37:34.000Z"),
+      })
+      .where(eq(issues.id, issueId));
     const gateKey = 11_157_001;
     const gateHeld = deferred<void>();
     const releaseGate = deferred<void>();
@@ -371,7 +385,8 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
         language plpgsql as $$
         begin
           if new.id = '${issueId}'::uuid
-             and new.checkout_run_id = '${runId}'::uuid then
+             and old.execution_run_id = '${staleRunId}'::uuid
+             and new.execution_run_id is null then
             perform pg_advisory_xact_lock(${gateKey});
           end if;
           return new;
@@ -400,8 +415,9 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
         runId,
       );
 
-      // The trigger pauses checkout after its issue mutation, while the same
-      // transaction still owns both the issue and run locks.
+      // The trigger pauses checkout during stale-lock cleanup. Actor-run
+      // validation, cleanup, and the final issue mutation must share this same
+      // transaction, so checkout still owns both the issue and actor-run locks.
       let checkoutWaitingOnGate = false;
       for (let attempt = 0; attempt < 100; attempt += 1) {
         const waiting = await db.execute<{ count: number }>(sql`
@@ -476,7 +492,9 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
         .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.companyId, companyId))
-        .then((rows) => rows.find((row) => row.id !== runId));
+        .then((rows) =>
+          rows.find((row) => row.id !== runId && row.id !== staleRunId),
+        );
       const [issue] = await db
         .select({
           status: issues.status,
