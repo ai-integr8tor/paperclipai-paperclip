@@ -47,6 +47,14 @@ describe("explicit Claude Keychain import", () => {
     await expect(readClaudeToken({ allowKeychain: true })).resolves.toBe("legacy");
     expect(mocks.exec).toHaveBeenLastCalledWith("/usr/bin/security", ["find-generic-password", "-s", "Claude Code-credentials", "-w"], expect.any(Object));
   });
+  it("does not fall back when the account-scoped lookup times out", async () => {
+    vi.spyOn(process, "platform", "get").mockReturnValue("darwin");
+    vi.stubEnv("CLAUDE_CONFIG_DIR", "");
+    mocks.read.mockRejectedValue(new Error("missing"));
+    mocks.exec.mockRejectedValueOnce(Object.assign(new Error("timed out"), { killed: true }));
+    await expect(readClaudeToken({ allowKeychain: true })).resolves.toBeNull();
+    expect(mocks.exec).toHaveBeenCalledTimes(1);
+  });
   it("reads only the custom auth home's own suffixed Keychain item", async () => {
     // Claude Code stores a custom CLAUDE_CONFIG_DIR login in a per-directory
     // suffixed item; the unsuffixed item belongs to a different account and

@@ -117,3 +117,14 @@ it("truncates long details", () => {
   ]);
   expect(message).toBe(`Failed. ${"a".repeat(300)}…`);
 });
+it("redacts credential material in probe details", () => {
+  const message = describeSetupFailure([
+    {
+      code: "codex_hello_probe_failed",
+      level: "error",
+      message: "Failed.",
+      detail: "request failed: Authorization: Bearer sk-fixture-secret-value-1234567890",
+    },
+  ]);
+  expect(message).not.toContain("sk-fixture-secret-value-1234567890");
+});

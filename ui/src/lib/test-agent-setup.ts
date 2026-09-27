@@ -1,5 +1,6 @@
 import type { AdapterEnvironmentTestResult } from "@paperclipai/shared";
 import { ADAPTER_AUTH_MISSING_CHECK_CODE } from "@paperclipai/shared";
+import { redactDiagnosticText } from "@paperclipai/adapter-utils/command-redaction";
 import { agentsApi } from "../api/agents";
 
 /** ACP readiness checks do not authenticate a provider. Verify credentials with
@@ -101,7 +102,11 @@ export function describeSetupFailure(
         candidate.code.includes("hello_probe") && candidate.level === "warn",
     );
   if (!check) return undefined;
-  const detail = check.detail ? readableCheckDetail(check.detail) : "";
+  // Probe details can echo provider stderr; redact before display and bound
+  // the length after redaction.
+  const detail = check.detail
+    ? redactDiagnosticText(readableCheckDetail(check.detail))
+    : "";
   if (!detail || detail === check.message) return check.message;
   const clipped =
     detail.length > MAX_FAILURE_DETAIL_LENGTH
