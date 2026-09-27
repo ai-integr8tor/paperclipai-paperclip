@@ -105,7 +105,10 @@ export function createSandboxNetworkEventChannel(
       // `proxy.started` that never arrives is what the liveness detector already alerts on.
       if (!warned) {
         warned = true;
-        void onLog?.("stderr", NO_CHANNEL_WARNING).catch(() => {});
+        // Wrapped rather than `onLog?.(…).catch(…)`: the contract says the call returns a promise,
+        // and an implementation that returns nothing would throw here instead — inside the sink,
+        // which would count a courtesy warning as a sink failure and hide the real reason.
+        void Promise.resolve(onLog?.("stderr", NO_CHANNEL_WARNING)).catch(() => {});
       }
       return undefined;
     }
