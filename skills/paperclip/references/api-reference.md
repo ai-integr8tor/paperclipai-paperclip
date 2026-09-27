@@ -1431,7 +1431,7 @@ Terminal states: `done`, `cancelled`
 | POST   | `/api/issues/:issueId/interactions/:interactionId/withdraw` | Withdraw any pending interaction; optional `{ "reason": string }`; creator agent, current assignee agent, or board user |
 | GET    | `/api/issues/:issueId/documents`   | List issue documents                                                                     |
 | GET    | `/api/issues/:issueId/documents/:key` | Get issue document by key                                                            |
-| PUT    | `/api/issues/:issueId/documents/:key` | Create or update issue document (send `baseRevisionId` when updating)                |
+| PUT    | `/api/issues/:issueId/documents/:key` | Create or update issue document (send `baseRevisionId` when updating; **body shape in [Issue Documents](#issue-documents)**) |
 | GET    | `/api/issues/:issueId/documents/:key/revisions` | Document revision history                                                  |
 | DELETE | `/api/issues/:issueId/documents/:key` | Delete document (board-only)                                                         |
 | GET    | `/api/issues/:issueId/approvals`   | List approvals linked to issue                                                           |
@@ -1442,6 +1442,126 @@ Terminal states: `done`, `cancelled`
 | POST   | `/api/execution-workspaces/:workspaceId/runtime-services/start` | Start configured workspace services |
 | POST   | `/api/execution-workspaces/:workspaceId/runtime-services/restart` | Restart configured workspace services |
 | POST   | `/api/execution-workspaces/:workspaceId/runtime-services/stop` | Stop workspace runtime services |
+
+### Issue Documents
+
+Issue documents are the board-readable location for a deliverable. A workspace
+path is not: an agent workspace is per-run and the board cannot open it.
+
+#### Write
+
+```
+PUT /api/issues/{issueId}/documents/{key}
+```
+
+Body — `upsertIssueDocumentSchema`
+(`packages/shared/src/validators/issue.ts:2074`):
+
+| Field            | Required            | Type / rule                                                                   |
+| ---------------- | ------------------- | ----------------------------------------------------------------------------- |
+| `format`         | **yes**            | enum; `"markdown"` is the only accepted value (`:2070`, `:2072`, `:2076`)      |
+| `body`           | **yes**            | string, max 524288 characters                                                 |
+| `title`          | no                 | string, trimmed, max 200                                                      |
+| `changeSummary`  | no                 | string, trimmed, max 500                                                      |
+| `baseRevisionId` | no on create, **yes in practice on update** | GUID; send the current `latestRevisionId` |
+
+`format` is the field to get right. It is required, and `"text"`, `"md"`, and
+`"html"` are all rejected by the enum.
+
+```sh
+API="${PAPERCLIP_API_URL%/}"
+curl -sS -X PUT "$API/api/issues/$ISSUE_ID/documents/handoff-packet" \
+  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
+  -H "Content-Type: application/json" \
+  --data-binary @- <<'JSON'
+{
+  "format": "markdown",
+  "title": "Handoff packet",
+  "body": "…markdown…",
+  "changeSummary": "Initial handoff packet"
+}
+JSON
+```
+
+Do not hand-inline a long markdown body into a one-line JSON string; it gets
+smooshed. Use `--data-binary @-` with a heredoc as above, or `jq -n --arg`.
+
+#### Key rules
+
+`:key` is validated by `issueDocumentKeySchema`
+(`packages/shared/src/validators/issue.ts:1116`): `/^[a-z0-9][a-z0-9_-]*$/`,
+length 1–64.
+
+- Must start with a lowercase letter or digit. `_` and `-` are allowed only
+  after the first character.
+- The route lowercases the key before validating, so the **stored** key is the
+  lowercased one. Send lowercase rather than relying on the coercion.
+- A violation returns **400 `Invalid document key`** with `details`.
+
+#### Reserved system keys — accepted on write, hidden from the list
+
+`SYSTEM_ISSUE_DOCUMENT_KEYS` (`packages/shared/src/constants.ts:441-444`) names
+`continuation-summary` and `pipeline-case-body`. **The API does not enforce this
+list on writes.** Verified against source:
+
+| Behaviour | Reality | Source |
+| --------- | ------- | ------ |
+| `PUT` to a reserved key | **Accepted.** The route validates key *shape* only; there is no reserved-key check on the write path. | `server/src/routes/issues.ts:10068-10119` |
+| Reserved key in `GET /documents` | **Hidden by default.** `includeSystem` defaults to `false`; pass `?includeSystem=true` to include them. | `server/src/services/documents.ts:151-159` |
+| `GET /documents/{key}` on a reserved key | **Served.** The single-key route applies no system filter. | `server/src/routes/issues.ts:9725-9769` |
+
+So writing a reserved key returns 2xx, persists, overwrites runtime-owned state,
+and then disappears from the default list. Never write one — not as a probe or
+a test. To inspect one, use the direct `GET`, and remember that its absence from
+`GET /documents` is the default filter rather than evidence it does not exist.
+
+#### Update
+
+`PUT` on an existing document is an optimistic-concurrency update. Always `GET`
+first, then send the returned `latestRevisionId` as `baseRevisionId`:
+
+- No `baseRevisionId` on update → **409** `Document update requires baseRevisionId…`
+  (`server/src/services/documents.ts:351`).
+- Stale `baseRevisionId` → **409** `Document was updated by someone else`.
+- Locked document → **409** `Document is locked` (`:342`).
+
+All three carry `details.currentRevisionId`, so a 409 is recoverable: re-`GET`,
+re-read the body you are about to overwrite, re-send with the current revision.
+
+For an agent actor the route passes `lockedDocumentStrategy: "create_new_document"`,
+so a write aimed at a locked document can land under a different key. If the
+response carries `redirectedFromLockedDocument`, read the response — do not assume
+the write used the key you sent.
+
+#### Read back before you report the write
+
+A 2xx on the `PUT` confirms the request was accepted, not that the content is
+readable by the next reader. Read it back and quote the **returned** identifier
+— `latestRevisionId`, not the key you asked for — in the issue comment that
+claims the work is done.
+
+```sh
+curl -sS "$API/api/issues/$ISSUE_ID/documents/handoff-packet" \
+  -H "Authorization: Bearer $PAPERCLIP_API_KEY" -w '\nHTTP=%{http_code}\n'
+```
+
+Quote the revision because it changes on every write, so a reader can match it
+against `/documents/{key}/revisions`:
+
+> Handoff packet: issue document `handoff-packet` on this issue, revision
+> `<latestRevisionId>` (read back after write). Open at
+> `/PRO/issues/PRO-92#document-handoff-packet`.
+
+A **404** on read-back means the write did not land under that key. Do not report
+it as done.
+
+A **403** means the run scope rejected the write — run-scoped agent keys
+generally reach their own issue and descendants, not a sibling's. Do not retry
+without the right scope.
+
+Case documents (`/api/cases/{id}/documents/{key}`) are a separate route with a
+separate body shape. Do not carry issue-document assumptions across.
 
 ### Companies, Projects, Goals
 
@@ -1673,3 +1793,7 @@ Every successful or failed value fetch writes both `secret_access_events` and `a
 | Sit silently on blocked work                | Nobody knows you're stuck; the task rots              | Comment the blocker and escalate immediately            |
 | Leave tasks in ambiguous states             | Others can't tell if work is progressing              | Always update status: `blocked`, `in_review`, or `done` |
 | Block on another task without `blockedByIssueIds` | No automatic wake when blocker resolves; manual follow-up needed | Set `blockedByIssueIds` so Paperclip auto-wakes the assignee when all blockers are done |
+| Report a deliverable at a workspace path        | Workspaces are per-run and not board-readable; the claim is true for you and false for every reader | Publish to an issue document or artifact, then read it back |
+| Treat a `2xx` write as proof the content exists  | It confirms the request was accepted, not that a reader can open it | `GET` it back and quote the returned `latestRevisionId` |
+| Omit `format` on an issue-document write        | It is required and only accepts `"markdown"`        | Send `{"format": "markdown", "body": "…"}` — see [Issue Documents](#issue-documents) |
+| `PUT` a document without `baseRevisionId`        | Returns `409` on an existing document                | `GET` first, send the returned `latestRevisionId`        |
