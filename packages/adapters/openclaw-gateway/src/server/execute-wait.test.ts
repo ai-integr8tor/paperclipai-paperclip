@@ -221,6 +221,27 @@ describe("openclaw_gateway execute wait loop", () => {
     expect(gateway.waitRequests.map((request) => request.timeoutMs)).toEqual([1_000, 1_000, 500]);
   });
 
+  it("does not start agent.wait when dispatch already spent the run budget", async () => {
+    const { ctx } = createContext({ runBudgetMs: 1_000, waitWindowMs: 200 });
+    const recordEvent = ctx.onEvent;
+    ctx.onEvent = async (event) => {
+      await recordEvent?.(event);
+      // Dispatch took longer than the whole budget.
+      if (event.eventType === "openclaw.run.accepted") vi.setSystemTime(Date.now() + 5_000);
+    };
+
+    const result = await runExecute(ctx);
+
+    expect(gateway.waitRequests).toHaveLength(0);
+    expect(result).toMatchObject({ exitCode: 1, timedOut: true, errorCode: "openclaw_gateway_wait_budget_exhausted" });
+    expect(result.errorMessage).toContain("oc-run-1");
+    expect(dispatchOf(result)).toMatchObject({
+      phase: "wait_budget_exhausted",
+      acceptedRunId: "oc-run-1",
+      providerWorkStarted: true,
+    });
+  });
+
   it.each([
     ["error", { status: "error", error: "model crashed" }, "openclaw_gateway_wait_error", "wait_error"],
     ["unexpected", { status: "weird" }, "openclaw_gateway_wait_status_unexpected", "wait_status_unexpected"],

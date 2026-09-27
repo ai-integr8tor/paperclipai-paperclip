@@ -1511,7 +1511,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         // "still running", so wait again, bounded by the run budget and call cap.
         while (true) {
           const budgetLeftMs = waitDeadlineMs - Date.now();
-          if (waitCallsTotal > 0 && budgetLeftMs <= 0) return await waitBudgetExhausted();
+          // Also before the first call: dispatch retries may have spent the whole budget.
+          if (budgetLeftMs <= 0) return await waitBudgetExhausted();
           // No single observation may outlive the run budget.
           const callWindowMs = Math.max(1, Math.min(waitWindowMs, budgetLeftMs));
           waitCallsTotal++;
