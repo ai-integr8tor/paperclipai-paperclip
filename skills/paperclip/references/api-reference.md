@@ -1460,7 +1460,7 @@ Body — `upsertIssueDocumentSchema`
 | Field            | Required            | Type / rule                                                                   |
 | ---------------- | ------------------- | ----------------------------------------------------------------------------- |
 | `format`         | **yes**            | enum; `"markdown"` is the only accepted value (`:2070`, `:2072`, `:2076`)      |
-| `body`           | **yes**            | string, max 524288 bytes                                                      |
+| `body`           | **yes**            | string, max 524288 characters                                                 |
 | `title`          | no                 | string, trimmed, max 200                                                      |
 | `changeSummary`  | no                 | string, trimmed, max 500                                                      |
 | `baseRevisionId` | no on create, **yes in practice on update** | GUID; send the current `latestRevisionId` |
