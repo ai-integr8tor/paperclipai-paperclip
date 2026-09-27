@@ -27,6 +27,8 @@ export interface Company {
   spentMonthlyCents: number;
   defaultResponsibleUserId: string | null;
   requireBoardApprovalForNewAgents: boolean;
+  /** When true, human-facing questions, decisions and approvals must carry a brief. */
+  requireDecisionBrief?: boolean;
   interactionResolverGovernance: InteractionResolverGovernance;
   feedbackDataSharingEnabled: boolean;
   feedbackDataSharingConsentAt: Date | null;

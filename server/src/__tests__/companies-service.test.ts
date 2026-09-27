@@ -1146,6 +1146,24 @@ describeEmbeddedPostgres("companyService", () => {
         cases: ["ACM-C3"],
       });
     });
+
+    it("persists and returns requireDecisionBrief", async () => {
+      const companyId = await seedCompanyForBriefFlag();
+      const updated = await companyService(db).update(companyId, { requireDecisionBrief: true }, TEST_ACTOR);
+      expect(updated?.requireDecisionBrief).toBe(true);
+      const reread = await companyService(db).getById(companyId);
+      expect(reread?.requireDecisionBrief).toBe(true);
+    });
+
+    async function seedCompanyForBriefFlag() {
+      const companyId = randomUUID();
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Brief flag",
+        issuePrefix: `B${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      });
+      return companyId;
+    }
   });
 
 });
