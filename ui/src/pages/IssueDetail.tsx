@@ -5377,6 +5377,13 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   });
 
   const conversationAgent = conversation?.agent ?? agents?.find(agent => agent.id === issue?.conversationAgentId);
+  // `issue` falls back to a client-only draft (agentChatDraft) with a
+  // synthetic `chat:<agentId>` id before the first message is ever sent, so
+  // it is always truthy in conversation mode. Only a real, persisted
+  // conversation issue can be deleted.
+  const persistedConversationIssueId = conversation
+    ? (conversation.issue?.id ?? null)
+    : (issue?.id ?? null);
   const deleteConversation = useMutation({
     mutationFn: (id: string) => issuesApi.remove(id),
     onSuccess: (_data, id) => {
@@ -5407,16 +5414,16 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         trailing: (
           <div className="flex items-center gap-0.5">
             <Button variant="ghost" size="icon-xs" asChild aria-label={`Configure ${conversationAgent.name}`}><Link to={agentDetailHref(conversationAgent.id, "runtime")}><ChatSettings /></Link></Button>
-            {issue?.id ? (
+            {persistedConversationIssueId ? (
               <DeleteChatButton
                 agentName={conversationAgent.name}
                 pending={deleteConversation.isPending}
-                onDelete={async () => { await deleteConversation.mutateAsync(issue.id); }}
+                onDelete={async () => { await deleteConversation.mutateAsync(persistedConversationIssueId); }}
               />
             ) : null}
           </div>
         ),
-        trailingKey: `configure:${conversationAgent.id}:${issue?.id ?? "draft"}`,
+        trailingKey: `configure:${conversationAgent.id}:${persistedConversationIssueId ?? "draft"}`,
       }]);
       return;
     }
@@ -5433,7 +5440,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     ]);
   }, [
     conversationAgent,
-    issue?.id,
+    persistedConversationIssueId,
     deleteConversation,
     breadcrumbTitle,
     breadcrumbIdentifier,
