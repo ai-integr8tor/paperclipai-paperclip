@@ -165,6 +165,14 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   && mkdir -p /paperclip \
   && chown node:node /paperclip
 
+# Muse Code (muse_local) ships as a launcher script plus a native binary that
+# the launcher installs next to itself; there is no npm package. Runs set
+# MUSE_NO_AUTO_UPDATE=1, so this root-owned install never self-updates.
+RUN curl -fsSL https://api.meta.ai/muse-launcher.sh -o /usr/local/bin/muse \
+  && chmod 0755 /usr/local/bin/muse \
+  && MUSE_LAUNCHER_INSTALL=1 /usr/local/bin/muse \
+  && command -v muse
+
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
