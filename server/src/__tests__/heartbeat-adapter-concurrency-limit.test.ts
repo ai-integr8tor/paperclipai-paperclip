@@ -369,22 +369,73 @@ describeEmbeddedPostgres("heartbeat adapter-type concurrency limit", () => {
         },
       });
 
-      await Promise.all([
-        heartbeat.wakeup(agentAId, {
-          source: "on_demand",
-          triggerDetail: "manual",
-          manualUserWake: true,
-          requestedByActorType: "user",
-          requestedByActorId: "test-responsible-user",
-        }),
-        heartbeat.wakeup(agentBId, {
-          source: "on_demand",
-          triggerDetail: "manual",
-          manualUserWake: true,
-          requestedByActorType: "user",
-          requestedByActorId: "test-responsible-user",
-        }),
-      ]);
+      // The default mock resolves immediately, which would let whichever run
+      // gets admitted first finish (and free its slot) before the second
+      // admission attempt's count check even runs -- at which point admitting
+      // the second one too is correct, not a bug, and the test would assert
+      // nothing about the actual race. Holding execution open here until
+      // both wakeups have returned keeps the first claimed run "running" for
+      // the whole window in which the second admission decision is made,
+      // regardless of how fast that decision happens to run.
+      let releaseExecutions!: () => void;
+      const executionGate = new Promise<void>((resolve) => {
+        releaseExecutions = resolve;
+      });
+      mockAdapterExecute.mockImplementation(async () => {
+        await executionGate;
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          errorMessage: null,
+          summary: "Adapter concurrency limit test run.",
+          provider: "test",
+          model: "test-model",
+        };
+      });
+
+      try {
+        await Promise.all([
+          heartbeat.wakeup(agentAId, {
+            source: "on_demand",
+            triggerDetail: "manual",
+            manualUserWake: true,
+            requestedByActorType: "user",
+            requestedByActorId: "test-responsible-user",
+          }),
+          heartbeat.wakeup(agentBId, {
+            source: "on_demand",
+            triggerDetail: "manual",
+            manualUserWake: true,
+            requestedByActorType: "user",
+            requestedByActorId: "test-responsible-user",
+          }),
+        ]);
+
+        // Both admission decisions are already made at this point (wakeup()
+        // only awaits the claim, not the adapter execution it kicks off) --
+        // so this snapshot, taken while the first claimed run is still
+        // deliberately held "running", is exactly what the guard promises.
+        const midRunRows = await db
+          .select()
+          .from(heartbeatRuns)
+          .where(inArray(heartbeatRuns.agentId, [agentAId, agentBId]));
+        expect(midRunRows.filter((run) => run.status === "running")).toHaveLength(1);
+        expect(midRunRows.filter((run) => run.status === "queued")).toHaveLength(1);
+      } finally {
+        releaseExecutions();
+        // Restore the fast-resolving default so later tests in this file
+        // aren't left waiting on a gate nothing will ever open.
+        mockAdapterExecute.mockImplementation(async () => ({
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          errorMessage: null,
+          summary: "Adapter concurrency limit test run.",
+          provider: "test",
+          model: "test-model",
+        }));
+      }
       await heartbeat.drainActiveRunExecutions();
 
       const allRuns = await db
