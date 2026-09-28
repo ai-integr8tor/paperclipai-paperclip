@@ -1,7 +1,7 @@
 import { definePlugin, runWorker } from "@paperclipai/plugin-sdk";
-import { createTypeSafeDecisionClient, evaluateIssue, type RoutingDecisionClient } from "./routing.js";
+import { evaluateIssue, type RoutingDecisionClient } from "./routing.js";
 
-export function createRoutingPlugin(client: RoutingDecisionClient = createTypeSafeDecisionClient()) {
+export function createRoutingPlugin(client?: RoutingDecisionClient) {
   return definePlugin({
     async setup(ctx) {
       ctx.events.on("issue.created", async (event) => {

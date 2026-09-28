@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { choice, noul, TypeSafeClient } from "@typesafe-ai/sdk";
 import type { JsonValue } from "@typesafe-ai/sdk";
-import type { Issue, PluginContext, Project } from "@paperclipai/plugin-sdk";
+import type { EnvSecretRefBinding, Issue, PluginContext, Project } from "@paperclipai/plugin-sdk";
 import {
   DEPARTMENT_INSTRUCTIONS,
   DESTINATION_CRITERIA,
@@ -36,7 +36,12 @@ export interface RoutingDecisionClient {
   decide(state: Record<string, JsonValue>, options: { timeoutMs: number; maxRetries: number }): Promise<RoutingDecision>;
 }
 
-type RoutingConfig = { enabled: boolean; timeoutMs: number; maxRetries: number };
+type RoutingConfig = {
+  apiKeyRef: EnvSecretRefBinding | null;
+  enabled: boolean;
+  timeoutMs: number;
+  maxRetries: number;
+};
 
 type RecommendationRecord = {
   issueId: string;
@@ -57,10 +62,11 @@ type RecommendationRecord = {
   reason: string;
 };
 
-export function createTypeSafeDecisionClient(): RoutingDecisionClient {
+export function createTypeSafeDecisionClient(apiKey: string): RoutingDecisionClient {
   return {
     async decide(state, options) {
       const client = new TypeSafeClient({
+        apiKey,
         defaultModel: MODEL_VERSION,
         timeout: options.timeoutMs,
         retry: { maxRetries: options.maxRetries },
@@ -87,12 +93,19 @@ export function createTypeSafeDecisionClient(): RoutingDecisionClient {
   };
 }
 
+function isSecretRefBinding(value: unknown): value is EnvSecretRefBinding {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    && (value as { type?: unknown }).type === "secret_ref"
+    && typeof (value as { secretId?: unknown }).secretId === "string";
+}
+
 function numberConfig(value: unknown, fallback: number, min: number, max: number): number {
   return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max ? value : fallback;
 }
 
 export function normalizeConfig(raw: Record<string, unknown>): RoutingConfig {
   return {
+    apiKeyRef: isSecretRefBinding(raw.apiKeyRef) ? raw.apiKeyRef : null,
     enabled: raw.enabled === true,
     timeoutMs: numberConfig(raw.timeoutMs, 5000, 1000, 15000),
     maxRetries: numberConfig(raw.maxRetries, 1, 0, 2),
@@ -187,7 +200,8 @@ export async function evaluateIssue(
   ctx: PluginContext,
   issueId: string,
   companyId: string,
-  client: RoutingDecisionClient,
+  client?: RoutingDecisionClient,
+  clientFactory: (apiKey: string) => RoutingDecisionClient = createTypeSafeDecisionClient,
 ): Promise<string> {
   const config = normalizeConfig(await ctx.config.get(companyId));
   if (!config.enabled) return "disabled";
@@ -207,7 +221,13 @@ export async function evaluateIssue(
 
   const startedAt = performance.now();
   try {
-    const decision = await client.decide(state, config);
+    let decisionClient = client;
+    if (!decisionClient) {
+      if (!config.apiKeyRef) throw new Error("TypeSafe API key secret reference is not configured");
+      const apiKey = await ctx.secrets.resolve(config.apiKeyRef, { companyId, configPath: "apiKeyRef" });
+      decisionClient = clientFactory(apiKey);
+    }
+    const decision = await decisionClient.decide(state, config);
     const latencyMs = Math.round(performance.now() - startedAt);
     const resolved = resolveDecision(decision);
     await record(ctx, issue, inputRevision, {

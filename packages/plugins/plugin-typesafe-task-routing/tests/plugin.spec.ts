@@ -105,6 +105,22 @@ describe("TypeSafe task routing pilot", () => {
     expect(JSON.stringify(record?.data)).not.toContain("provider unavailable");
   });
 
+  it("resolves the company secret at the worker boundary and never persists its value", async () => {
+    const secretRef = { type: "secret_ref" as const, secretId: "11111111-1111-4111-8111-111111111111", version: "latest" as const };
+    const harness = createTestHarness({ manifest, config: { enabled: true, apiKeyRef: secretRef } });
+    harness.seed({ issues: [issue()] });
+    const resolvedApiKey = "typesafe-test-key-never-persist";
+    const resolve = vi.spyOn(harness.ctx.secrets, "resolve").mockResolvedValue(resolvedApiKey);
+    const decide = vi.fn(async () => decision());
+    const clientFactory = vi.fn((_apiKey: string): RoutingDecisionClient => ({ decide }));
+
+    expect(await evaluateIssue(harness.ctx, "issue-1", COMPANY_ID, undefined, clientFactory)).toBe("engineering");
+    expect(resolve).toHaveBeenCalledWith(secretRef, { companyId: COMPANY_ID, configPath: "apiKeyRef" });
+    expect(clientFactory).toHaveBeenCalledWith(resolvedApiKey);
+    expect(decide).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(await records(harness))).not.toContain(resolvedApiKey);
+  });
+
   it("fails open on a provider timeout", async () => {
     const timeout = new Error("request exceeded deadline");
     timeout.name = "TimeoutError";
