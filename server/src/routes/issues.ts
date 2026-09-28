@@ -1,3 +1,4 @@
+import { isNativeWorkspaceExportRepairCause } from "@paperclipai/shared";
 import { retryNativeWorkspaceExport } from "../services/native-runtime/native-workspace-export-retry.js";
 import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractionResponse } from "../services/queued-interaction-response.js";
 import { deliverConversationComments, isConversation } from "../services/agent-conversations.js";
@@ -9271,7 +9272,7 @@ export function issueRoutes(
           { source: "recovery_action_resolution" },
         );
 
-        if (sourceIssueStatus === "todo" && activeRecoveryAction.cause === "native_workspace_sync_out_unsafe_archive") {
+        if (sourceIssueStatus === "todo" && isNativeWorkspaceExportRepairCause(activeRecoveryAction.cause)) {
           throw conflict("Repair the retained sandbox, then use Retry workspace export to finish the accepted result without another provider turn.", { code: "workspace_export_retry_required" });
         }
 

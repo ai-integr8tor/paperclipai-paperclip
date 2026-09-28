@@ -14,6 +14,8 @@ import type { PluginWorkerManager } from "../plugin-worker-manager.js";
 import { heartbeatService } from "../heartbeat.js";
 import { remoteTerminationReceipt } from "../remote-execution-termination.js";
 import { retryNativeWorkspaceExport } from "./native-workspace-export-retry.js";
+import { recordNativeFinalizationFailure } from "./native-run-finalizer.js";
+import { classifyNativeWorkspaceFailure } from "./native-workspace-failure.js";
 
 const enabled = process.env.PAPERCLIP_LIVE_EXPORT_RESUME === "1";
 const describeLive = enabled ? describe : describe.skip;
@@ -33,23 +35,46 @@ describeLive("live Daytona export-resume failure recovery", () => {
   const nonce = randomUUID();
   const bytes = `preserved-export-resume-${nonce}\n`;
   const digest = createHash("sha256").update(bytes).digest("hex");
-  const config = { provider: "daytona", image, reuseLease: true, timeoutMs: 120_000, autoStopInterval: 10, autoDeleteInterval: 30 };
+  const config = { provider: "daytona", image, reuseLease: false, timeoutMs: 120_000, autoStopInterval: 10, autoDeleteInterval: 0 };
   const evidence: Record<string, unknown> = { kind: "live_provider_boundary_fault_integration", image, nonceSha256: digest };
   const methods: string[] = [];
+  const providerCalls: unknown[] = [];
+  evidence.providerCalls = providerCalls;
   let failProbe = false;
   let failStop = false;
-  const handlers: Record<string, string> = { environmentResumeLease: "onEnvironmentResumeLease", environmentReleaseLease: "onEnvironmentReleaseLease", environmentExecute: "onEnvironmentExecute" };
+  const handlers: Record<string, string> = { environmentResumeLease: "onEnvironmentResumeLease", environmentStopLease: "onEnvironmentStopLease", environmentExecute: "onEnvironmentExecute" };
   const manager = () => ({ isRunning: () => true,
     getWorker: () => ({ supportedMethods: Object.keys(handlers) }),
     call: async (_id: string, method: string, input: any) => {
       methods.push(method);
-      if (method === "environmentExecute" && failProbe) { failProbe = false; throw new Error("Injected probe transport failure"); }
-      if (method === "environmentReleaseLease" && failStop) { failStop = false; throw new Error("Injected stop transport failure"); }
+      if (method === "environmentExecute" && failProbe) { failProbe = false; evidence.probeFaultsInjected = Number(evidence.probeFaultsInjected ?? 0) + 1; throw new Error("Injected probe transport failure"); }
+      if (method === "environmentStopLease" && failStop) { failStop = false; throw new Error("Injected stop transport failure"); }
       if (!handlers[method]) throw new Error("Unexpected provider operation");
-      try { return await plugin[handlers[method]](input); }
-      catch { throw new Error("Live Daytona operation failed; provider details withheld"); }
+      try {
+        const result = await plugin[handlers[method]](input);
+        providerCalls.push({ method, ...(method === "environmentExecute" ? { exitCode: result.exitCode, timedOut: result.timedOut } : {}),
+          ...(method === "environmentResumeLease" ? { exactAllocation: result.providerLeaseId === lease.providerLeaseId, exactRoot: result.metadata?.remoteCwd === lease.metadata?.remoteCwd } : {}) });
+        return result;
+      } catch (error) {
+        evidence.providerFailure = { method, errorName: (error as Error).name,
+          // Function locations diagnose fixture failures without copying provider messages or credentials.
+          frames: (error as Error).stack?.split("\n").slice(1, 6) };
+        throw new Error("Live Daytona operation failed; provider details withheld");
+      }
     },
   }) as unknown as PluginWorkerManager;
+  function runtime() {
+    const service = environmentRuntimeService(db, { pluginWorkerManager: manager() });
+    const execute = service.execute.bind(service);
+    service.execute = async input => {
+      try { return await execute(input); }
+      catch (error) {
+        evidence.executionFailure = { errorName: (error as Error).name, frames: (error as Error).stack?.split("\n").slice(1, 6) };
+        throw error;
+      }
+    };
+    return service;
+  }
   const scope = () => ({ driverKey: "daytona", companyId: ids.company, environmentId: ids.environment, issueId: ids.issue,
     config, providerLeaseId: lease.providerLeaseId, leaseMetadata: lease.metadata });
   async function persistedLease() {
@@ -58,6 +83,8 @@ describeLive("live Daytona export-resume failure recovery", () => {
   async function confirmStoppedAndPreserved() {
     await sandbox.refreshData();
     expect(sandbox.state).toBe("stopped");
+    expect(sandbox.autoDeleteInterval).toBe(-1);
+    evidence.providerAutoDeleteDisabled = true;
     await sandbox.start(60);
     const result = await sandbox.process.executeCommand(`sha256sum ${quote(`${lease.metadata!.remoteCwd}/preserved-${nonce}.txt`)}`, "/", undefined, 15);
     expect(result.exitCode).toBe(0);
@@ -94,17 +121,17 @@ describeLive("live Daytona export-resume failure recovery", () => {
       sandbox = await new Daytona({ apiKey: process.env.DAYTONA_API_KEY }).get(acquired.providerLeaseId);
       const metadata = { ...acquired.metadata, provider: "daytona", pluginId: ids.plugin, sandboxProviderPlugin: true };
       await db.insert(environmentLeases).values({ id: ids.lease, companyId: ids.company, environmentId: ids.environment, issueId: ids.issue,
-        heartbeatRunId: ids.run, status: "active", leasePolicy: "reuse_by_environment", provider: "daytona", providerLeaseId: acquired.providerLeaseId, metadata });
+        heartbeatRunId: ids.run, status: "active", leasePolicy: "ephemeral", provider: "daytona", providerLeaseId: acquired.providerLeaseId, metadata });
       lease = await persistedLease() as unknown as EnvironmentLease;
       setupPhase = "write";
       const wrote = await sandbox.process.executeCommand(`printf %s ${quote(bytes)} > ${quote(`${metadata.remoteCwd}/preserved-${nonce}.txt`)}`, "/", undefined, 15);
       if (wrote.exitCode !== 0) throw new Error("Write failed");
       setupPhase = "initial_stop";
-      const receipt = await plugin.onEnvironmentReleaseLease({ ...scope(), cancelActiveWork: true });
+      const receipt = await plugin.onEnvironmentStopLease(scope());
       expect(receipt.state).toBe("stopped");
       await db.update(environmentLeases).set({ status: "released", cleanupStatus: "success", releasedAt: new Date(),
         metadata: { ...metadata, remoteExecutionTermination: remoteTerminationReceipt(lease, receipt) } }).where(eq(environmentLeases.id, ids.lease));
-      await db.update(heartbeatRuns).set({ runnerProfileJson: { nativeWorkspaceSync: { schema: "paperclip.native-workspace-sync/v1", state: "prepared", descriptorSha256: "a".repeat(64), baselineSha256: "b".repeat(64), finalHostSha256: null, workspaceId: randomUUID(), leaseId: ids.lease, providerLeaseId: lease.providerLeaseId, remoteCwd: metadata.remoteCwd, resourceDisposition: "keep_running" } } }).where(eq(heartbeatRuns.id, ids.run));
+      await db.update(heartbeatRuns).set({ runnerProfileJson: { nativeWorkspaceSync: { schema: "paperclip.native-workspace-sync/v1", state: "prepared", descriptorSha256: "a".repeat(64), baselineSha256: "b".repeat(64), finalHostSha256: null, workspaceId: randomUUID(), leaseId: ids.lease, providerLeaseId: lease.providerLeaseId, remoteCwd: metadata.remoteCwd, resourceDisposition: "destroy" } } }).where(eq(heartbeatRuns.id, ids.run));
     } catch (error) {
       evidence.setupFailure = { phase: setupPhase, errorType: (error as Error).name };
       throw new Error(`Live fixture setup failed at ${setupPhase}; provider details withheld`);
@@ -125,7 +152,7 @@ describeLive("live Daytona export-resume failure recovery", () => {
   }, 90_000);
   it("stops after a failed probe, and recovers a failed stop through a fresh runtime", async () => {
     const request = () => ({ db, companyId: ids.company, issueId: ids.issue, actionId: ids.action, runId: ids.run, actorId: "live-test",
-      repairNote: "Provider-boundary fault integration preserves exact synthetic nonce bytes", environmentRuntime: environmentRuntimeService(db, { pluginWorkerManager: manager() }) });
+      repairNote: "Provider-boundary fault integration preserves exact synthetic nonce bytes", environmentRuntime: runtime() });
     failProbe = true;
     await expect(retryNativeWorkspaceExport(request())).rejects.toThrow("Resume and repair");
     expect(await persistedLease()).toMatchObject({ status: "released", cleanupStatus: "success", metadata: { remoteExecutionTermination: { state: "stopped" } } });
@@ -143,16 +170,52 @@ describeLive("live Daytona export-resume failure recovery", () => {
     const restartedPlugin = (await import(`${new URL("../../../../packages/plugins/sandbox-providers/daytona/dist/plugin.js", import.meta.url).href}?restart=${nonce}`)).default.definition;
     expect(restartedPlugin).not.toBe(plugin);
     plugin = restartedPlugin;
-    const fresh = environmentRuntimeService(db, { pluginWorkerManager: manager() });
+    const fresh = runtime();
     await heartbeatService(db, { environmentRuntime: fresh }).sweepPendingCleanupLeases({ backoffMs: 0 });
-    expect(await persistedLease()).toMatchObject({ status: "expired", cleanupStatus: "success", metadata: { remoteExecutionTermination: { state: "stopped" } } });
+    expect(await persistedLease()).toMatchObject({ status: "released", cleanupStatus: "success", metadata: { remoteExecutionTermination: { state: "stopped" } } });
     expect((await persistedLease()).metadata?.nativeWorkspaceExportResume).toBeUndefined();
     await confirmStoppedAndPreserved();
     expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
     expect(await db.select().from(heartbeatRuns)).toHaveLength(1);
     expect((await db.select().from(nativeRunFinalizations))[0]).toMatchObject({ phase: "terminal_failure", resultId: ids.result });
     expect(methods.filter(m => m === "environmentResumeLease")).toHaveLength(2);
-    expect(methods.filter(m => m === "environmentReleaseLease")).toHaveLength(3);
+    expect(methods.filter(m => m === "environmentStopLease")).toHaveLength(3);
+    expect(evidence.probeFaultsInjected).toBe(2);
     evidence.restartStopPreservedBytes = true; evidence.noNewProviderTurn = true; evidence.noDestroyBeforeFixtureCleanup = true;
+  }, 180_000);
+  it("preserves an ephemeral allocation after injected transient export exhaustion and a failed initial stop", async () => {
+    await plugin.onEnvironmentResumeLease(scope());
+    await db.update(environmentLeases).set({ status: "active", cleanupStatus: null, releasedAt: null,
+      metadata: { ...(await persistedLease()).metadata, remoteExecutionTermination: undefined } }).where(eq(environmentLeases.id, ids.lease));
+    await db.update(heartbeatRuns).set({ status: "running", nativePhase: "result_accepted" }).where(eq(heartbeatRuns.id, ids.run));
+    await db.update(nativeRunFinalizations).set({ phase: "result_accepted", failureCode: null, failureDetail: null }).where(eq(nativeRunFinalizations.runId, ids.run));
+    const acceptedBefore = await db.select().from(nativeRunResults);
+    // Deliberate fixture-only transport failure at the finalizer boundary. No
+    // disk pressure, provider outage, or successful physical copyback is claimed.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const failure = classifyNativeWorkspaceFailure(new Error("Injected fixture export transport unavailable"));
+      await recordNativeFinalizationFailure({ db, runId: ids.run, error: new Error(failure.failureCode),
+        failureScope: "workspace", projectRunStatus: true, permanent: failure.permanent });
+    }
+    expect(await persistedLease()).toMatchObject({ status: "pending_cleanup", leasePolicy: "ephemeral", metadata: { reuseLease: false, nativeWorkspaceExportResume: { purpose: "terminal_export", resultId: ids.result } } });
+    failStop = true;
+    await runtime().releaseRunLeases(ids.run, "failed", undefined, "stop_and_retain");
+    expect(await persistedLease()).toMatchObject({ status: "pending_cleanup", metadata: { pendingCleanupInFlight: false } });
+    await sandbox.refreshData(); expect(sandbox.state).toBe("started");
+    plugin = (await import(`${new URL("../../../../packages/plugins/sandbox-providers/daytona/dist/plugin.js", import.meta.url).href}?exhaustion-restart=${nonce}`)).default.definition;
+    await heartbeatService(db, { environmentRuntime: runtime() }).sweepPendingCleanupLeases({ backoffMs: 0 });
+    expect(await persistedLease()).toMatchObject({ status: "released", metadata: { remoteExecutionTermination: { providerLeaseId: lease.providerLeaseId, state: "stopped" } } });
+    await confirmStoppedAndPreserved();
+    const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.cause, "native_workspace_sync_out_retry_exhausted"));
+    expect(action).toMatchObject({ status: "active", ownerType: "board" });
+    const queued = await retryNativeWorkspaceExport({ db, companyId: ids.company, issueId: ids.issue, runId: ids.run, actionId: action.id,
+      actorId: "live-test", repairNote: "Fixture-only export transport fault removed; exact nonce and allocation preserved", environmentRuntime: runtime() });
+    expect(queued).toMatchObject({ resultId: ids.result, leaseId: ids.lease, status: "queued" });
+    expect(await db.select().from(nativeRunResults)).toEqual(acceptedBefore);
+    expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
+    expect(await db.select().from(heartbeatRuns)).toHaveLength(1);
+    evidence.ephemeralExhaustionRestartPreserved = true;
+    evidence.genericExportRetryAdmittedWithoutProviderTurn = true;
+    evidence.genericCopybackNotAttempted = true;
   }, 180_000);
 });

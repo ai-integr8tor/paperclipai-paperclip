@@ -52,6 +52,14 @@ describe("WorkspaceExportRecovery", () => {
   it("does not offer the action without runtime access", async () => {
     await mount({ canManage: false }); expect(container.querySelector("button")).toBeNull();
   });
+  it("offers saved-result export after transient retries are exhausted without claiming an unsafe link", async () => {
+    await mount({ action: { ...action, cause: "native_workspace_sync_out_retry_exhausted" } });
+    expect(container.querySelector("button")?.textContent).toBe("Retry workspace export");
+    expect(container.textContent).toContain("export failure");
+    expect(container.textContent).not.toContain("unsafe link");
+    await enterNote(); await submit();
+    expect(retry).toHaveBeenCalledWith("issue", expect.objectContaining({ runId: "run" }));
+  });
   it("does not offer a second retry while the same export is queued", async () => {
     await mount({ action: { ...action, wakePolicy: { kind: "resume_native_run" } } });
     expect(container.querySelector('[role="status"]')?.textContent).toContain("Export is queued"); expect(container.querySelector("button")).toBeNull();

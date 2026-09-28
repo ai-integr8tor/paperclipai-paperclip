@@ -5,7 +5,7 @@ import {
   type NativeWorkspaceFinalizationOwnership,
 } from "./native-runtime/native-workspace-finalization-ownership.js";
 import { classifyNativeWorkspaceFailure, type NativeWorkspaceFailureCode } from "./native-runtime/native-workspace-failure.js";
-import { hasNativeWorkspaceExportResume, settleNativeWorkspaceExportResume } from "./native-runtime/native-workspace-export-resume.js";
+import { hasStopOnlyCleanup, settleStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
 import { applyWorkspaceRestoreFailure } from "@paperclipai/adapter-utils/workspace-restore-result";
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { externalConversationStateSql, nonIdleSlackIssueCondition } from "./slack-conversation-state.js";
@@ -18576,7 +18576,7 @@ export function heartbeatService(
       // An interrupted export resume also uses recorded cleanup, but its tagged
       // intent permits verified stop-and-retain only, never sandbox destruction.
       const isOrphanEphemeralLease = lease.leasePolicy === "ephemeral";
-      const useRecordedTeardown = isOrphanEphemeralLease || !environment || hasNativeWorkspaceExportResume(lease);
+      const useRecordedTeardown = isOrphanEphemeralLease || !environment || hasStopOnlyCleanup(lease);
 
       // Do not consume a finite cleanup attempt while the provider plugin is
       // briefly unavailable. A plugin worker restart, a plugin reload, or a
@@ -18645,8 +18645,8 @@ export function heartbeatService(
             environment,
             lease,
           });
-          const released = hasNativeWorkspaceExportResume(lease)
-            ? await settleNativeWorkspaceExportResume(db, lease, { attemptId: claimed, receipt, status: "expired" })
+          const released = hasStopOnlyCleanup(lease)
+            ? await settleStopOnlyCleanup(db, lease, { attemptId: claimed, receipt })
             : await environmentsSvc.releaseLease(lease.id, "expired", {
             expectedPendingCleanupAttemptId: claimed,
             cleanupStatus: "success",
@@ -18805,7 +18805,7 @@ export function heartbeatService(
       agentId: input.agentId,
       status: settledRun?.status,
       failureReason: settledRun?.error ?? undefined,
-      providerResourceDisposition: input.succeeded && !parseObject(settledRun?.resultJson).workspaceExportRetry
+      providerResourceDisposition: input.succeeded && (!parseObject(settledRun?.resultJson).workspaceExportRetry || workspaceSyncReference?.resourceDisposition === "destroy")
         ? (workspaceSyncReference?.resourceDisposition ?? "stop_and_retain")
         : "stop_and_retain",
     });
@@ -25464,7 +25464,9 @@ export function heartbeatService(
             message: err.terminalFailure
               ? err.reasonCode === "workspace_sync_out_unsafe_archive"
                 ? "native result is durable; workspace copy-back requires repair of an unsafe link or path in the retained sandbox"
-                : "native result is durable, but the sandbox containing unexported workspace changes is unrecoverable"
+                : err.reasonCode === "workspace_sync_out_failed"
+                  ? "native result is durable; automatic workspace copy-back retries stopped and saved work is retained for export repair"
+                  : "native result is durable, but the sandbox containing unexported workspace changes is unrecoverable"
               : "native result is durable; workspace copy-back will retry without another provider turn",
             payload: {
               attempt: coordinator?.attempt ?? null,

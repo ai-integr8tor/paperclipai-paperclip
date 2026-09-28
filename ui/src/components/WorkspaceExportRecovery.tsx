@@ -1,6 +1,7 @@
 import { useId, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import type { IssueRecoveryAction } from "@paperclipai/shared";
+import { isNativeWorkspaceExportRepairCause } from "@paperclipai/shared";
 import { issuesApi } from "../api/issues";
 import { Button } from "./ui/button";
 import { Label } from "./ui/label";
@@ -19,17 +20,19 @@ export function WorkspaceExportRecovery({ issueId, action, canManage, onQueued }
     }),
     onSuccess: () => { setQueuedActionVersion(String(action!.updatedAt)); onQueued(); },
   });
-  if (action?.cause !== "native_workspace_sync_out_unsafe_archive" || action.ownerType !== "board"
+  if (!action || !isNativeWorkspaceExportRepairCause(action.cause) || action.ownerType !== "board"
     || !["active", "escalated"].includes(action.status) || typeof action.evidence.runId !== "string") return null;
   const queued = queuedActionVersion === String(action.updatedAt) || action.wakePolicy?.kind === "resume_native_run";
   return <section aria-label="Workspace export repair" className="flex flex-col gap-2 p-4 text-sm">
     <p className="font-medium">Workspace export needs repair</p>
     {queued ? <p role="status">Export is queued for the saved result. The agent will not repeat its work.</p> : <>
-      <p className="text-muted-foreground">Resume the retained sandbox in its provider console and repair the unsafe link or path. Preserve the other files, then retry export here.</p>
+      <p className="text-muted-foreground">{action.cause === "native_workspace_sync_out_unsafe_archive"
+        ? "Resume the retained sandbox in its provider console and repair the unsafe link or path. Preserve the other files, then retry export here."
+        : "Automatic workspace export retries stopped. Inspect the export failure, restore provider or destination availability, and preserve the saved files in the retained sandbox. Retry export here when the cause is resolved."}</p>
       {canManage ? <>
         <Label htmlFor={noteId}>Repair performed</Label>
         <Textarea id={noteId} value={repairNote} onChange={event => setRepairNote(event.target.value)}
-          placeholder="Describe the repaired path and how the other workspace files were preserved." disabled={retry.isPending} />
+          placeholder="Describe the repair and how the saved workspace files were preserved." disabled={retry.isPending} />
         <div className="flex justify-end">
           <Button onClick={() => retry.mutate()} disabled={retry.isPending || repairNote.trim().length < 20}>
             {retry.isPending ? "Queueing export…" : "Retry workspace export"}

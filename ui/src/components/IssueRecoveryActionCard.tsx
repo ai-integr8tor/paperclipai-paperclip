@@ -1,3 +1,4 @@
+import { isNativeWorkspaceExportRepairCause } from "@paperclipai/shared";
 import { useWorkspaceIsolationControls } from "@/hooks/useWorkspaceIsolationControls";
 import { requiresExecutionReconciliation } from "@paperclipai/shared";
 import { useMemo, useState } from "react";
@@ -1061,7 +1062,7 @@ export function IssueRecoveryActionCard({
 
   const showResolveActions = onResolve !== undefined && cardState !== "resolved";
   const visibleResolveOptions = RESOLVE_OPTIONS.filter((option) => {
-    if (option.outcome === "todo" && (requiresExecutionReconciliation(action.cause) || action.cause === "native_workspace_sync_out_unsafe_archive")) return false;
+    if (option.outcome === "todo" && (requiresExecutionReconciliation(action.cause) || isNativeWorkspaceExportRepairCause(action.cause))) return false;
     if (option.boardOnly && !canFalsePositive) return false;
     return true;
   });

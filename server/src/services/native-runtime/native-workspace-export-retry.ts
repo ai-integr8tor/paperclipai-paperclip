@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Environment, EnvironmentLease } from "@paperclipai/shared";
+import { isNativeWorkspaceExportRepairCause } from "@paperclipai/shared";
 import { and, eq, gt, inArray, ne, or, sql } from "drizzle-orm";
 import { environmentLeases, environments, heartbeatRuns, issues, issueRecoveryActions, nativeRunFinalizations, nativeRunResults, type Db } from "@paperclipai/db";
 import { conflict } from "../../errors.js";
@@ -11,7 +12,6 @@ import { readNativeWorkspaceSyncReference } from "./native-workspace-sync.js";
 import type { EnvironmentRuntimeService } from "../environment-runtime.js";
 import { resolveEnvironmentExecutionTarget } from "../environment-execution-target.js";
 
-const CAUSE = "native_workspace_sync_out_unsafe_archive";
 const record = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const changed = () => conflict("The recorded export repair is no longer current. Refresh the task and inspect its run.", { code: "workspace_export_retry_stale" });
 
@@ -29,19 +29,19 @@ export async function retryNativeWorkspaceExport(input: {
     const run = await one(db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.nativeIssueId, input.issueId))).limit(1));
     const action = await one(db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, input.companyId), eq(issueRecoveryActions.sourceIssueId, input.issueId), eq(issueRecoveryActions.id, input.actionId))).limit(1));
     if (!issue || !run || !coordinator || !action || action.evidence?.runId !== run.id
-      || action.kind !== "active_run_watchdog" || action.cause !== CAUSE || action.ownerType !== "board"
+      || action.kind !== "active_run_watchdog" || !isNativeWorkspaceExportRepairCause(action.cause) || action.ownerType !== "board"
       || !["active", "escalated"].includes(action.status) || run.runtimeMode !== "native"
-      || issue.status !== "blocked" || issue.assigneeAgentId !== run.agentId
+      || !(issue.status === "blocked" || (issue.status === "in_review" && action.cause === "native_workspace_sync_out_retry_exhausted")) || issue.assigneeAgentId !== run.agentId
       || (issue.executionRunId && issue.executionRunId !== run.id)
       || (issue.checkoutRunId && issue.checkoutRunId !== run.id) || coordinator.leaseOwner) throw changed();
     const reference = readNativeWorkspaceSyncReference(record(run.runnerProfileJson).nativeWorkspaceSync);
-    if (!reference || reference.state !== "prepared" || reference.resourceDisposition === "destroy") throw changed();
+    if (!reference || reference.state !== "prepared") throw changed();
     const lease = await one(db.select().from(environmentLeases).where(and(eq(environmentLeases.companyId, input.companyId), eq(environmentLeases.id, reference.leaseId))).limit(1));
     if (!lease || lease.heartbeatRunId !== run.id || lease.issueId !== issue.id
       || lease.providerLeaseId !== reference.providerLeaseId || !lease.environmentId
       || typeof lease.metadata?.pluginId !== "string" || !lease.metadata.pluginId) throw changed();
     const [otherLease] = await db.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
-      ne(environmentLeases.id, lease.id), eq(environmentLeases.provider, lease.provider!), eq(environmentLeases.providerLeaseId, lease.providerLeaseId!), inArray(environmentLeases.status, ["active", "pending_cleanup"]),
+      ne(environmentLeases.id, lease.id), eq(environmentLeases.provider, lease.provider!), eq(environmentLeases.providerLeaseId, lease.providerLeaseId!), inArray(environmentLeases.status, ["active", "retained", "pending_cleanup"]),
     )).limit(1);
     if (otherLease) throw changed();
     const [result] = await db.select().from(nativeRunResults).where(and(eq(nativeRunResults.companyId, input.companyId), eq(nativeRunResults.issueId, issue.id), eq(nativeRunResults.runId, run.id), eq(nativeRunResults.id, coordinator.resultId ?? "00000000-0000-0000-0000-000000000000"))).limit(1);
@@ -61,7 +61,7 @@ export async function retryNativeWorkspaceExport(input: {
       && lease.metadata?.pendingCleanupInFlight === true && resumeIntent?.requestId === resumeRequestId
       && Number(lease.metadata?.pendingCleanupLeaseExpiresAtMs) > Date.now()
       && resumeIntent.resultId === result.id);
-    if (!alreadyQueued && (coordinator.phase !== "terminal_failure" || coordinator.failureCode !== CAUSE
+    if (!alreadyQueued && (coordinator.phase !== "terminal_failure" || coordinator.failureCode !== action.cause
       || run.status !== "failed" || (!ownsResume && (!hasRemoteTerminationReceipt(lease)
         || record(lease.metadata?.remoteExecutionTermination).state !== "stopped")))) throw changed();
     if (resumeRequestId && !ownsResume) throw changed();
@@ -100,6 +100,7 @@ export async function retryNativeWorkspaceExport(input: {
               pluginId: current.lease.metadata?.pluginId,
                 provider: current.lease.provider, providerLeaseId: current.lease.providerLeaseId, resultId: current.result.id },
               pendingCleanupAttemptId: requestId, pendingCleanupInFlight: true,
+              pendingCleanupRetryAfterMs: 0, pendingCleanupRetryAttempts: 0, pendingCleanupRetryCapWarned: false,
               pendingCleanupLeaseExpiresAtMs: now.getTime() + 15 * 60_000 },
           }).where(eq(environmentLeases.id, current.lease.id)).returning();
           return lease;
@@ -141,8 +142,10 @@ export async function retryNativeWorkspaceExport(input: {
         // finalization settlement will stop/retain it again on success or failure.
         await tx.update(environmentLeases).set({ status: "active", releasedAt: null, cleanupStatus: null, failureReason: null,
           metadata: { ...current.lease.metadata, remoteExecutionTermination: undefined,
-            [NATIVE_WORKSPACE_EXPORT_RESUME_KEY]: undefined, pendingCleanupAttemptId: undefined,
-            pendingCleanupInFlight: undefined, pendingCleanupLeaseExpiresAtMs: undefined }, updatedAt: now }).where(eq(environmentLeases.id, current.lease.id));
+            // Keep stop-only authority through copyback and commitment. A crash
+            // before final release must not make the orphan sweeper destroy it.
+            pendingCleanupAttemptId: undefined, pendingCleanupInFlight: false,
+            pendingCleanupLeaseExpiresAtMs: 0 }, updatedAt: now }).where(eq(environmentLeases.id, current.lease.id));
         await tx.update(issueRecoveryActions).set({ evidence: { ...current.action.evidence, workspaceExportRetry: retry },
           nextAction: "Workspace export is queued for the accepted result. No provider turn will run.",
           wakePolicy: { kind: "resume_native_run", runId: current.run.id }, updatedAt: now }).where(eq(issueRecoveryActions.id, current.action.id));
@@ -164,7 +167,7 @@ export async function retryNativeWorkspaceExport(input: {
             sql`${environmentLeases.metadata}->>'pendingCleanupAttemptId' = ${resumeRequestId}`)).limit(1);
           const [otherOwner] = await input.db.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
             ne(environmentLeases.id, initial.lease.id), eq(environmentLeases.provider, initial.lease.provider!),
-            eq(environmentLeases.providerLeaseId, initial.lease.providerLeaseId!), inArray(environmentLeases.status, ["active", "pending_cleanup"]),
+            eq(environmentLeases.providerLeaseId, initial.lease.providerLeaseId!), inArray(environmentLeases.status, ["active", "retained", "pending_cleanup"]),
           )).limit(1);
           if (lease && !otherOwner && readNativeWorkspaceExportResume(lease)?.requestId === resumeRequestId) {
             let termination: ReturnType<typeof remoteTerminationReceipt>;

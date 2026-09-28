@@ -3,6 +3,7 @@ import { dismissAutomaticCompletionReviews } from "./automatic-completion-review
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-review-participant.js";
 import { conversationNativeDecision, isConversation } from "../agent-conversations.js";
 import { randomUUID } from "node:crypto";
+import { preserveNativeWorkspaceExportLease } from "./native-workspace-export-resume.js";
 import { and, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -424,6 +425,9 @@ async function recordRetryableFailure(input: {
       .where(eq(nativeRunFinalizations.runId, input.run.id));
     const projectsTerminalStatus =
       exhausted && !supersededByNewerRun && input.projectRunStatus;
+    if (projectsTerminalStatus && input.failureScope === "workspace") {
+      await preserveNativeWorkspaceExportLease(tx as unknown as Db, input.run, input.coordinator.resultId);
+    }
     const [updatedRun] = await tx
       .update(heartbeatRuns)
       .set({
@@ -478,7 +482,7 @@ async function recordRetryableFailure(input: {
         input.coordinator.issueId,
         {
           status:
-            input.permanent && input.failureScope === "workspace"
+            input.failureScope === "workspace"
               ? "blocked"
               : "in_review",
         },

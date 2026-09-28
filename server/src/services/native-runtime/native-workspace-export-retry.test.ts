@@ -11,6 +11,7 @@ import { restoreNativeWorkspaceExportRepairs } from "./native-workspace-export-r
 import { recordNativeFinalizationFailure } from "./native-run-finalizer.js";
 import { recoveryService } from "../recovery/service.js";
 import { retryNativeWorkspaceExport } from "./native-workspace-export-retry.js";
+import { releaseCompletedNativeWorkspaceExportRetention } from "./native-workspace-export-resume.js";
 
 describe("board retry of accepted workspace export", () => {
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
@@ -65,6 +66,59 @@ describe("board retry of accepted workspace export", () => {
     expect(resume).toHaveBeenCalledOnce();
     expect(resume).toHaveBeenCalledWith(expect.objectContaining({ lease: expect.objectContaining({ id: f.leaseId, providerLeaseId: lease.providerLeaseId }) }));
   });
+  it("retries exhausted transient export of an ephemeral allocation without another provider turn", async () => {
+    const f = await seed();
+    await db.update(nativeRunFinalizations).set({ failureCode: "native_workspace_sync_out_retry_exhausted", failureDetail: { workspaceFinalizeAttempt: 3 } }).where(eq(nativeRunFinalizations.runId, f.runId));
+    await db.update(issueRecoveryActions).set({ cause: "native_workspace_sync_out_retry_exhausted" }).where(eq(issueRecoveryActions.id, f.actionId));
+    await db.update(environmentLeases).set({ leasePolicy: "ephemeral" }).where(eq(environmentLeases.id, f.leaseId));
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { ...run.runnerProfileJson, nativeWorkspaceSync: { ...(run.runnerProfileJson!.nativeWorkspaceSync as object), resourceDisposition: "destroy" } } }).where(eq(heartbeatRuns.id, f.runId));
+    await expect(retryNativeWorkspaceExport(f.request)).resolves.toMatchObject({ status: "queued", resultId: f.resultId, leaseId: f.leaseId });
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toHaveLength(0);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.nativeIssueId, f.issueId))).toHaveLength(1);
+  });
+  it.each(["unsafe", "transient"])("records stop-only preservation atomically with %s terminal export failure", async kind => {
+    const f = await seed();
+    await db.update(nativeRunFinalizations).set({ phase: "result_accepted", failureCode: null, failureDetail: null }).where(eq(nativeRunFinalizations.runId, f.runId));
+    await db.update(heartbeatRuns).set({ status: "running", nativePhase: "result_accepted" }).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(environmentLeases).set({ status: "active", leasePolicy: "ephemeral", releasedAt: null, metadata: { pluginId: "plugin-test", pendingCleanupRetryAfterMs: Date.now() + 600_000, pendingCleanupRetryAttempts: 7 } }).where(eq(environmentLeases.id, f.leaseId));
+    for (let attempt = 1; attempt <= (kind === "unsafe" ? 1 : 3); attempt++) {
+      await recordNativeFinalizationFailure({ db, runId: f.runId,
+        error: new Error(kind === "unsafe" ? "native_workspace_sync_out_unsafe_archive" : "native_workspace_sync_out_failed"),
+        failureScope: "workspace", projectRunStatus: true, permanent: kind === "unsafe" });
+      const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
+      if (kind === "transient" && attempt < 3) expect(lease.status).toBe("active");
+      else {
+        expect(lease).toMatchObject({ status: "pending_cleanup", metadata: {
+          nativeWorkspaceExportResume: { runId: f.runId, leaseId: f.leaseId, resultId: f.resultId },
+          pendingCleanupInFlight: false, pendingCleanupRetryAfterMs: 0, pendingCleanupRetryAttempts: 0,
+        } });
+        expect(lease.metadata?.remoteExecutionTermination).toBeUndefined();
+        expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0].status).toBe("blocked");
+      }
+    }
+    expect((await db.select().from(nativeRunResults).where(eq(nativeRunResults.id, f.resultId)))[0].schemaStatus).toBe("accepted");
+  });
+  it.each(["complete", "committed_failed", "committed_cancelled", "running", "unexported", "wrong_result", "uncommitted_run", "wrong_allocation", "competing_owner"])("releases ephemeral retention only after exact committed copyback: %s", async kind => {
+    const f = await seed();
+    await retryNativeWorkspaceExport(f.request);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(heartbeatRuns).set({ status: kind === "running" ? "running" : kind === "committed_cancelled" ? "cancelled" : ["uncommitted_run", "committed_failed"].includes(kind) ? "failed" : "succeeded",
+      nativePhase: kind === "uncommitted_run" ? "terminal_failure" : "committed",
+      runnerProfileJson: { ...run.runnerProfileJson, nativeWorkspaceSync: { ...(run.runnerProfileJson!.nativeWorkspaceSync as object),
+        state: kind === "unexported" ? "prepared" : "finalized", finalHostSha256: "c".repeat(64), resourceDisposition: "destroy",
+        ...(kind === "wrong_allocation" ? { providerLeaseId: randomUUID() } : {}) } },
+    }).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(nativeRunFinalizations).set({ phase: "committed", ...(kind === "wrong_result" ? { resultId: null } : {}) }).where(eq(nativeRunFinalizations.runId, f.runId));
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
+    if (kind === "competing_owner") await db.insert(environmentLeases).values({ companyId, environmentId, status: "active", provider: lease.provider, providerLeaseId: lease.providerLeaseId });
+    const released = await releaseCompletedNativeWorkspaceExportRetention(db, lease);
+    const committed = ["complete", "committed_failed", "committed_cancelled"].includes(kind);
+    if (committed) expect(released).toMatchObject({ id: lease.id, metadata: expect.not.objectContaining({ nativeWorkspaceExportResume: expect.anything() }) });
+    else expect(released).toBeNull();
+    const [after] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
+    expect(Boolean(after.metadata?.nativeWorkspaceExportResume)).toBe(!committed);
+  });
   it("records a recoverable stop-only intent before the provider can resume", async () => {
     const f = await seed();
     const runtime = f.request.environmentRuntime as { resumeRunLease: ReturnType<typeof vi.fn>; retryPendingSandboxTeardown: ReturnType<typeof vi.fn> };
@@ -81,7 +135,7 @@ describe("board retry of accepted workspace export", () => {
     expect(runtime.retryPendingSandboxTeardown).not.toHaveBeenCalled();
     const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
     expect(lease.status).toBe("active");
-    expect(lease.metadata?.nativeWorkspaceExportResume).toBeUndefined();
+    expect(lease.metadata?.nativeWorkspaceExportResume).toMatchObject({ runId: f.runId, resultId: f.resultId });
   });
   it.each(["resume_reply_lost", "probe_failed", "admission_changed", "cancelled", "completed", "stop_failed"])("tracks and compensates a failed export resume: %s", async kind => {
     const f = await seed();
@@ -112,16 +166,16 @@ describe("board retry of accepted workspace export", () => {
     expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.runId)))[0]).toMatchObject({ phase: "terminal_failure", resultId: f.resultId });
     expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toHaveLength(0);
   });
-  it.each(["rebound_lease", "competing_owner", "late_stop_receipt"])("does not stop or overwrite a newer sandbox owner: %s", async kind => {
+  it.each(["rebound_lease", "competing_owner", "retained_owner", "late_stop_receipt"])("does not stop or overwrite a newer sandbox owner: %s", async kind => {
     const f = await seed();
     const runtime = f.request.environmentRuntime as { retryPendingSandboxTeardown: ReturnType<typeof vi.fn> };
     const rebound = async () => db.update(environmentLeases).set({ status: "active", heartbeatRunId: null,
       metadata: { newOwner: true }, cleanupStatus: null, releasedAt: null }).where(eq(environmentLeases.id, f.leaseId));
     probe.mockImplementationOnce(async () => {
       if (kind === "rebound_lease") await rebound();
-      if (kind === "competing_owner") {
+      if (kind === "competing_owner" || kind === "retained_owner") {
         const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
-        await db.insert(environmentLeases).values({ companyId, environmentId, status: "active", provider: lease.provider, providerLeaseId: lease.providerLeaseId });
+        await db.insert(environmentLeases).values({ companyId, environmentId, status: kind === "retained_owner" ? "retained" : "active", provider: lease.provider, providerLeaseId: lease.providerLeaseId });
       }
       throw new Error("probe failed after ownership changed");
     });
@@ -131,7 +185,7 @@ describe("board retry of accepted workspace export", () => {
     await expect(retryNativeWorkspaceExport(f.request)).rejects.toThrow();
     expect(runtime.retryPendingSandboxTeardown).toHaveBeenCalledTimes(kind === "late_stop_receipt" ? 1 : 0);
     const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
-    if (kind !== "competing_owner") expect(lease).toMatchObject({ status: "active", heartbeatRunId: null, metadata: { newOwner: true }, cleanupStatus: null });
+    if (kind !== "competing_owner" && kind !== "retained_owner") expect(lease).toMatchObject({ status: "active", heartbeatRunId: null, metadata: { newOwner: true }, cleanupStatus: null });
     expect(lease.metadata?.remoteExecutionTermination).toBeUndefined();
   });
   it.each(["missing", "replacement", "wrong_root"])("refuses an unproven resume without probing or acquiring replacement: %s", async kind => {
@@ -161,14 +215,14 @@ describe("board retry of accepted workspace export", () => {
     expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.runId)))[0]).toMatchObject({ phase: "result_accepted", failureCode: null, nextAttemptAt: null });
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0]).toMatchObject({ status: "running", nativePhase: "result_accepted" });
   });
-  it.each(["foreign_company", "missing_result", "newer_run", "lease_rebound", "other_lease", "unconfirmed_stop", "destroyed"])("rejects %s before probing or changing finalization", async (kind) => {
+  it.each(["foreign_company", "missing_result", "newer_run", "lease_rebound", "other_lease", "retained_lease", "unconfirmed_stop", "destroyed"])("rejects %s before probing or changing finalization", async (kind) => {
     const f = await seed();
     if (kind === "foreign_company") f.request.companyId = randomUUID();
     if (kind === "missing_result") await db.update(nativeRunFinalizations).set({ resultId: null }).where(eq(nativeRunFinalizations.runId, f.runId));
     if (kind === "newer_run") await db.insert(heartbeatRuns).values({ companyId, agentId, nativeIssueId: f.issueId, status: "failed", createdAt: new Date(Date.now() + 1000) });
-    if (kind === "other_lease") {
+    if (kind === "other_lease" || kind === "retained_lease") {
       const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
-      await db.insert(environmentLeases).values({ companyId, environmentId, issueId: f.issueId, status: "active", provider: lease.provider, providerLeaseId: lease.providerLeaseId });
+      await db.insert(environmentLeases).values({ companyId, environmentId, issueId: f.issueId, status: kind === "retained_lease" ? "retained" : "active", provider: lease.provider, providerLeaseId: lease.providerLeaseId });
     }
     if (kind === "lease_rebound") await db.update(environmentLeases).set({ heartbeatRunId: null }).where(eq(environmentLeases.id, f.leaseId));
     if (kind === "unconfirmed_stop" || kind === "destroyed") {
