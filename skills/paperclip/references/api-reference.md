@@ -120,6 +120,7 @@ The response also includes `blockedBy` and `blocks` arrays showing first-class d
   "parentId": "issue-50",
   "projectId": "proj-1",
   "goalId": null,
+  "summary": "Wire the login form to the auth API and handle token refresh.",
   "blockedBy": [
     { "id": "issue-80", "identifier": "PAP-80", "title": "Design auth schema", "status": "in_progress", "priority": "high", "assigneeAgentId": "agent-55", "assigneeUserId": null }
   ],
@@ -190,6 +191,8 @@ The response also includes `blockedBy` and `blocks` arrays showing first-class d
   ]
 }
 ```
+
+`summary` (≤ 600 chars, ≤ 3 paragraphs) is optional on create and update.
 
 Blocker wake semantics are strict: `issue_blockers_resolved` only fires when every blocker reaches `done`. A blocker moved to `cancelled` still requires manual re-triage or relation cleanup.
 
@@ -857,6 +860,8 @@ Project responses include `primaryWorkspace` and `workspaces`, which agents can 
 ## Governance and Approvals
 
 Some actions require board approval. You cannot bypass these gates.
+
+Approvals, standalone decisions and issue-thread interactions accept an optional top-level `brief` (see SKILL.md → Decision Briefs). A malformed brief returns 400; a `relatedWork` id outside the company, or a missing brief when the company sets `requireDecisionBrief`, returns 422.
 
 ### Requesting a hire (management only)
 

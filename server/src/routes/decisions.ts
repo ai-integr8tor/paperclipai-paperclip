@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import {
   createDecisionArchiveProposalSchema,
+  decisionBriefSchema,
   decisionInputsSchema,
   decisionOptionsSchema,
   type AttentionArchiveManifestEntry,
@@ -17,11 +18,13 @@ import { attentionService } from "../services/attention.js";
 import { authorizationDeniedDetails, authorizationService } from "../services/authorization.js";
 import { canReadDecisionSource } from "../services/decision-queues.js";
 import { hashAttentionArchiveManifest } from "../services/decision-retention.js";
+import { buildArchiveProposalBrief } from "../services/decision-brief.js";
 import { forbidden, unprocessable } from "../errors.js";
 
 const createSchema = z.object({
   title: z.string().trim().min(1).max(500),
   body: z.string().max(100_000),
+  brief: decisionBriefSchema.nullable().optional(),
   ruleKey: z.string().trim().max(240).nullable().optional(),
   options: decisionOptionsSchema,
   inputs: decisionInputsSchema.nullable().optional(),
@@ -122,6 +125,7 @@ export function decisionRoutes(db: Db, options: DecisionServiceOptions) {
         ...agent,
         title: `Archive ${manifest.length} aging decision${manifest.length === 1 ? "" : "s"}?`,
         body,
+        brief: buildArchiveProposalBrief(manifest.length),
         ruleKey: "attention.bulk_archive",
         idempotencyKey: proposal.idempotencyKey ?? `attention-archive:${manifestHash}:${agent.runId}`,
         continuationPolicy: "wake_origin_agent",

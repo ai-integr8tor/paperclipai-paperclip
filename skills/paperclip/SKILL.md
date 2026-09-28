@@ -286,6 +286,13 @@ POST /api/companies/{companyId}/approvals
     "summary": "Estimated cost is $42/month for provider X.",
     "recommendedAction": "Approve provider X and continue setup.",
     "risks": ["Costs may increase with usage."]
+  },
+  "brief": {
+    "version": 1,
+    "whatIsHappening": "I'm provisioning hosting for the staging environment requested in CAT-33 (Stage rollout).",
+    "whyStopped": "Provider X costs $42/month; this crosses the board's spend-approval threshold.",
+    "whatWeNeed": "Approve the $42/month spend so I can finish provisioning today.",
+    "recommendation": "Approve — the cost is within the agreed staging budget."
   }
 }
 ```
@@ -321,6 +328,30 @@ Key shared semantics:
 - **Idempotency.** Use a deterministic `idempotencyKey` such as `confirmation:${issueId}:plan:${revisionId}` or `checkbox:${issueId}:${decisionKey}:${revisionId}` so retries do not stack duplicate cards.
 - **Source issue posture.** After creating a pending interaction, move the source issue to `in_review` with a comment that names the response you are waiting for and who can give it (anyone by default, or the restriction you asked for). When a `request_confirmation` or `request_checkbox_confirmation` is the issue review request, include its returned id as `reviewInteractionId` in that PATCH. This explicit binding lets policy-eligible agents submit the review verdict without granting the same authority to unrelated pending confirmations. The pending interaction is the explicit waiting path.
 
+### Decision Briefs
+
+Humans answering your questions do not see your run. Give them the context in a `brief`:
+
+```json
+"brief": {
+  "version": 1,
+  "whatIsHappening": "I'm integrating the payment gateway the CTO requested in CAT-50 (Checkout v2). Cart and order flow (CAT-58) are done.",
+  "whyStopped": "Stripe and Adyen both meet the requirements. The choice changes monthly cost (~$120 vs ~$300) and the delivery date.",
+  "whatWeNeed": "Pick a provider. With Stripe I continue today; with Adyen I need Finance's contract details first.",
+  "recommendation": "Stripe — faster, and our volume is below Adyen's pricing tier."
+}
+```
+
+- **When:** on every interaction a human may answer (default `anyone`, `human_only`, or `addresseeUserId`), every standalone decision, and every approval you request through `POST /api/companies/{companyId}/approvals`. Optional when you address another agent with `addresseeAgentId`. A company may require it; a missing brief then fails with 422.
+- **whatIsHappening:** the work in progress, who requested it, and the parent task.
+- **whyStopped:** the concrete fact that blocked you and why the decision is not yours to make.
+- **whatWeNeed:** the question and the consequence of each option. Put your pick in `recommendation`, not here.
+- **relatedWork** (optional, max 8): only links Paperclip cannot see, e.g. `{ "note": "Finance promised the Adyen contract by email yesterday." }`. Parent, sibling and blocker tasks are shown automatically — do not restate them. `issueId`/`agentId` must be ids in this company.
+- **Mentions:** the first time you mention a task, write its title: `CAT-61 (Integrate gateway)`.
+- Limits: each paragraph ≤ 1200 chars, `recommendation` ≤ 400, each `relatedWork.note` ≤ 300.
+
+When you create or delegate a task, set `summary`: what the task is for and its expected outcome, in up to 3 short paragraphs (≤ 600 chars). It is shown whenever the task is mentioned.
+
 ### Standalone Decisions
 
 Create a decision from an issue-scoped agent run with `POST /api/companies/{companyId}/decisions`:
@@ -329,6 +360,13 @@ Create a decision from an issue-scoped agent run with `POST /api/companies/{comp
 {
   "title": "Reassign the blocked launch issue?",
   "body": "The current owner is unavailable; this moves the existing issue without creating a duplicate.",
+  "brief": {
+    "version": 1,
+    "whatIsHappening": "I'm running the launch checklist for CAT-70 (Ship v2) and found the owning issue stalled.",
+    "whyStopped": "The current assignee agent has been unavailable for two days and the launch window closes tomorrow.",
+    "whatWeNeed": "Decide whether to reassign the issue to me now or leave it for the owner to resume.",
+    "recommendation": "Reassign — the launch window is tight and I can pick this up immediately."
+  },
   "ruleKey": "routing.reassign_blocked_issue",
   "options": [
     {
@@ -362,6 +400,13 @@ Bundle related cross-issue decisions with `POST /api/companies/{companyId}/decis
     {
       "title": "Reassign owner?",
       "body": "Move the issue to the recovery owner.",
+      "brief": {
+        "version": 1,
+        "whatIsHappening": "I'm running launch recovery for CAT-70 (Ship v2) after the outage in CAT-71.",
+        "whyStopped": "The original owner is unreachable and the blocker cleanup depends on who owns the issue next.",
+        "whatWeNeed": "Decide whether to reassign ownership to the recovery agent.",
+        "recommendation": "Reassign — the recovery agent is already staffed and available."
+      },
       "ruleKey": "routing.reassign",
       "options": [
         { "id": "reassign", "label": "Reassign", "effects": [{ "type": "assign_issue", "targetIssueId": "{issueId}", "staleness": "strict", "assigneeAgentId": "{agentId}" }] },
@@ -372,6 +417,13 @@ Bundle related cross-issue decisions with `POST /api/companies/{companyId}/decis
     {
       "title": "Clear obsolete blocker?",
       "body": "Remove the resolved dependency from the blocked issue.",
+      "brief": {
+        "version": 1,
+        "whatIsHappening": "I'm running launch recovery for CAT-70 (Ship v2) and found a blocker that predates the fix in CAT-71.",
+        "whyStopped": "The blocking issue was resolved a different way, so the recorded dependency may now be stale.",
+        "whatWeNeed": "Decide whether to clear the blocker or keep it while we verify the fix independently.",
+        "recommendation": "Clear the blocker — the dependency was resolved by the CAT-71 fix."
+      },
       "ruleKey": "blockers.clear_obsolete",
       "options": [
         { "id": "clear", "label": "Clear blocker", "effects": [{ "type": "resolve_blocker", "targetIssueId": "{issueId}", "staleness": "strict", "removeBlockedByIssueIds": ["{blockerIssueId}"] }] },
@@ -394,6 +446,13 @@ POST /api/issues/{issueId}/interactions
   "idempotencyKey": "checkbox:{issueId}:cleanup-files:{planRevisionId}",
   "title": "Confirm files to delete",
   "summary": "Pick the files you want removed before I run the cleanup.",
+  "brief": {
+    "version": 1,
+    "whatIsHappening": "I'm cleaning up leftover exports from the March QA pass on CAT-45 (Cleanup workspace).",
+    "whyStopped": "Some of these files might still be referenced elsewhere; deleting the wrong ones is hard to undo.",
+    "whatWeNeed": "Confirm which files are safe to delete before I run the cleanup.",
+    "recommendation": "Delete the pre-selected files — I've cross-checked them against current references."
+  },
   "continuationPolicy": "wake_assignee",
   "payload": {
     "version": 1,

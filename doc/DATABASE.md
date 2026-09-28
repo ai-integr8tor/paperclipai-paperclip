@@ -236,6 +236,8 @@ This policy makes training exports self-describing while keeping the decision re
 
 The decisions desk stores queue membership, decide-by/snooze state, and retention state in `decision_queues`, `decision_queue_items`, `decision_triage`, and `decision_retention`. These sidecars use the stable attention identity `(source_kind, source_id)` so all attention source kinds can participate without copying source titles, bodies, projects, or other visibility-sensitive data.
 
+`issue_thread_interactions.brief`, `decisions.brief`, and `approvals.brief` hold the optional agent-written decision brief (JSON, `version: 1`). `issues.summary` is an optional short task summary. `companies.require_decision_brief` makes the brief mandatory for human-facing items.
+
 `decision_triage_events` is append-only history for queue and triage changes. Current rows and history both carry server-derived user/agent, heartbeat run, API-key, and responsible-user attribution where applicable. Queue reads must resolve and authorize their source rows at read time; a sidecar row is never a visibility grant.
 
 Triage writes serialize on the company and attention-source identity so concurrent partial updates preserve both fields and produce monotonic history versions.

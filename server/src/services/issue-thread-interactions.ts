@@ -1,4 +1,5 @@
 import { currentContinuationOrigins } from "./execution-continuation.js";
+import { decisionBriefGuard } from "./decision-brief.js";
 import { assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
 import { connectionIntentDeliveries } from "@paperclipai/db";
 import { isDeepStrictEqual } from "node:util";
@@ -153,6 +154,12 @@ async function assertInteractionRunWriteAllowed(tx: Db, issue: { id: string; com
 type CreateInteractionOptions = {
   /** Keep independently owned pending cards actionable. Internal runtime bridges use this. */
   supersedePendingSiblingInteractions?: boolean;
+  /**
+   * Server-authored card with no agent author to write a decision brief.
+   * Skips the company's requireDecisionBrief enforcement; a supplied brief is
+   * still validated against the company boundary.
+   */
+  systemGenerated?: boolean;
 };
 
 type InteractionWakeup = (
@@ -3419,6 +3426,15 @@ export function issueThreadInteractionService(
         }
       }
 
+      await decisionBriefGuard(db).assertAllowed({
+        companyId: issue.companyId,
+        brief: normalizedData.brief ?? null,
+        humanFacing: options.systemGenerated
+          ? false
+          : policy.effectiveResolverPolicy === "human_only" ||
+            Boolean(normalizedData.addresseeUserId),
+      });
+
       if (data.sourceCommentId) {
         const sourceComment = await db
           .select({
@@ -3526,6 +3542,7 @@ export function issueThreadInteractionService(
               sourceIdentityContextId,
               title: data.title ?? null,
               summary: data.summary ?? null,
+              brief: data.brief ?? null,
               createdByAgentId: actor.agentId ?? null,
               addresseeAgentId: data.addresseeAgentId ?? null,
               addresseeUserId: data.addresseeUserId ?? null,

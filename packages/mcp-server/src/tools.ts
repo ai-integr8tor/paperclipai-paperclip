@@ -9,6 +9,7 @@ import {
   connectionsSearchInputSchema,
   createApprovalSchema,
   createIssueInputSchema,
+  decisionBriefSchema,
   issueThreadInteractionContinuationPolicySchema,
   requestCheckboxConfirmationPayloadSchema,
   requestConfirmationPayloadSchema,
@@ -155,6 +156,7 @@ const createSuggestTasksToolSchema = z.object({
   summary: z.string().trim().max(1000).nullable().optional(),
   continuationPolicy: issueThreadInteractionContinuationPolicySchema.optional().default("wake_assignee"),
   payload: suggestTasksPayloadSchema,
+  brief: decisionBriefSchema.nullable().optional(),
 });
 
 const createAskUserQuestionsToolSchema = z.object({
@@ -166,6 +168,7 @@ const createAskUserQuestionsToolSchema = z.object({
   summary: z.string().trim().max(1000).nullable().optional(),
   continuationPolicy: issueThreadInteractionContinuationPolicySchema.optional().default("wake_assignee"),
   payload: askUserQuestionsPayloadSchema,
+  brief: decisionBriefSchema.nullable().optional(),
 });
 
 const createRequestConfirmationToolSchema = z.object({
@@ -177,6 +180,7 @@ const createRequestConfirmationToolSchema = z.object({
   summary: z.string().trim().max(1000).nullable().optional(),
   continuationPolicy: issueThreadInteractionContinuationPolicySchema.optional().default("none"),
   payload: requestConfirmationPayloadSchema,
+  brief: decisionBriefSchema.nullable().optional(),
 });
 
 const createRequestCheckboxConfirmationToolSchema = z.object({
@@ -188,6 +192,7 @@ const createRequestCheckboxConfirmationToolSchema = z.object({
   summary: z.string().trim().max(1000).nullable().optional(),
   continuationPolicy: issueThreadInteractionContinuationPolicySchema.optional().default("wake_assignee"),
   payload: requestCheckboxConfirmationPayloadSchema,
+  brief: decisionBriefSchema.nullable().optional(),
 });
 
 const approvalDecisionSchema = z.object({

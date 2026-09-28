@@ -127,6 +127,7 @@ describe("paperclip MCP tools", () => {
       priority: "medium",
       assigneeAgentId: "22222222-2222-2222-2222-222222222222",
       requestDepth: 0,
+      allowDuplicate: false,
     });
   });
 
@@ -253,6 +254,30 @@ describe("paperclip MCP tools", () => {
         tasks: [{ clientKey: "task-1", title: "One" }],
       },
     });
+  });
+
+  it.each([
+    ["paperclipRequestConfirmation", { version: 1, prompt: "Proceed with Stripe?" }],
+    ["paperclipAskUserQuestions", {
+      version: 1,
+      questions: [{ id: "q1", prompt: "Which?", selectionMode: "single", options: [{ id: "a", label: "A" }] }],
+    }],
+  ])("forwards the decision brief from %s to the interaction request body", async (toolName, payload) => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ id: "interaction-1" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const brief = {
+      version: 1,
+      whatIsHappening: "Integrating payments for the CTO.",
+      whyStopped: "Provider choice changes cost.",
+      whatWeNeed: "Confirm Stripe.",
+    };
+
+    await getTool(toolName).execute({ issueId: "PAP-1135", payload, brief });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(String(init.body))).toMatchObject({ brief });
   });
 
   it("creates request_confirmation interactions with plan target payloads", async () => {

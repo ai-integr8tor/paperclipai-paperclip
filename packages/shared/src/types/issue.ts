@@ -1,4 +1,5 @@
 import type { ExecutionProjection, ExecutionBlocker } from "./execution-projection.js";
+import type { DecisionBrief } from "./decision-brief.js";
 import type {
   IssueCommentAuthorType,
   IssueCommentMetadataRowType,
@@ -788,6 +789,8 @@ export interface Issue {
   title: string;
   description: string | null;
   descriptionTruncated?: boolean;
+  /** Up to 3 short paragraphs: what the task is for and its expected outcome. */
+  summary?: string | null;
   status: IssueStatus;
   workMode: IssueWorkMode;
   priority: IssuePriority;
@@ -1506,6 +1509,7 @@ export interface IssueThreadInteractionBase extends IssueThreadInteractionActorF
   addresseeUserId?: string | null;
   title?: string | null;
   summary?: string | null;
+  brief?: DecisionBrief | null;
   status: IssueThreadInteractionStatus;
   continuationPolicy: IssueThreadInteractionContinuationPolicy;
   /** @deprecated Read requestedResolverPolicy. Kept for API compatibility. */

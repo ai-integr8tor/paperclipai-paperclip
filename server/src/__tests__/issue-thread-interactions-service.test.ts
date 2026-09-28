@@ -4247,4 +4247,125 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       });
     });
   });
+
+  const confirmationInput = (extra: Record<string, unknown> = {}) => ({
+    kind: "request_confirmation" as const,
+    title: "Choose provider",
+    payload: { version: 1 as const, prompt: "Proceed with Stripe?" },
+    ...extra,
+  });
+  const sampleBrief = {
+    version: 1 as const,
+    whatIsHappening: "Integrating payments for the CTO.",
+    whyStopped: "Provider choice changes cost.",
+    whatWeNeed: "Confirm Stripe.",
+  };
+
+  it("persists and returns the interaction brief", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Brief round-trip");
+    const created = await interactionsSvc.create({ id: issueId, companyId }, confirmationInput({ brief: sampleBrief }), { userId: "board-user" });
+    expect(created.brief).toEqual(sampleBrief);
+    const [listed] = await interactionsSvc.listForIssue(issueId);
+    expect(listed.brief).toEqual(sampleBrief);
+  });
+
+  it("returns a null brief when omitted", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Brief omitted");
+    const created = await interactionsSvc.create({ id: issueId, companyId }, confirmationInput(), { userId: "board-user" });
+    expect(created.brief ?? null).toBeNull();
+  });
+
+  it("requires a brief for human_only interactions when the company flag is on", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Brief required");
+    await db.update(companies).set({ requireDecisionBrief: true }).where(eq(companies.id, companyId));
+    await expect(interactionsSvc.create(
+      { id: issueId, companyId }, confirmationInput({ resolverPolicy: "human_only" }), { userId: "board-user" },
+    )).rejects.toMatchObject({ status: 422 });
+  });
+
+  it("does not require a brief for default-audience interactions when the flag is on", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Brief exempt");
+    await db.update(companies).set({ requireDecisionBrief: true }).where(eq(companies.id, companyId));
+    const created = await interactionsSvc.create({ id: issueId, companyId }, confirmationInput(), { userId: "board-user" });
+    expect(created.status).toBe("pending");
+  });
+
+  it("rejects a brief with a foreign relatedWork issue", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Brief foreign");
+    const other = await seedConfirmationIssue("Other company");
+    await expect(interactionsSvc.create(
+      { id: issueId, companyId },
+      confirmationInput({ brief: { ...sampleBrief, relatedWork: [{ issueId: other.issueId, note: "n" }] } }),
+      { userId: "board-user" },
+    )).rejects.toMatchObject({ status: 422 });
+  });
+
+  it("creates a system-generated human_only interaction without a brief when the flag is on", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Brief system-generated");
+    await db.update(companies).set({ requireDecisionBrief: true }).where(eq(companies.id, companyId));
+    const created = await interactionsSvc.create(
+      { id: issueId, companyId },
+      confirmationInput({ resolverPolicy: "human_only" }),
+      { userId: "board-user" },
+      { systemGenerated: true },
+    );
+    expect(created.status).toBe("pending");
+  });
+
+  it("still rejects a foreign relatedWork brief on a system-generated interaction", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Brief system-generated foreign");
+    const other = await seedConfirmationIssue("Other company system-generated");
+    await db.update(companies).set({ requireDecisionBrief: true }).where(eq(companies.id, companyId));
+    await expect(interactionsSvc.create(
+      { id: issueId, companyId },
+      confirmationInput({
+        resolverPolicy: "human_only",
+        brief: { ...sampleBrief, relatedWork: [{ issueId: other.issueId, note: "n" }] },
+      }),
+      { userId: "board-user" },
+      { systemGenerated: true },
+    )).rejects.toMatchObject({ status: 422 });
+  });
+
+  it("replays an idempotent interaction created before the brief flag was turned on", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Brief idempotent replay");
+    const input = confirmationInput({ resolverPolicy: "human_only", idempotencyKey: "brief-replay-1" });
+    const first = await interactionsSvc.create({ id: issueId, companyId }, input, { userId: "board-user" });
+    await db.update(companies).set({ requireDecisionBrief: true }).where(eq(companies.id, companyId));
+    const replay = await interactionsSvc.create({ id: issueId, companyId }, input, { userId: "board-user" });
+    expect(replay.id).toBe(first.id);
+  });
+
+  it("does not require a brief for agent-addressed default-audience interactions when the flag is on", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Brief agent addressee");
+    const addresseeAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: addresseeAgentId,
+      companyId,
+      name: "Addressee",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.update(companies).set({ requireDecisionBrief: true }).where(eq(companies.id, companyId));
+    const created = await interactionsSvc.create(
+      { id: issueId, companyId },
+      confirmationInput({ addresseeAgentId }),
+      { userId: "board-user" },
+    );
+    expect(created).toMatchObject({ status: "pending", addresseeAgentId });
+  });
+
+  it("requires a brief for user-addressed interactions when the flag is on", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Brief user addressee");
+    await db.update(companies).set({ requireDecisionBrief: true }).where(eq(companies.id, companyId));
+    await expect(interactionsSvc.create(
+      { id: issueId, companyId },
+      confirmationInput({ addresseeUserId: "user-board" }),
+      { userId: "board-user" },
+    )).rejects.toMatchObject({ status: 422 });
+  });
 });

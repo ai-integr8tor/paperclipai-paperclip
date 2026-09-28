@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { APPROVAL_TYPES } from "../constants.js";
+import { decisionBriefSchema } from "./decision-brief.js";
 import { multilineTextSchema } from "./text.js";
 
 export const createApprovalSchema = z.object({
@@ -7,6 +8,7 @@ export const createApprovalSchema = z.object({
   requestedByAgentId: z.string().guid().optional().nullable(),
   payload: z.record(z.string(), z.unknown()),
   issueIds: z.array(z.string().guid()).optional(),
+  brief: decisionBriefSchema.nullable().optional(),
 });
 
 export type CreateApproval = z.infer<typeof createApprovalSchema>;

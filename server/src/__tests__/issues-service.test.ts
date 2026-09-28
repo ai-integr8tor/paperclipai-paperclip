@@ -578,6 +578,27 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     expect(persisted?.assigneeAgentId).toBe(activeAgentId);
   });
 
+  it("persists the task summary through create and update", async () => {
+    const companyId = await seedAssignableAgentCompany();
+    const created = await svc.create(companyId, {
+      title: "Summarized task",
+      description: null,
+      status: "todo",
+      priority: "medium",
+      summary: "Why.\n\nOutcome.",
+    });
+    expect(created.summary).toBe("Why.\n\nOutcome.");
+    const reread = await svc.getById(created.id);
+    expect(reread?.summary).toBe("Why.\n\nOutcome.");
+    const [row] = await db.select({ summary: issues.summary }).from(issues).where(eq(issues.id, created.id));
+    expect(row?.summary).toBe("Why.\n\nOutcome.");
+
+    const updated = await svc.update(created.id, { summary: null });
+    expect(updated?.summary ?? null).toBeNull();
+    const rereadAfterUpdate = await svc.getById(created.id);
+    expect(rereadAfterUpdate?.summary ?? null).toBeNull();
+  });
+
   it("rejects checkout by a terminated agent before assigning the issue", async () => {
     const companyId = await seedAssignableAgentCompany();
     const terminatedAgentId = randomUUID();

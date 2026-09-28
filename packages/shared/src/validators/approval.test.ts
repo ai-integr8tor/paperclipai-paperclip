@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   addApprovalCommentSchema,
+  createApprovalSchema,
   requestApprovalRevisionSchema,
   resolveApprovalSchema,
 } from "./approval.js";
@@ -27,5 +28,11 @@ describe("approval validators", () => {
       .toBe("Decision\n\nApproved.");
     expect(requestApprovalRevisionSchema.parse({ decisionNote: "Decision\\r\\nRevise." }).decisionNote)
       .toBe("Decision\nRevise.");
+  });
+
+  it("accepts an optional decision brief", () => {
+    const brief = { version: 1, whatIsHappening: "a", whyStopped: "b", whatWeNeed: "c" };
+    expect(createApprovalSchema.parse({ type: "request_board_approval", payload: {}, brief }).brief).toEqual(brief);
+    expect(createApprovalSchema.safeParse({ type: "request_board_approval", payload: {}, brief: { version: 1 } }).success).toBe(false);
   });
 });

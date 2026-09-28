@@ -41,6 +41,7 @@ import {
   trustAuthorizationPolicySchema,
 } from "./trust-policy.js";
 import { objectWithoutDefaults } from "./partial.js";
+import { decisionBriefSchema } from "./decision-brief.js";
 
 export const issueBlockedInboxStateSchema = z.enum([
   "needs_attention",
@@ -678,6 +679,21 @@ function withCreateIssueStatusDefault<T extends z.ZodRawShape>(
   }, schema);
 }
 
+export const ISSUE_SUMMARY_LIMITS = { maxLength: 600, maxParagraphs: 3 } as const;
+
+export const issueSummarySchema = multilineTextSchema
+  .pipe(
+    z
+      .string()
+      .trim()
+      .max(ISSUE_SUMMARY_LIMITS.maxLength)
+      .refine(
+        (value) => value.split(/\n\s*\n/).filter((paragraph) => paragraph.trim()).length <= ISSUE_SUMMARY_LIMITS.maxParagraphs,
+        { message: `summary must have at most ${ISSUE_SUMMARY_LIMITS.maxParagraphs} paragraphs` },
+      ),
+  )
+  .transform((value) => (value.length > 0 ? value : null));
+
 const createIssueBaseSchema = z.object({
   projectId: z.string().guid().optional().nullable(),
   projectWorkspaceId: z.string().guid().optional().nullable(),
@@ -699,6 +715,7 @@ const createIssueBaseSchema = z.object({
   inheritExecutionWorkspaceFromIssueId: z.string().guid().optional().nullable(),
   title: z.string().min(1),
   description: multilineTextSchema.optional().nullable(),
+  summary: issueSummarySchema.optional().nullable(),
   status: z.enum(ISSUE_STATUSES),
   workMode: z.enum(ISSUE_WORK_MODES).optional().default("standard"),
   harnessKind: z.enum(ISSUE_HARNESS_KINDS).optional().nullable(),
@@ -1875,6 +1892,7 @@ const createIssueThreadInteractionCommon = {
   resolverPolicy: issueThreadInteractionResolverPolicySchema.optional(),
   addresseeAgentId: z.string().guid().nullable().optional(),
   addresseeUserId: z.string().trim().min(1).nullable().optional(),
+  brief: decisionBriefSchema.nullable().optional(),
 };
 
 // Validate dual representations on creation, not when reading historical rows.

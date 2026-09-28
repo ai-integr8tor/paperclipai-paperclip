@@ -299,6 +299,39 @@ describeEmbeddedPostgres("tool gateway service", () => {
     })).rejects.toMatchObject({ reasonCode: "action_not_approved" });
   });
 
+  it("posts the tool-action approval card when the company requires decision briefs", async () => {
+    const { company, agent, run } = await createRunFixture(db);
+    await db.update(companies).set({ requireDecisionBrief: true }).where(eq(companies.id, company.id));
+    await db.insert(toolPolicies).values({
+      companyId: company.id,
+      name: "Review note writes",
+      policyType: "require_approval",
+      selectors: { toolName: "mcp-remote-fixture:update_note" },
+    });
+    const gateway = createTestToolGatewayService(db);
+    const session = await gateway.createSession({
+      companyId: company.id,
+      agentId: agent.id,
+      runId: run.id,
+    });
+
+    await expect(gateway.executeTool({
+      sessionToken: session.token,
+      tool: "mcp-remote-fixture:update_note",
+      parameters: { noteId: "n1", body: "short" },
+    })).rejects.toMatchObject({ reasonCode: "approval_required" });
+
+    const [actionRequest] = await db.select().from(toolActionRequests);
+    expect(actionRequest).toMatchObject({ status: "pending", issueId: session.issueId });
+    const [interaction] = await db.select().from(issueThreadInteractions);
+    expect(interaction).toMatchObject({
+      kind: "request_confirmation",
+      status: "pending",
+      issueId: session.issueId,
+      effectiveResolverPolicy: "human_only",
+    });
+  });
+
   it("approves a pending action request directly from the review queue and preserves signed arguments", async () => {
     const { company, agent, issue, run } = await createRunFixture(db);
     // Real runner calls carry immutable identity in their signed approval.
