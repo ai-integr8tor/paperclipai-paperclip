@@ -202,6 +202,42 @@ describe("TypeSafe worker OneCLI launcher boundary", () => {
     await manager.stopAll();
     await expect(access(path.join(tmpdir(), created[0]!))).rejects.toThrow();
   });
+
+  it("bounds a stalled OneCLI environment setup and allows shutdown to finish", async () => {
+    const manager = createPluginWorkerManager({
+      getOneCliContainerConfig: vi.fn(() => new Promise(() => undefined)),
+      workerEnvironmentSetupTimeoutMs: 5,
+    });
+    await expect(manager.startWorker("typesafe", workerOptions())).rejects.toThrow(
+      "environment setup timed out after 5ms",
+    );
+    await expect(manager.stopAll()).resolves.toBeUndefined();
+    expect(manager.getWorker("typesafe")).toBeUndefined();
+  });
+
+  it("serializes overlapping stops before a replacement start", async () => {
+    const manager = createPluginWorkerManager({
+      getOneCliContainerConfig: vi.fn(async () => containerConfig),
+    });
+    const original = await manager.startWorker("typesafe", workerOptions());
+    let releaseStop!: () => void;
+    const stopGate = new Promise<void>((resolve) => { releaseStop = resolve; });
+    const originalStop = original.stop.bind(original);
+    vi.spyOn(original, "stop").mockImplementation(async () => {
+      await stopGate;
+      await originalStop();
+    });
+
+    const firstStop = manager.stopWorker("typesafe");
+    const secondStop = manager.stopWorker("typesafe");
+    const replacementStart = manager.startWorker("typesafe", workerOptions());
+    releaseStop();
+    await Promise.all([firstStop, secondStop]);
+    const replacement = await replacementStart;
+    expect(replacement).not.toBe(original);
+    expect(manager.getWorker("typesafe")).toBe(replacement);
+    await manager.stopAll();
+  });
 });
 
 describe("resolveRpcCallTimeoutMs", () => {

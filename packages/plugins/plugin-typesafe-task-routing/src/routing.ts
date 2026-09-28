@@ -18,8 +18,11 @@ import {
 
 const TERMINAL_STATUSES = new Set(["done", "cancelled"]);
 const GATED_ACTION_PATTERN = /\b(refund|capture|void|authorize|re-?auth|store credit|gift card|payment|gateway|send|email|text|sms|publish|public reply|direct message)\b/i;
-const ACTION_REQUEST_PATTERN = /\b(execute|process|issue|apply|run|send|publish|post|reply|change|update|write|approve)\b/i;
 const ROUTING_ENTITY_TYPE = "typesafe-routing-recommendation";
+const OCC_COMPANY_ID = "a07c1334-f3d6-446e-9aab-349cca2e5a9a";
+const AVAILABLE_AGENT_STATUSES = new Set(["active", "idle", "running"]);
+const PROBABILITY_SUM_TOLERANCE = 1e-6;
+const MAX_EVALUATION_DELIVERIES = 2;
 const inFlightEvaluations = new Map<string, Promise<string>>();
 
 export type RoutingDecision = {
@@ -54,6 +57,7 @@ type RecommendationRecord = {
   probabilities: Record<string, number> | null;
   sufficiencyProbability: number | null;
   latencyMs: number;
+  attempts: number;
   usage: { inputTokens: number; outputTokens: number } | null;
   status: "recommended" | "failed";
   reason: string;
@@ -140,7 +144,7 @@ export function eligibilityReason(issue: Issue, project: Project | null, goal: u
   if (issue.parentId) return "child_issue";
   if (hasPrescribedOwner(project, goal)) return "prescribed_owner";
   const text = `${issue.title}\n${issue.description ?? ""}`;
-  if (GATED_ACTION_PATTERN.test(text) && ACTION_REQUEST_PATTERN.test(text)) return "governed_action";
+  if (GATED_ACTION_PATTERN.test(text)) return "governed_action";
   return null;
 }
 
@@ -166,25 +170,48 @@ function isDestination(value: string): value is DestinationKey {
   return Object.prototype.hasOwnProperty.call(DESTINATIONS, value);
 }
 
+function hasExactKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+}
+
 function resolveDecision(decision: RoutingDecision): { destination: DestinationKey; reason: string } {
+  if (!hasExactKeys(decision, ["model", "department", "sufficiency", "usage"])) {
+    return { destination: "needs_triage", reason: "invalid_response_schema" };
+  }
   if (decision.model !== MODEL_VERSION) return { destination: "needs_triage", reason: "unexpected_model" };
-  if (decision.department.type !== "choice" || decision.sufficiency.type !== "noul") {
+  if (
+    !hasExactKeys(decision.department, ["type", "choice", "confidence", "probabilities"]) ||
+    !hasExactKeys(decision.sufficiency, ["type", "noul"]) ||
+    !hasExactKeys(decision.usage, ["input_tokens", "output_tokens"]) ||
+    decision.department.type !== "choice" ||
+    decision.sufficiency.type !== "noul"
+  ) {
     return { destination: "needs_triage", reason: "invalid_response_type" };
   }
   if (!isDestination(decision.department.choice)) return { destination: "needs_triage", reason: "unknown_destination" };
+  if (!hasExactKeys(decision.department.probabilities, Object.keys(DESTINATIONS))) {
+    return { destination: "needs_triage", reason: "invalid_probability_keys" };
+  }
   const probabilities = Object.entries(decision.department.probabilities)
     .filter((entry): entry is [string, number] => Number.isFinite(entry[1]) && entry[1] >= 0 && entry[1] <= 1)
     .sort((a, b) => b[1] - a[1]);
   if (
-    probabilities.length < 2 ||
-    probabilities.length !== Object.keys(decision.department.probabilities).length ||
-    !Object.prototype.hasOwnProperty.call(decision.department.probabilities, decision.department.choice) ||
+    probabilities.length !== Object.keys(DESTINATIONS).length ||
+    Math.abs(probabilities.reduce((sum, [, probability]) => sum + probability, 0) - 1) > PROBABILITY_SUM_TOLERANCE ||
+    probabilities[0]?.[0] !== decision.department.choice ||
     !Number.isFinite(decision.department.confidence) ||
     decision.department.confidence < 0 ||
     decision.department.confidence > 1 ||
     !Number.isFinite(decision.sufficiency.noul) ||
     decision.sufficiency.noul < 0 ||
-    decision.sufficiency.noul > 1
+    decision.sufficiency.noul > 1 ||
+    !Number.isInteger(decision.usage.input_tokens) ||
+    decision.usage.input_tokens < 0 ||
+    !Number.isInteger(decision.usage.output_tokens) ||
+    decision.usage.output_tokens < 0
   ) {
     return { destination: "needs_triage", reason: "invalid_probabilities" };
   }
@@ -222,6 +249,7 @@ async function evaluateAndRecord(
   config: RoutingConfig,
   client: RoutingDecisionClient | undefined,
   clientFactory: () => RoutingDecisionClient,
+  attempt: number,
 ): Promise<string> {
   const startedAt = performance.now();
   try {
@@ -229,6 +257,23 @@ async function evaluateAndRecord(
     const decision = await decisionClient.decide(state, config);
     const latencyMs = Math.round(performance.now() - startedAt);
     const resolved = resolveDecision(decision);
+    const currentIssue = await ctx.issues.get(issue.id, issue.companyId);
+    if (!currentIssue) return "missing";
+    const currentProject = currentIssue.projectId ? await ctx.projects.get(currentIssue.projectId, issue.companyId) : null;
+    const currentGoal = currentIssue.goalId ? await ctx.goals.get(currentIssue.goalId, issue.companyId) : null;
+    const currentIneligible = eligibilityReason(currentIssue, currentProject, currentGoal);
+    if (currentIneligible) return currentIneligible;
+    if (computeInputRevision(inputState(currentIssue, currentProject)) !== inputRevision) return "stale_input";
+
+    let destination = resolved.destination;
+    let reason = resolved.reason;
+    if (destination !== "needs_triage") {
+      const agent = await ctx.agents.get(DESTINATIONS[destination], issue.companyId);
+      if (!agent || agent.companyId !== issue.companyId || !AVAILABLE_AGENT_STATUSES.has(agent.status)) {
+        destination = "needs_triage";
+        reason = "unavailable_destination";
+      }
+    }
     await record(ctx, issue, inputRevision, {
       issueId: issue.id,
       inputRevision,
@@ -237,17 +282,18 @@ async function evaluateAndRecord(
       requestedModelVersion: MODEL_VERSION,
       returnedModelVersion: decision.model,
       rawDecision: decision.department.choice,
-      effectiveDecision: resolved.destination,
-      recommendedAgentId: DESTINATIONS[resolved.destination],
+      effectiveDecision: destination,
+      recommendedAgentId: DESTINATIONS[destination],
       confidence: decision.department.confidence,
       probabilities: decision.department.probabilities,
       sufficiencyProbability: decision.sufficiency.noul,
       latencyMs,
+      attempts: attempt,
       usage: { inputTokens: decision.usage.input_tokens, outputTokens: decision.usage.output_tokens },
       status: "recommended",
-      reason: resolved.reason,
+      reason,
     });
-    return resolved.destination;
+    return destination;
   } catch (error) {
     try {
       await record(ctx, issue, inputRevision, {
@@ -264,6 +310,7 @@ async function evaluateAndRecord(
         probabilities: null,
         sufficiencyProbability: null,
         latencyMs: Math.round(performance.now() - startedAt),
+        attempts: attempt,
         usage: null,
         status: "failed",
         reason: errorType(error),
@@ -292,6 +339,7 @@ export async function evaluateIssue(
   try {
     const config = normalizeConfig(await ctx.config.get(companyId));
     if (!config.enabled) return "disabled";
+    if (companyId !== OCC_COMPANY_ID) return "wrong_company";
 
     const issue = await ctx.issues.get(issueId, companyId);
     if (!issue) return "missing";
@@ -304,13 +352,20 @@ export async function evaluateIssue(
     const inputRevision = computeInputRevision(state);
     const externalId = `${issue.id}:${inputRevision}:${POLICY_VERSION}`;
     const existing = await ctx.entities.list({ entityType: ROUTING_ENTITY_TYPE, scopeKind: "issue", scopeId: issue.id, externalId, limit: 1 });
-    if (existing.length > 0) return "duplicate";
+    if (existing.some((entity) => entity.status !== "failed")) return "duplicate";
+    const previousAttempts = existing.reduce((maximum, entity) => {
+      const attempts = entity.data && typeof entity.data === "object" && "attempts" in entity.data
+        ? (entity.data as { attempts?: unknown }).attempts
+        : 0;
+      return typeof attempts === "number" && Number.isInteger(attempts) ? Math.max(maximum, attempts) : maximum;
+    }, 0);
+    if (previousAttempts >= MAX_EVALUATION_DELIVERIES) return "retry_exhausted";
 
     const inFlightKey = `${companyId}:${externalId}`;
     const existingEvaluation = inFlightEvaluations.get(inFlightKey);
     if (existingEvaluation) return existingEvaluation;
 
-    const evaluation = evaluateAndRecord(ctx, issue, inputRevision, state, config, client, clientFactory);
+    const evaluation = evaluateAndRecord(ctx, issue, inputRevision, state, config, client, clientFactory, previousAttempts + 1);
     inFlightEvaluations.set(inFlightKey, evaluation);
     try {
       return await evaluation;

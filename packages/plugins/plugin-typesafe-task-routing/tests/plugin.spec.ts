@@ -4,7 +4,25 @@ import type { Issue } from "@paperclipai/plugin-sdk";
 import manifest from "../src/manifest.js";
 import { createOneCliGatewayFetch, evaluateIssue, type RoutingDecision, type RoutingDecisionClient } from "../src/routing.js";
 
-const COMPANY_ID = "company-1";
+const COMPANY_ID = "a07c1334-f3d6-446e-9aab-349cca2e5a9a";
+
+function probabilities(overrides: Record<string, number> = {}) {
+  return {
+    engineering: 0.90,
+    distributor_sync: 0.01,
+    project_management: 0.01,
+    customer_support: 0.01,
+    revenue: 0.01,
+    inventory: 0.01,
+    fraud: 0.01,
+    email_marketing: 0.01,
+    social_media: 0.01,
+    content_seo: 0.01,
+    search_performance: 0.005,
+    needs_triage: 0.005,
+    ...overrides,
+  };
+}
 
 function issue(overrides: Partial<Issue> = {}): Issue {
   return {
@@ -54,7 +72,7 @@ function decision(overrides: Partial<RoutingDecision> = {}): RoutingDecision {
       type: "choice",
       choice: "engineering",
       confidence: 0.91,
-      probabilities: { engineering: 0.91, needs_triage: 0.05, revenue: 0.04 },
+      probabilities: probabilities(),
     },
     sufficiency: { type: "noul", noul: 0.89 },
     usage: { input_tokens: 420, output_tokens: 60 },
@@ -65,6 +83,11 @@ function decision(overrides: Partial<RoutingDecision> = {}): RoutingDecision {
 function setup(clientResult: RoutingDecision | Error, config: Record<string, unknown> = { enabled: true }) {
   const harness = createTestHarness({ manifest, config });
   harness.seed({ issues: [issue()] });
+  vi.spyOn(harness.ctx.agents, "get").mockImplementation(async (agentId, companyId) => ({
+    id: agentId,
+    companyId,
+    status: "active",
+  }) as never);
   const decide = vi.fn(async () => {
     if (clientResult instanceof Error) throw clientResult;
     return clientResult;
@@ -86,7 +109,7 @@ describe("TypeSafe task routing pilot", () => {
   });
 
   it("sends ambiguous probabilities to needs_triage", async () => {
-    const { harness, client } = setup(decision({ department: { type: "choice", choice: "engineering", confidence: 0.76, probabilities: { engineering: 0.44, revenue: 0.40, needs_triage: 0.16 } } }));
+    const { harness, client } = setup(decision({ department: { type: "choice", choice: "engineering", confidence: 0.76, probabilities: probabilities({ engineering: 0.42, revenue: 0.38, needs_triage: 0.12, distributor_sync: 0.01, project_management: 0.01, customer_support: 0.01, inventory: 0.01, fraud: 0.01, email_marketing: 0.01, social_media: 0.01, content_seo: 0.005, search_performance: 0.005 }) } }));
     expect(await evaluateIssue(harness.ctx, "issue-1", COMPANY_ID, client)).toBe("needs_triage");
     expect((await records(harness))[0]?.data.reason).toBe("ambiguous");
   });
@@ -108,6 +131,11 @@ describe("TypeSafe task routing pilot", () => {
   it("creates the decision client only after the worker reaches an eligible issue", async () => {
     const harness = createTestHarness({ manifest, config: { enabled: true } });
     harness.seed({ issues: [issue()] });
+    vi.spyOn(harness.ctx.agents, "get").mockImplementation(async (agentId, companyId) => ({
+      id: agentId,
+      companyId,
+      status: "active",
+    }) as never);
     const decide = vi.fn(async () => decision());
     const clientFactory = vi.fn((): RoutingDecisionClient => ({ decide }));
 
@@ -203,6 +231,104 @@ describe("TypeSafe task routing pilot", () => {
     expect(await evaluateIssue(harness.ctx, "issue-1", COMPANY_ID, client)).toBe("explicit_assignment");
     expect(decide).not.toHaveBeenCalled();
     expect(await records(harness)).toHaveLength(0);
+  });
+
+  it.each([
+    ["Refund order 123", "Customer requested a full refund."],
+    ["Capture payment", "Authorize the card now."],
+    ["Reply to customer", "Send an email with the result."],
+  ])("excludes direct governed action text without calling TypeSafe: %s", async (title, description) => {
+    const { harness, client, decide } = setup(decision());
+    harness.seed({ issues: [issue({ title, description })] });
+    expect(await evaluateIssue(harness.ctx, "issue-1", COMPANY_ID, client)).toBe("governed_action");
+    expect(decide).not.toHaveBeenCalled();
+  });
+
+  it("refuses enablement outside the OCC company", async () => {
+    const { harness, client, decide } = setup(decision());
+    expect(await evaluateIssue(harness.ctx, "issue-1", "other-company", client)).toBe("wrong_company");
+    expect(decide).not.toHaveBeenCalled();
+  });
+
+  it("escalates when the selected destination agent is unavailable", async () => {
+    const { harness, client } = setup(decision());
+    vi.mocked(harness.ctx.agents.get).mockResolvedValueOnce(null);
+    expect(await evaluateIssue(harness.ctx, "issue-1", COMPANY_ID, client)).toBe("needs_triage");
+    expect((await records(harness))[0]?.data).toMatchObject({
+      effectiveDecision: "needs_triage",
+      reason: "unavailable_destination",
+    });
+  });
+
+  it("does not persist a recommendation when assignment changes during evaluation", async () => {
+    const { harness } = setup(decision());
+    const client: RoutingDecisionClient = {
+      decide: vi.fn(async () => {
+        harness.seed({ issues: [issue({ assigneeAgentId: "human-selected-agent" })] });
+        return decision();
+      }),
+    };
+    expect(await evaluateIssue(harness.ctx, "issue-1", COMPANY_ID, client)).toBe("explicit_assignment");
+    expect(await records(harness)).toHaveLength(0);
+  });
+
+  it("does not persist a recommendation when routing input changes during evaluation", async () => {
+    const { harness } = setup(decision());
+    const client: RoutingDecisionClient = {
+      decide: vi.fn(async () => {
+        harness.seed({ issues: [issue({ description: "Changed while the request was in flight." })] });
+        return decision();
+      }),
+    };
+    expect(await evaluateIssue(harness.ctx, "issue-1", COMPANY_ID, client)).toBe("stale_input");
+    expect(await records(harness)).toHaveLength(0);
+  });
+
+  it("retries a later delivery after a failed evaluation record", async () => {
+    const { harness, client } = setup(new Error("temporary outage"));
+    expect(await evaluateIssue(harness.ctx, "issue-1", COMPANY_ID, client)).toBe("failed_open");
+    vi.mocked(client.decide).mockResolvedValueOnce(decision());
+    expect(await evaluateIssue(harness.ctx, "issue-1", COMPANY_ID, client)).toBe("engineering");
+    expect(client.decide).toHaveBeenCalledTimes(2);
+    expect((await records(harness))[0]?.status).toBe("recommended");
+  });
+
+  it("bounds repeated recovery deliveries after failures", async () => {
+    const { harness, client } = setup(new Error("persistent outage"));
+    expect(await evaluateIssue(harness.ctx, "issue-1", COMPANY_ID, client)).toBe("failed_open");
+    expect(await evaluateIssue(harness.ctx, "issue-1", COMPANY_ID, client)).toBe("failed_open");
+    expect(await evaluateIssue(harness.ctx, "issue-1", COMPANY_ID, client)).toBe("retry_exhausted");
+    expect(client.decide).toHaveBeenCalledTimes(2);
+    expect((await records(harness))[0]?.data).toMatchObject({ status: "failed", attempts: 2 });
+  });
+
+  it.each([
+    ["missing probability", probabilities({ engineering: undefined as never })],
+    ["extra probability", { ...probabilities(), invented: 0 }],
+    ["non-normalized probabilities", { ...probabilities(), engineering: 0.5 }],
+  ])("escalates an invalid closed probability map: %s", async (_label, invalidProbabilities) => {
+    const { harness, client } = setup(decision({
+      department: { type: "choice", choice: "engineering", confidence: 0.91, probabilities: invalidProbabilities },
+    }));
+    expect(await evaluateIssue(harness.ctx, "issue-1", COMPANY_ID, client)).toBe("needs_triage");
+  });
+
+  it("rejects a selected choice that is not the top probability", async () => {
+    const { harness, client } = setup(decision({
+      department: { type: "choice", choice: "engineering", confidence: 0.91, probabilities: probabilities({ engineering: 0.01, revenue: 0.91 }) },
+    }));
+    expect(await evaluateIssue(harness.ctx, "issue-1", COMPANY_ID, client)).toBe("needs_triage");
+    expect((await records(harness))[0]?.data.reason).toBe("invalid_probabilities");
+  });
+
+  it.each([
+    { input_tokens: -1, output_tokens: 2 },
+    { input_tokens: 1.5, output_tokens: 2 },
+    { input_tokens: 1, output_tokens: Number.NaN },
+  ])("rejects invalid usage counters", async (usage) => {
+    const { harness, client } = setup(decision({ usage }));
+    expect(await evaluateIssue(harness.ctx, "issue-1", COMPANY_ID, client)).toBe("needs_triage");
+    expect((await records(harness))[0]?.data.reason).toBe("invalid_probabilities");
   });
 
   it("defaults disabled and makes no request", async () => {

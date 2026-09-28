@@ -8,7 +8,7 @@ const manifest: PaperclipPluginManifestV1 = {
   description: "Records observation-only routing recommendations for eligible new issues.",
   author: "Oxford Cigar Company",
   categories: ["automation"],
-  capabilities: ["events.subscribe", "issues.read", "projects.read", "goals.read"],
+  capabilities: ["events.subscribe", "issues.read", "projects.read", "goals.read", "agents.read"],
   entrypoints: { worker: "./dist/worker.js" },
   instanceConfigSchema: {
     type: "object",
