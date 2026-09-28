@@ -1644,4 +1644,64 @@ process.exit(1);
       await fs.rm(root, { recursive: true, force: true });
     }
   });
+
+  it("mounts skill sources read-only in the workspace sandbox so CODEX_HOME skill links resolve", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-execute-sandbox-skills-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "codex");
+    const bwrapPath = path.join(root, "bwrap");
+    const codexHome = path.join(root, "codex-home");
+    const bwrapCapturePath = path.join(root, "bwrap.json");
+    await fs.mkdir(workspace, { recursive: true });
+    await writeFakeCodexCommand(commandPath);
+    // Records the bwrap argv, then runs the confined command without confinement.
+    await fs.writeFile(bwrapPath, `#!/usr/bin/env node
+const fs = require("node:fs");
+const argv = process.argv.slice(2);
+fs.writeFileSync(process.env.PAPERCLIP_TEST_BWRAP_CAPTURE, JSON.stringify(argv));
+const sep = argv.indexOf("--");
+const r = require("node:child_process").spawnSync(argv[sep + 1], argv.slice(sep + 2), { stdio: "inherit" });
+process.exit(r.status ?? 1);
+`, "utf8");
+    await fs.chmod(bwrapPath, 0o755);
+
+    const previousHome = process.env.HOME;
+    const previousPaperclipHome = process.env.PAPERCLIP_HOME;
+    process.env.HOME = root;
+    process.env.PAPERCLIP_HOME = path.join(root, "paperclip-home");
+
+    try {
+      await execute({
+        runId: "run-sandbox-skills",
+        agent: { id: "agent-1", companyId: "company-1", name: "Codex Coder", adapterType: "codex_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          engine: "cli",
+          command: commandPath,
+          cwd: workspace,
+          filesystemScope: "workspace",
+          filesystemSandboxCommand: bwrapPath,
+          env: { CODEX_HOME: codexHome, PAPERCLIP_TEST_BWRAP_CAPTURE: bwrapCapturePath },
+          promptTemplate: "Follow the paperclip heartbeat.",
+          paperclipSkillSync: { desiredSkills: ["paperclip"] },
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+      });
+
+      const bwrapArgs = JSON.parse(await fs.readFile(bwrapCapturePath, "utf8")) as string[];
+      const link = path.join(codexHome, "skills", "paperclip");
+      const source = path.resolve(path.dirname(link), await fs.readlink(link));
+      const bind = bwrapArgs.findIndex((arg, i) => arg === "--ro-bind" && bwrapArgs[i + 1] === source);
+      expect(bind).toBeGreaterThanOrEqual(0);
+      expect(bwrapArgs[bind + 2]).toBe(source);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousPaperclipHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
 });

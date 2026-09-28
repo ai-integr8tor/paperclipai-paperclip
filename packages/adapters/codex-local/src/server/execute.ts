@@ -998,7 +998,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ? {
             workspaceDir: effectiveExecutionCwd,
             filesystemScope,
-            managedPaths: [{ path: effectiveCodexHome, access: "rw" }],
+            managedPaths: [
+              { path: effectiveCodexHome, access: "rw" },
+              // CODEX_HOME/skills links each skill to its source; mount the sources so the links resolve.
+              ...codexSkillEntries
+                .filter((entry) => desiredSkillNames.includes(entry.key))
+                .map((entry) => ({ path: entry.source, access: "ro" as const })),
+            ],
             extraPaths: parseLocalProcessSandboxExtraPaths(config.filesystemExtraPaths),
             pathAliases: targetWorkspaceRealization?.mode === "copy"
               ? targetWorkspaceRealization.pathAliases
