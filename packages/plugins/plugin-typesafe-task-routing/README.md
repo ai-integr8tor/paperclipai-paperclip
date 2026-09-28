@@ -6,7 +6,9 @@ Observation-only Paperclip plugin for OCC routing policy `1.0.0`. It subscribes 
 
 The `enabled` instance setting defaults to `false`. Set it to `true` only for the approved pilot. Disable immediately by setting `enabled` back to `false` or disabling/uninstalling the plugin. No data migration or rollback is required; prior recommendation records remain audit evidence.
 
-Configure `apiKeyRef` with a company-scoped Paperclip managed secret. The worker resolves that reference at request time with `ctx.secrets.resolve` and passes the value directly to the SDK's in-memory `apiKey` option; it never stores the resolved value in plugin config, entities, state, or logs. The dependency is pinned to `@typesafe-ai/sdk@0.6.0`, and requests are pinned to immutable model `jev-1.13.0`.
+The worker requires a OneCLI-managed gateway transport and never receives the TypeSafe provider key. It supplies a non-secret SDK placeholder, accepts only `https://api.typesafe.ai` in its custom fetch, and fails closed unless its process starts with `ONECLI_GATEWAY=true`, an HTTPS proxy, Node environment-proxy support, and OneCLI CA trust. The gateway injects the real credential according to the worker identity's grant. The dependency is pinned to `@typesafe-ai/sdk@0.6.0`, and requests are pinned to immutable model `jev-1.13.0`.
+
+Production requires a dedicated OneCLI identity for this plugin worker, with only the existing TypeSafe secret granted, and its `getContainerConfig({ agent: "occ-typesafe-routing-plugin" })` result applied when the worker process is spawned. Do not use the Paperclip server's identity and do not copy the provider key into plugin config.
 
 ## Data handling
 

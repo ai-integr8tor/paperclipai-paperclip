@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
+import { access } from "node:fs/promises";
 import { choice, noul, TypeSafeClient } from "@typesafe-ai/sdk";
 import type { JsonValue } from "@typesafe-ai/sdk";
-import type { EnvSecretRefBinding, Issue, PluginContext, Project } from "@paperclipai/plugin-sdk";
+import type { Issue, PluginContext, Project } from "@paperclipai/plugin-sdk";
 import {
   DEPARTMENT_INSTRUCTIONS,
   DESTINATION_CRITERIA,
@@ -36,12 +37,7 @@ export interface RoutingDecisionClient {
   decide(state: Record<string, JsonValue>, options: { timeoutMs: number; maxRetries: number }): Promise<RoutingDecision>;
 }
 
-type RoutingConfig = {
-  apiKeyRef: EnvSecretRefBinding | null;
-  enabled: boolean;
-  timeoutMs: number;
-  maxRetries: number;
-};
+type RoutingConfig = { enabled: boolean; timeoutMs: number; maxRetries: number };
 
 type RecommendationRecord = {
   issueId: string;
@@ -62,12 +58,34 @@ type RecommendationRecord = {
   reason: string;
 };
 
-export function createTypeSafeDecisionClient(apiKey: string): RoutingDecisionClient {
+const TYPESAFE_API_ORIGIN = "https://api.typesafe.ai";
+const ONECLI_PLACEHOLDER_API_KEY = "onecli-gateway-managed";
+
+export function createOneCliGatewayFetch(
+  env: NodeJS.ProcessEnv = process.env,
+  fetchImpl: typeof globalThis.fetch = globalThis.fetch,
+): (input: string, init?: RequestInit) => Promise<Response> {
+  if (env.ONECLI_GATEWAY !== "true") throw new Error("OneCLI gateway is not enabled for this worker");
+  if (!env.HTTPS_PROXY) throw new Error("OneCLI HTTPS proxy is not configured for this worker");
+  if (env.NODE_USE_ENV_PROXY !== "1") throw new Error("Node environment proxy support is not enabled for this worker");
+  if (!env.NODE_EXTRA_CA_CERTS) throw new Error("OneCLI CA trust is not configured for this worker");
+
+  return async (input, init) => {
+    const url = new URL(input);
+    if (url.origin !== TYPESAFE_API_ORIGIN) throw new Error("TypeSafe transport refused an unexpected origin");
+    await access(env.NODE_EXTRA_CA_CERTS!);
+    return fetchImpl(input, init);
+  };
+}
+
+export function createTypeSafeDecisionClient(): RoutingDecisionClient {
+  const gatewayFetch = createOneCliGatewayFetch();
   return {
     async decide(state, options) {
       const client = new TypeSafeClient({
-        apiKey,
+        apiKey: ONECLI_PLACEHOLDER_API_KEY,
         defaultModel: MODEL_VERSION,
+        fetch: gatewayFetch,
         timeout: options.timeoutMs,
         retry: { maxRetries: options.maxRetries },
         logLevel: "warn",
@@ -93,19 +111,12 @@ export function createTypeSafeDecisionClient(apiKey: string): RoutingDecisionCli
   };
 }
 
-function isSecretRefBinding(value: unknown): value is EnvSecretRefBinding {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    && (value as { type?: unknown }).type === "secret_ref"
-    && typeof (value as { secretId?: unknown }).secretId === "string";
-}
-
 function numberConfig(value: unknown, fallback: number, min: number, max: number): number {
   return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max ? value : fallback;
 }
 
 export function normalizeConfig(raw: Record<string, unknown>): RoutingConfig {
   return {
-    apiKeyRef: isSecretRefBinding(raw.apiKeyRef) ? raw.apiKeyRef : null,
     enabled: raw.enabled === true,
     timeoutMs: numberConfig(raw.timeoutMs, 5000, 1000, 15000),
     maxRetries: numberConfig(raw.maxRetries, 1, 0, 2),
@@ -201,7 +212,7 @@ export async function evaluateIssue(
   issueId: string,
   companyId: string,
   client?: RoutingDecisionClient,
-  clientFactory: (apiKey: string) => RoutingDecisionClient = createTypeSafeDecisionClient,
+  clientFactory: () => RoutingDecisionClient = createTypeSafeDecisionClient,
 ): Promise<string> {
   const config = normalizeConfig(await ctx.config.get(companyId));
   if (!config.enabled) return "disabled";
@@ -223,9 +234,7 @@ export async function evaluateIssue(
   try {
     let decisionClient = client;
     if (!decisionClient) {
-      if (!config.apiKeyRef) throw new Error("TypeSafe API key secret reference is not configured");
-      const apiKey = await ctx.secrets.resolve(config.apiKeyRef, { companyId, configPath: "apiKeyRef" });
-      decisionClient = clientFactory(apiKey);
+      decisionClient = clientFactory();
     }
     const decision = await decisionClient.decide(state, config);
     const latencyMs = Math.round(performance.now() - startedAt);

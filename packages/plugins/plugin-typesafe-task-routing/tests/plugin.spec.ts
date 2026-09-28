@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { createTestHarness } from "@paperclipai/plugin-sdk/testing";
 import type { Issue } from "@paperclipai/plugin-sdk";
 import manifest from "../src/manifest.js";
-import { evaluateIssue, type RoutingDecision, type RoutingDecisionClient } from "../src/routing.js";
+import { createOneCliGatewayFetch, evaluateIssue, type RoutingDecision, type RoutingDecisionClient } from "../src/routing.js";
 
 const COMPANY_ID = "company-1";
 
@@ -105,20 +105,33 @@ describe("TypeSafe task routing pilot", () => {
     expect(JSON.stringify(record?.data)).not.toContain("provider unavailable");
   });
 
-  it("resolves the company secret at the worker boundary and never persists its value", async () => {
-    const secretRef = { type: "secret_ref" as const, secretId: "11111111-1111-4111-8111-111111111111", version: "latest" as const };
-    const harness = createTestHarness({ manifest, config: { enabled: true, apiKeyRef: secretRef } });
+  it("creates the decision client only after the worker reaches an eligible issue", async () => {
+    const harness = createTestHarness({ manifest, config: { enabled: true } });
     harness.seed({ issues: [issue()] });
-    const resolvedApiKey = "typesafe-test-key-never-persist";
-    const resolve = vi.spyOn(harness.ctx.secrets, "resolve").mockResolvedValue(resolvedApiKey);
     const decide = vi.fn(async () => decision());
-    const clientFactory = vi.fn((_apiKey: string): RoutingDecisionClient => ({ decide }));
+    const clientFactory = vi.fn((): RoutingDecisionClient => ({ decide }));
 
     expect(await evaluateIssue(harness.ctx, "issue-1", COMPANY_ID, undefined, clientFactory)).toBe("engineering");
-    expect(resolve).toHaveBeenCalledWith(secretRef, { companyId: COMPANY_ID, configPath: "apiKeyRef" });
-    expect(clientFactory).toHaveBeenCalledWith(resolvedApiKey);
+    expect(clientFactory).toHaveBeenCalledOnce();
     expect(decide).toHaveBeenCalledTimes(1);
-    expect(JSON.stringify(await records(harness))).not.toContain(resolvedApiKey);
+  });
+
+  it("fails closed when the OneCLI worker transport is unavailable", () => {
+    expect(() => createOneCliGatewayFetch({})).toThrow("OneCLI gateway is not enabled");
+    expect(() => createOneCliGatewayFetch({ ONECLI_GATEWAY: "true" })).toThrow("HTTPS proxy is not configured");
+  });
+
+  it("refuses custom-fetch requests outside the TypeSafe API origin", async () => {
+    const gatewayFetch = createOneCliGatewayFetch(
+      {
+        ONECLI_GATEWAY: "true",
+        HTTPS_PROXY: "http://gateway.invalid",
+        NODE_USE_ENV_PROXY: "1",
+        NODE_EXTRA_CA_CERTS: "/does/not/need/to/exist-for-rejected-hosts",
+      },
+      vi.fn(),
+    );
+    await expect(gatewayFetch("https://example.com/v1/systemone")).rejects.toThrow("unexpected origin");
   });
 
   it("fails open on a provider timeout", async () => {
