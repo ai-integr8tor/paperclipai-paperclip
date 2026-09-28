@@ -9,6 +9,7 @@ import {
   nativeRunFinalizations,
   workspaceOperations,
 } from "@paperclipai/db";
+import { classifyNativeWorkspaceFailure, type NativeWorkspaceFailureCode } from "./native-workspace-failure.js";
 import { workspaceOperationService } from "../workspace-operations.js";
 import { inspectManagedGitWorktreeBranch } from "../workspace-runtime.js";
 import { environmentService } from "../environments.js";
@@ -30,7 +31,7 @@ function readString(value: unknown) {
 }
 
 function workspaceSyncFailure(
-  code: "workspace_sync_out_failed" | "workspace_sync_out_unrecoverable",
+  code: NativeWorkspaceFailureCode,
 ) {
   return {
     status: "failed" as const,
@@ -223,12 +224,7 @@ export async function resumeNativeWorkspaceFinalization(input: {
           };
         } catch (error) {
           await ownership.assertHeld();
-          const code =
-            error instanceof Error &&
-            (error.message === "workspace_sync_out_unrecoverable" ||
-              error.message.includes("daytona_sandbox_not_found"))
-              ? "workspace_sync_out_unrecoverable"
-              : "workspace_sync_out_failed";
+          const { code } = classifyNativeWorkspaceFailure(error);
           return workspaceSyncFailure(code);
         }
       }

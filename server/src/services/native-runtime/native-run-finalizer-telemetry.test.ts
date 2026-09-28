@@ -1,3 +1,4 @@
+import { classifyNativeWorkspaceFailure } from "./native-workspace-failure.js";
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -702,6 +703,46 @@ describeEmbeddedPostgres("native run finalizer / status decision committer — a
         .where(eq(issues.id, fixture.issueId))
         .then((rows) => rows[0]?.status),
     ).resolves.toBe("blocked");
+  });
+
+  it("retains the accepted result and stops unsafe-archive retries after the first copy-back failure", async () => {
+    const fixture = await seedNativeRun();
+    const resultId = randomUUID();
+    const resultJson = { evidence: "accepted provider work" };
+    await db.insert(nativeRunResults).values({
+      id: resultId, companyId, issueId: fixture.issueId, runId: fixture.runId,
+      completionContractId: fixture.contractId, serverFingerprint: `fp-${resultId}`,
+      schemaStatus: "accepted", resultJson, canonicalSha256: `sha-${resultId}`,
+    });
+    await db.update(heartbeatRuns).set({ resultJson: { prpRunTerminalState: "succeeded" } })
+      .where(eq(heartbeatRuns.id, fixture.runId));
+    await db.insert(nativeRunFinalizations).values({
+      runId: fixture.runId, companyId, issueId: fixture.issueId,
+      phase: "workspace_finalizing", attempt: 1, resultId,
+    });
+    const workspaceFailure = classifyNativeWorkspaceFailure(new Error(
+      "Daytona syncOut refusing tarball link whose target escapes the extraction dir: .tools/pnpm -> /usr/bin/pnpm",
+    ));
+    const failure = await recordNativeFinalizationFailure({
+      db, runId: fixture.runId, error: new Error(workspaceFailure.failureCode),
+      projectRunStatus: true, failureScope: "workspace", permanent: workspaceFailure.permanent,
+    });
+    expect(failure).toMatchObject({
+      phase: "terminal_failure", failureCode: "native_workspace_sync_out_unsafe_archive",
+      nextAttemptAt: null, attempt: 1,
+    });
+    const coordinator = await db.select().from(nativeRunFinalizations)
+      .where(eq(nativeRunFinalizations.runId, fixture.runId)).then((rows) => rows[0]!);
+    expect(coordinator.resultId).toBe(resultId);
+    expect(coordinator.failureDetail).toMatchObject({
+      workspaceFinalizeAttempt: 1,
+      recoveryOwner: { kind: "board" },
+      nextAction: "Repair the unsafe link or path in the retained sandbox, then retry workspace export without submitting another provider turn.",
+    });
+    const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId)).then((rows) => rows[0]!);
+    expect(run.resultJson).toMatchObject({ prpRunTerminalState: "succeeded" });
+    expect(await db.select().from(nativeRunResults).where(eq(nativeRunResults.id, resultId)).then((rows) => rows[0]?.resultJson)).toEqual(resultJson);
+    expect(await db.select().from(issues).where(eq(issues.id, fixture.issueId)).then((rows) => rows[0]?.status)).toBe("blocked");
   });
 
   it("emits exactly one event for a cancel_continuations write (trap 2: :685/:518 overlap)", async () => {
