@@ -9396,6 +9396,41 @@ export function resolveHeartbeatSchedulingSuppression(
   return { suppressed: false, reason: null };
 }
 
+// Parses PAPERCLIP_ADAPTER_CONCURRENCY_LIMITS, an optional JSON object mapping
+// adapter type -> a positive integer cap on how many runs using that adapter
+// type may be "running" at once across the whole instance, e.g.
+// '{"opencode":5,"litellm":10}'. Unset, unparsable, or non-object input yields
+// {} (no limits), which is the default: the feature is opt-in and changes no
+// behavior for anyone who has not set it. Non-finite or non-positive entries
+// are dropped rather than treated as "no limit" or "zero forever", so a typo
+// degrades to "that adapter type is unthrottled" instead of silently wedging
+// every run using it.
+export function resolveAdapterConcurrencyLimits(
+  env: Record<string, string | undefined> = process.env,
+): Record<string, number> {
+  const raw = env.PAPERCLIP_ADAPTER_CONCURRENCY_LIMITS;
+  if (!raw || !raw.trim()) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return {};
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return {};
+  }
+  const limits: Record<string, number> = {};
+  for (const [adapterType, value] of Object.entries(
+    parsed as Record<string, unknown>,
+  )) {
+    const parsedValue = typeof value === "number" ? value : Number(value);
+    if (Number.isFinite(parsedValue) && parsedValue > 0) {
+      limits[adapterType] = Math.floor(parsedValue);
+    }
+  }
+  return limits;
+}
+
 export function heartbeatService(
   db: Db,
   options: HeartbeatServiceOptions = {},
@@ -9459,6 +9494,10 @@ export function heartbeatService(
       allowWorktreeRunExecution: override.allowed,
     });
   };
+  // Empty unless PAPERCLIP_ADAPTER_CONCURRENCY_LIMITS is set (see
+  // resolveAdapterConcurrencyLimits above); an empty map disables every
+  // check below at negligible cost, so this feature is a no-op by default.
+  const adapterConcurrencyLimits = resolveAdapterConcurrencyLimits(runtimeEnv);
   const getWorktreeExecutionCutoff = async () => {
     const override = await resolveWorktreeRunExecutionOverride();
     return override.allowed ? override.cutoff : null;
@@ -16906,6 +16945,62 @@ export function heartbeatService(
     return Number(count ?? 0);
   }
 
+  // Counts running runs instance-wide for one adapter type, e.g. so five
+  // agents that all use "litellm" share one admission budget instead of each
+  // getting their own maxConcurrentRuns worth of slots against the same
+  // downstream gateway. See resolveAdapterConcurrencyLimits for the config
+  // shape (issue: shared concurrency bucket per adapter type).
+  async function countRunningRunsForAdapterType(
+    adapterType: string,
+    executor: Db = db,
+  ) {
+    const [{ count }] = await executor
+      .select({ count: sql<number>`count(*)` })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(agents.id, heartbeatRuns.agentId))
+      .where(
+        and(
+          eq(heartbeatRuns.status, "running"),
+          eq(agents.adapterType, adapterType),
+        ),
+      );
+    return Number(count ?? 0);
+  }
+
+  // Caps `requested` slots to what the adapter-type bucket actually has free,
+  // for adapter types that have a configured limit; adapter types with no
+  // configured limit pass `requested` through untouched (default: no-op).
+  //
+  // A Postgres advisory lock keyed by a hash of the adapter type name is held
+  // for the duration of the count so that two different agents sharing the
+  // same adapter type, both ticking around the same moment, do not both read
+  // the same stale headroom and both admit up to the full limit at once --
+  // the exact failure mode a plain in-memory counter would have. The lock is
+  // released as soon as the count is read; the actual claim a caller makes
+  // afterwards still goes through claimQueuedRun's own atomic
+  // `UPDATE ... WHERE status = 'queued'`, which is what prevents the same run
+  // from ever being claimed twice. Between this function returning and that
+  // claim completing there is a small window in which a concurrent scheduler
+  // tick for another agent of the same adapter type could also have been
+  // admitted, so under contention the bucket can be transiently over by a run
+  // or two rather than never exceeded -- turning an unbounded burst (34
+  // processes in 9 seconds, observed on a self-hosted instance after a
+  // restart) into one bounded by roughly the configured limit, not a
+  // hard real-time guarantee.
+  async function reserveAdapterConcurrencySlots(
+    adapterType: string,
+    requested: number,
+  ) {
+    if (requested <= 0) return 0;
+    const limit = adapterConcurrencyLimits[adapterType];
+    if (limit === undefined) return requested;
+    return db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${adapterType}))`);
+      const running = await countRunningRunsForAdapterType(adapterType, tx as unknown as Db);
+      return Math.max(0, Math.min(requested, limit - running));
+    });
+  }
+
   async function withChatControlRecoveryGate(
     run: typeof heartbeatRuns.$inferSelect,
     stage: "claim" | "dispatch",
@@ -19813,11 +19908,18 @@ export function heartbeatService(
       }
       const policy = parseHeartbeatPolicy(agent);
       const runningCount = await countRunningRunsForAgent(agentId);
-      const availableSlots = Math.max(
+      let availableSlots = Math.max(
         0,
         policy.maxConcurrentRuns - runningCount,
       );
       if (availableSlots <= 0) return [];
+      if (Object.keys(adapterConcurrencyLimits).length > 0) {
+        availableSlots = await reserveAdapterConcurrencySlots(
+          agent.adapterType,
+          availableSlots,
+        );
+        if (availableSlots <= 0) return [];
+      }
 
       const queuedRuns = await db
         .select()
