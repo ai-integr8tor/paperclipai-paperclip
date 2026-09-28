@@ -58,12 +58,30 @@ vi.mock("../api/auth", async (importOriginal) => {
   return { ...actual, authApi: { ...actual.authApi, getSession: mockAuthApi.getSession } };
 });
 
+const mockCompaniesApi = vi.hoisted(() => ({
+  create: vi.fn(),
+  list: vi.fn().mockResolvedValue([]),
+  detachInflightList: vi.fn(),
+}));
+
+const mockAgentsApi = vi.hoisted(() => ({
+  adapterModels: vi.fn(async () => []),
+  getAdapterAuthSignal: vi.fn(async () => ({ status: "present" })),
+  hire: vi.fn(async () => ({ agent: { id: "agent-1" }, approval: null })),
+  list: vi.fn(async () => []),
+  testEnvironment: vi.fn(async () => ({
+    adapterType: "agy_local",
+    status: "pass",
+    checks: [],
+    testedAt: new Date().toISOString(),
+  })),
+}));
+
 vi.mock("../api/companies", () => ({
-  companiesApi: {
-    create: vi.fn(),
-    list: vi.fn().mockResolvedValue([]),
-    detachInflightList: vi.fn(),
-  },
+  companiesApi: mockCompaniesApi,
+}));
+vi.mock("../api/agents", () => ({
+  agentsApi: mockAgentsApi,
 }));
 vi.mock("../adapters", () => ({
   listUIAdapters: () => mockAdapterRegistry.list,
@@ -73,7 +91,7 @@ vi.mock("../adapters/metadata", () => ({ isVisualAdapterChoice: () => true }));
 vi.mock("../adapters/adapter-display-registry", () => ({
   getAdapterDisplay: (type: string) => ({
     type,
-    recommended: false,
+    recommended: type === "claude_local" || type === "codex_local",
     label: type,
     description: "",
     icon: () => null,
@@ -148,6 +166,7 @@ describe("OnboardingWizard adapter selection", () => {
     mockAdapterRegistry.list = [];
     mockAdapterRegistry.disabled = new Set<string>();
     mockAdapterRegistry.loaded = true;
+    mockAgentsApi.getAdapterAuthSignal.mockResolvedValue({ status: "present" });
   });
 
   afterEach(() => {
@@ -282,6 +301,155 @@ describe("OnboardingWizard adapter selection", () => {
       window.localStorage.getItem(ONBOARDING_STORAGE_KEY) ?? "{}",
     );
     expect(saved.adapterType).toBe("acme_external");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("allows selecting a non-recommended adapter on step 4 via more harnesses", async () => {
+    mockAdapterRegistry.list = [
+      { type: "claude_local" },
+      { type: "codex_local" },
+      { type: "agy_local" },
+    ];
+    const company = { id: "comp-1", name: "Acme", issuePrefix: "ACM" };
+    mockCompany.companies = [company];
+    mockCompaniesApi.list.mockResolvedValue([company]);
+    window.localStorage.setItem(
+      ONBOARDING_STORAGE_KEY,
+      JSON.stringify({
+        step: 4,
+        companyName: "Acme",
+        agentName: "Chief of Staff",
+        createdCompanyId: "comp-1",
+      }),
+    );
+
+    const { root } = await mount();
+
+    // The more harnesses toggle button should be present
+    const toggleButton = Array.from(document.querySelectorAll("button")).find(
+      (btn) => btn.textContent?.includes("More harnesses"),
+    );
+    expect(toggleButton).toBeTruthy();
+
+    // Click to expand more harnesses
+    await act(async () => {
+      toggleButton?.click();
+    });
+    await flushReact();
+
+    // agy_local tile should now be visible
+    const agyButton = Array.from(document.querySelectorAll("button")).find(
+      (btn) => btn.textContent?.includes("Antigravity") || btn.textContent?.includes("agy_local"),
+    );
+    expect(agyButton).toBeTruthy();
+
+    // Click to select agy_local
+    await act(async () => {
+      agyButton?.click();
+    });
+    await flushReact();
+
+    const saved = JSON.parse(
+      window.localStorage.getItem(ONBOARDING_STORAGE_KEY) ?? "{}",
+    );
+    expect(saved.adapterType).toBe("agy_local");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("skips asking for an API key when Antigravity local credentials are present", async () => {
+    mockAdapterRegistry.list = [
+      { type: "claude_local" },
+      { type: "codex_local" },
+      { type: "agy_local" },
+    ];
+    const company = { id: "comp-1", name: "Acme", issuePrefix: "ACM" };
+    mockCompany.companies = [company];
+    mockCompaniesApi.list.mockResolvedValue([company]);
+    mockAgentsApi.getAdapterAuthSignal.mockResolvedValue({ status: "present" });
+    window.localStorage.setItem(
+      ONBOARDING_STORAGE_KEY,
+      JSON.stringify({
+        step: 4,
+        companyName: "Acme",
+        agentName: "Chief of Staff",
+        createdCompanyId: "comp-1",
+        adapterType: "agy_local",
+      }),
+    );
+
+    const { root } = await mount();
+
+    for (let i = 0; i < 5; i++) {
+      await flushReact();
+    }
+
+    expect(mockAgentsApi.getAdapterAuthSignal).toHaveBeenCalledWith(
+      "comp-1",
+      "agy_local",
+      undefined,
+    );
+
+    // Should indicate that an existing provider connection is available
+    expect(document.body.textContent).toContain("An existing provider connection is available.");
+
+    // Should NOT render the API key input field
+    const apiKeyInput = document.querySelector('input[placeholder="Enter API key here"]');
+    expect(apiKeyInput).toBeNull();
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("shows sign-in instructions when Antigravity local credentials are absent", async () => {
+    mockAdapterRegistry.list = [
+      { type: "claude_local" },
+      { type: "codex_local" },
+      { type: "agy_local" },
+    ];
+    const company = { id: "comp-1", name: "Acme", issuePrefix: "ACM" };
+    mockCompany.companies = [company];
+    mockCompaniesApi.list.mockResolvedValue([company]);
+    mockAgentsApi.getAdapterAuthSignal.mockResolvedValue({ status: "absent" });
+    window.localStorage.setItem(
+      ONBOARDING_STORAGE_KEY,
+      JSON.stringify({
+        step: 4,
+        companyName: "Acme",
+        agentName: "Chief of Staff",
+        createdCompanyId: "comp-1",
+        adapterType: "agy_local",
+      }),
+    );
+
+    const { root } = await mount();
+
+    for (let i = 0; i < 5; i++) {
+      await flushReact();
+    }
+
+    // Expand more harnesses if needed and click Antigravity tile
+    const agyButton = Array.from(document.querySelectorAll("button")).find(
+      (btn) => btn.textContent?.includes("Antigravity") || btn.textContent?.includes("agy_local"),
+    );
+    expect(agyButton).toBeTruthy();
+
+    await act(async () => {
+      agyButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    for (let i = 0; i < 10; i++) {
+      await flushReact();
+    }
+
+    expect(document.body.textContent).toContain(
+      "Antigravity is not signed in on this machine. Run agy in your terminal to sign in, or connect with an API key.",
+    );
 
     await act(async () => {
       root.unmount();
