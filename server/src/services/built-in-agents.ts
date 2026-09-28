@@ -10,7 +10,9 @@ import { syncRoutineVariablesWithTemplate } from "@paperclipai/shared";
 import type { Agent, Approval, CompanySkill, PermissionKey, Routine, RoutineTrigger, RoutineVariable } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
-import { agentInstructionsService } from "./agent-instructions.js";
+import { agentInstructionRevisionService } from "./agent-instruction-revisions.js";
+import type { AuthorizationActor } from "./authorization.js";
+import { agentInstructionsBundleMode, agentInstructionsService } from "./agent-instructions.js";
 import { agentService } from "./agents.js";
 import { approvalService } from "./approvals.js";
 import {
@@ -802,7 +804,7 @@ export function builtInAgentService(db: Db) {
   const agentSvc = agentService(db);
   const accessSvc = accessService(db);
   const approvalSvc = approvalService(db);
-  const instructionsSvc = agentInstructionsService();
+  const instructionsSvc = agentInstructionsService(db);
   const skillSvc = companySkillService(db);
   const routineSvc = routineService(db);
 
@@ -952,10 +954,15 @@ export function builtInAgentService(db: Db) {
     return currentFiles;
   }
 
-  async function materializeInstructions(agent: Agent, definition: BuiltInAgentDefinition, mode: "reconcile" | "reset") {
+  async function materializeInstructions(agent: Agent, definition: BuiltInAgentDefinition, mode: "reconcile" | "reset", actor?: AuthorizationActor) {
     const bundle = definition.bundle!;
     const stock = stockHash(bundle.instructions.files);
     const binding = await getManagedResourceBinding(agent.companyId, definition.key, "instructions", "AGENTS.md");
+    // Stock operations also read the committed projection after interrupted writes.
+    if (agentInstructionsBundleMode(agent) === "managed") {
+      try { await agentInstructionRevisionService(db).materializeCurrent({ companyId: agent.companyId, agentId: agent.id }); }
+      catch (error) { if (!(error instanceof HttpError && error.status === 404)) throw error; }
+    }
     const currentFiles = await currentInstructionFiles(agent, bundle);
     const currentHash = Object.values(currentFiles).some((value) => value === null) ? null : stockHash(currentFiles);
     const currentState = stockState({
@@ -992,13 +999,41 @@ export function builtInAgentService(db: Db) {
       return currentState;
     }
 
-    const materialized = await instructionsSvc.materializeManagedBundle(agent, bundle.instructions.files, {
-      entryFile: bundle.instructions.entryFile,
-      replaceExisting: true,
-      clearLegacyPromptTemplate: true,
-    });
+    let adapterConfig: Record<string, unknown>;
+    if (currentFiles[bundle.instructions.entryFile] !== null && currentFiles[bundle.instructions.entryFile] !== undefined) {
+      // Automatic stock reconciliation cannot invent responsible-user authority.
+      // The stock update remains visible until an authenticated reset applies it.
+      if (!actor && mode === "reconcile") return currentState;
+      if (!actor) throw unprocessable("Resetting existing instructions requires an authenticated operator", { code: "INSTRUCTION_IDENTITY_INVALID" });
+      const revisions = agentInstructionRevisionService(db);
+      const target = { companyId: agent.companyId, agentId: agent.id };
+      const baseline = await revisions.readCurrent(target, actor);
+      const receipt = await revisions.commit({ ...target, entryFile: bundle.instructions.entryFile,
+        baseRevisionId: baseline?.revision.id ?? null, content: bundle.instructions.files[bundle.instructions.entryFile] ?? "",
+        source: actor.type === "board" ? "board" : "api" }, actor);
+      if (receipt.materialization === "pending") throw conflict("Instruction revision saved; retry reset to repair its disk copy", { revisionId: receipt.revision.id });
+      const refreshed = await agentSvc.getById(agent.id);
+      if (!refreshed) throw notFound("Built-in agent not found");
+      for (const [file, content] of Object.entries(bundle.instructions.files)) {
+        if (file !== bundle.instructions.entryFile) await instructionsSvc.writeFile(refreshed, file, content);
+      }
+      const currentBundle = await instructionsSvc.getBundle(refreshed);
+      for (const file of currentBundle.files) {
+        if (!file.isEntryFile && !file.virtual && !(file.path in bundle.instructions.files)) await instructionsSvc.deleteFile(refreshed, file.path);
+      }
+      adapterConfig = { ...refreshed.adapterConfig };
+      delete adapterConfig.promptTemplate;
+      delete adapterConfig.bootstrapPromptTemplate;
+    } else {
+      const materialized = await instructionsSvc.materializeManagedBundle(agent, bundle.instructions.files, {
+        entryFile: bundle.instructions.entryFile,
+        replaceExisting: true,
+        clearLegacyPromptTemplate: true,
+      });
+      adapterConfig = materialized.adapterConfig;
+    }
     const updated = await agentSvc.update(agent.id, {
-      adapterConfig: materialized.adapterConfig,
+      adapterConfig,
     }, {
       allowBuiltInAgentMetadata: true,
       recordRevision: { source: `built-in-bundle:${mode}:instructions` },
@@ -1480,13 +1515,14 @@ export function builtInAgentService(db: Db) {
     definition: BuiltInAgentDefinition,
     mode: "reconcile" | "reset",
     resources?: Array<"instructions" | "skill" | "routine">,
+    actor?: AuthorizationActor,
   ) {
     if (!definition.bundle) return [];
     const selected = new Set(resources ?? ["instructions", "skill", "routine"]);
     const existingStates = await bundleResourceStates(agent.companyId, definition, agent);
     const byKind = new Map(existingStates.map((state) => [state.resourceKind, state]));
     const instruction = selected.has("instructions")
-      ? await materializeInstructions(agent, definition, mode)
+      ? await materializeInstructions(agent, definition, mode, actor)
       : byKind.get("instructions")!;
     const refreshedAgent = await agentSvc.getById(agent.id) as Agent | null;
     if (!refreshedAgent) throw notFound("Built-in agent not found");
@@ -1847,7 +1883,7 @@ export function builtInAgentService(db: Db) {
     return state(definition, updated as Agent);
   }
 
-  async function reset(companyId: string, key: string, input: { resources?: Array<"agent" | "instructions" | "skill" | "routine"> } = {}) {
+  async function reset(companyId: string, key: string, input: { resources?: Array<"agent" | "instructions" | "skill" | "routine"> } = {}, actor?: AuthorizationActor) {
     const definition = requireBuiltInAgentDefinition(key);
     const resetAgentDefaults = !input.resources || input.resources.includes("agent");
     const current = resetAgentDefaults
@@ -1862,6 +1898,7 @@ export function builtInAgentService(db: Db) {
       definition,
       "reset",
       input.resources ? selectedBundleResources ?? [] : undefined,
+      actor,
     );
     return state(definition, await agentSvc.getById(current.agent.id) as Agent, resources);
   }

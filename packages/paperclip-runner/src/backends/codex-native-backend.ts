@@ -139,6 +139,7 @@ function createTransportBackedNativeSessionBackend(
           ? (input.provider.approvalPolicy ?? "never")
           : "never",
       baseInstructions: nativeSystemInstructions(input),
+      instructionWorkingCopyRoot: "runtimeContext" in input ? input.runtimeContext.instructions.workingCopy?.rootPath : undefined,
       includeSkillInstructions: isCodex && "runtimeContext" in input,
       skillInputs: isCodex
         ? nativeTaskSkillInputs(
@@ -155,7 +156,7 @@ function createTransportBackedNativeSessionBackend(
         contractRevision: input.completionContract.contract.revision,
         criteria: input.completionContract.contract.criteria,
         constraints: [
-          "Work only inside the supplied working directory.",
+          "Work inside the supplied working directory and any explicitly registered private instruction copy.",
           ...(supportsCollaborativePlanning &&
           "executionMode" in input &&
           input.executionMode === "plan"

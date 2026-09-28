@@ -27,6 +27,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { agentInstructionRevisionService } from "../services/agent-instruction-revisions.js";
 import { agentInstructionsService } from "../services/agent-instructions.ts";
 import { agentService } from "../services/agents.ts";
 import { approvalService } from "../services/approvals.ts";
@@ -116,6 +117,16 @@ describe("built-in agent asset loading", () => {
 describeEmbeddedPostgres("built-in agents", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  const instructionOperator = { type: "board", userId: "local-board", source: "local_implicit" } as const;
+  async function writeInstructionEntry(agent: { id: string; companyId: string }, entryFile: string, content: string) {
+    const service = agentInstructionRevisionService(db);
+    const target = { companyId: agent.companyId, agentId: agent.id };
+    const baseline = await service.readCurrent(target, instructionOperator);
+    await service.commit({ ...target, entryFile, content, baseRevisionId: baseline?.revision.id ?? null, source: "board" }, instructionOperator);
+    const refreshed = await agentService(db).getById(agent.id);
+    return { adapterConfig: refreshed!.adapterConfig };
+  }
+
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-built-in-agents-");
@@ -553,7 +564,7 @@ describeEmbeddedPostgres("built-in agents", () => {
       capabilities: "Custom purpose",
     });
 
-    const reset = await builtIns.reset(companyId, "briefs");
+    const reset = await builtIns.reset(companyId, "briefs", {}, instructionOperator);
 
     expect(reset).toMatchObject({
       status: "ready",
@@ -801,7 +812,7 @@ describeEmbeddedPostgres("built-in agents", () => {
     const created = await builtIns.ensure(companyId, "reflection-coach");
     const instructions = agentInstructionsService();
 
-    await instructions.writeFile(created.agent!, "AGENTS.md", "# Custom Reflection Coach\n\nOperator edit.\n");
+    await writeInstructionEntry(created.agent!, "AGENTS.md", "# Custom Reflection Coach\n\nOperator edit.\n");
 
     const reconciled = await builtIns.ensure(companyId, "reflection-coach");
     const drift = reconciled.resources.find((resource) => resource.resourceKind === "instructions");
@@ -815,7 +826,7 @@ describeEmbeddedPostgres("built-in agents", () => {
       content: "# Custom Reflection Coach\n\nOperator edit.\n",
     });
 
-    const reset = await builtIns.reset(companyId, "reflection-coach");
+    const reset = await builtIns.reset(companyId, "reflection-coach", {}, instructionOperator);
     expect(reset.resources.find((resource) => resource.resourceKind === "instructions")).toMatchObject({
       stockStatus: "stock_current",
       resetAvailable: false,
@@ -823,6 +834,13 @@ describeEmbeddedPostgres("built-in agents", () => {
     const resetFile = await instructions.readFile(reset.agent!, "AGENTS.md");
     expect(resetFile.content).toContain("Reflection Coach");
     expect(resetFile.content).not.toContain("Operator edit.");
+    const revisions = agentInstructionRevisionService(db);
+    const target = { companyId, agentId: created.agent!.id, entryFile: "AGENTS.md" };
+    const history = await revisions.history(target, instructionOperator);
+    expect(history.revisions).toHaveLength(3);
+    expect(history.revisions[0]).toMatchObject({ source: "board", actorUserId: "local-board" });
+    const previous = await revisions.readRevision({ ...target, revisionId: history.revisions[1]!.id }, instructionOperator);
+    expect(previous.content).toBe("# Custom Reflection Coach\n\nOperator edit.\n");
   });
 
   it("blocks deleting a built-in agent", async () => {
@@ -1270,7 +1288,7 @@ describeEmbeddedPostgres("built-in agents", () => {
     const created = await builtIns.ensure(companyId, "summarizer");
     const instructions = agentInstructionsService();
 
-    await instructions.writeFile(created.agent!, "AGENTS.md", "# Custom Summarizer\n\nOperator edit.\n");
+    await writeInstructionEntry(created.agent!, "AGENTS.md", "# Custom Summarizer\n\nOperator edit.\n");
 
     const reconciled = await builtIns.ensure(companyId, "summarizer");
     expect(reconciled.resources.find((resource) => resource.resourceKind === "instructions")).toMatchObject({
@@ -1279,7 +1297,7 @@ describeEmbeddedPostgres("built-in agents", () => {
       changedFiles: ["AGENTS.md"],
     });
 
-    const reset = await builtIns.reset(companyId, "summarizer");
+    const reset = await builtIns.reset(companyId, "summarizer", {}, instructionOperator);
     expect(reset.resources.find((resource) => resource.resourceKind === "instructions")).toMatchObject({
       stockStatus: "stock_current",
       resetAvailable: false,
@@ -1419,7 +1437,7 @@ describeEmbeddedPostgres("built-in agents", () => {
     const coach = created.agent!;
     const instructionsSvc = agentInstructionsService();
     const originalInstructions = "# Target Coder\n\nWork from the assigned issue.\n";
-    const prepared = await instructionsSvc.writeFile(target, "AGENTS.md", originalInstructions);
+    const prepared = await writeInstructionEntry(target, "AGENTS.md", originalInstructions);
     let persistedTarget = (await agentsSvc.update(target.id, { adapterConfig: prepared.adapterConfig }))!;
 
     const interactionsSvc = issueThreadInteractionService(db);
@@ -1431,7 +1449,7 @@ describeEmbeddedPostgres("built-in agents", () => {
       if (interaction?.kind !== "request_confirmation" || interaction.status !== "accepted") {
         return false;
       }
-      const written = await instructionsSvc.writeFile(persistedTarget, "AGENTS.md", input.nextInstructions);
+      const written = await writeInstructionEntry(persistedTarget, "AGENTS.md", input.nextInstructions);
       persistedTarget = (await agentsSvc.update(persistedTarget.id, { adapterConfig: written.adapterConfig }))!;
       return true;
     };
@@ -1568,7 +1586,7 @@ describeEmbeddedPostgres("built-in agents", () => {
     const agent = created.agent!;
 
     const instructionsSvc = agentInstructionsService();
-    await instructionsSvc.writeFile(agent, "AGENTS.md", "# Custom Reflection Coach\n\nDo not overwrite me.\n");
+    await writeInstructionEntry(agent, "AGENTS.md", "# Custom Reflection Coach\n\nDo not overwrite me.\n");
     await db
       .update(companySkills)
       .set({ markdown: "---\nname: reflection-coach\n---\n\n# Custom skill\n" })
@@ -1597,7 +1615,7 @@ describeEmbeddedPostgres("built-in agents", () => {
 
     const reset = await builtInAgentService(db).reset(companyId, "reflection-coach", {
       resources: ["instructions", "routine"],
-    });
+    }, instructionOperator);
     expect(reset.resources.find((resource) => resource.resourceKind === "instructions")).toMatchObject({
       stockStatus: "stock_current",
       resetAvailable: false,

@@ -43,6 +43,8 @@ export interface AgentInstructionsFileSummary {
 
 export interface AgentInstructionsFileDetail extends AgentInstructionsFileSummary {
   content: string;
+  revision?: AgentInstructionRevision;
+  receipt?: AgentInstructionCommitReceipt;
 }
 
 export interface AgentInstructionsBundle {
@@ -335,4 +337,77 @@ export type AdapterAuthSignal = "present" | "absent" | "unknown";
 
 export interface AdapterAuthSignalResponse {
   status: AdapterAuthSignal;
+}
+
+export type AgentInstructionSource = "seed" | "board" | "api" | "tool" | "cleanup" | "restore";
+export interface AgentInstructionRevision {
+  id: string;
+  companyId: string;
+  agentId: string;
+  entryFile: string;
+  contentHash: string;
+  byteLength: number;
+  parentRevisionId: string | null;
+  baseRevisionId: string | null;
+  restoredFromRevisionId: string | null;
+  actorAgentId: string | null;
+  actorUserId: string | null;
+  responsibleUserId: string | null;
+  sourceRunId: string | null;
+  source: AgentInstructionSource;
+  createdAt: string;
+}
+export interface AgentInstructionSnapshot {
+  revision: AgentInstructionRevision;
+  content: string;
+}
+export interface AgentInstructionCommitReceipt extends AgentInstructionSnapshot {
+  changed: boolean;
+  materialization: "current" | "pending";
+}
+export interface AgentInstructionHistory {
+  revisions: AgentInstructionRevision[];
+  nextCursor: string | null;
+}
+export interface AgentInstructionDiff {
+  from: AgentInstructionSnapshot;
+  to: AgentInstructionSnapshot;
+  prefix: string;
+  removed: string;
+  added: string;
+  suffix: string;
+}
+
+export type AgentInstructionErrorCode =
+  | "INSTRUCTION_BASE_REQUIRED"
+  | "INSTRUCTION_REVISION_REQUIRED"
+  | "INSTRUCTION_REVISION_CONFLICT"
+  | "INSTRUCTION_ENTRY_CHANGED"
+  | "INSTRUCTION_MANAGED_BUNDLE_REQUIRED"
+  | "INSTRUCTION_IDENTITY_INVALID"
+  | "INSTRUCTION_CONTENT_INVALID"
+  | "INSTRUCTION_PATH_INVALID"
+  | "RESPONSIBLE_USER_UNAVAILABLE"
+  | "RESPONSIBLE_USER_UNAUTHORIZED";
+export interface AgentInstructionErrorDetails {
+  code: AgentInstructionErrorCode;
+  baseRevisionId?: string | null;
+  currentRevisionId?: string | null;
+  entryFile?: string;
+  reason?: string;
+}
+
+/** Preserved instruction edits; filesystem locations and responsible identity stay server-side. */
+export interface AgentInstructionCandidate {
+  runId: string;
+  entryFile: string;
+  baseRevisionId: string | null;
+  baseHash: string;
+  state: "conflict" | "pending_collection" | "pending_commit" | "unavailable";
+  candidateHash: string | null;
+  content: string | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+  createdAt: string;
+  updatedAt: string;
 }

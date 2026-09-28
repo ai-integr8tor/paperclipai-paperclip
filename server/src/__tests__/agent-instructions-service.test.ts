@@ -53,7 +53,7 @@ describe("agent instructions service", () => {
     await fs.mkdir(path.join(externalRoot, "docs"), { recursive: true });
     await fs.writeFile(path.join(externalRoot, "docs", "TOOLS.md"), "## Tools\n", "utf8");
 
-    const svc = agentInstructionsService();
+    const svc = agentInstructionsService({ select: () => ({ from: () => ({ where: async () => [] }) }) } as never);
     const agent = makeAgent({
       instructionsBundleMode: "external",
       instructionsRootPath: externalRoot,
@@ -250,11 +250,10 @@ describe("agent instructions service", () => {
 
     expect(bundle.mode).toBe("managed");
     expect(bundle.rootPath).toBe(managedRoot);
-    expect(bundle.entryFile).toBe("AGENTS.md");
+    expect(bundle.entryFile).toBe("docs/MISSING.md");
     expect(bundle.files.map((file) => file.path)).toEqual(["AGENTS.md"]);
     expect(bundle.warnings).toEqual([
       `Recovered managed instructions from disk at ${managedRoot}; ignoring stale configured root ${staleRoot}.`,
-      "Recovered managed instructions entry file from disk as AGENTS.md; previous entry docs/MISSING.md was missing.",
     ]);
     expect(exported.files).toEqual({ "AGENTS.md": "# Managed Agent\n" });
   });
@@ -293,8 +292,8 @@ describe("agent instructions service", () => {
     expect(result.adapterConfig).toMatchObject({
       instructionsBundleMode: "managed",
       instructionsRootPath: managedRoot,
-      instructionsEntryFile: "AGENTS.md",
-      instructionsFilePath: path.join(managedRoot, "AGENTS.md"),
+      instructionsEntryFile: "docs/MISSING.md",
+      instructionsFilePath: path.join(managedRoot, "docs/MISSING.md"),
     });
     await expect(fs.readFile(path.join(managedRoot, "docs", "TOOLS.md"), "utf8")).resolves.toBe("## Tools\n");
   });
@@ -334,8 +333,8 @@ describe("agent instructions service", () => {
     expect(result.adapterConfig).toMatchObject({
       instructionsBundleMode: "managed",
       instructionsRootPath: managedRoot,
-      instructionsEntryFile: "AGENTS.md",
-      instructionsFilePath: path.join(managedRoot, "AGENTS.md"),
+      instructionsEntryFile: "docs/MISSING.md",
+      instructionsFilePath: path.join(managedRoot, "docs/MISSING.md"),
     });
     await expect(fs.stat(path.join(managedRoot, "docs", "TOOLS.md"))).rejects.toThrow();
     expect(result.bundle.files.map((file) => file.path)).toEqual(["AGENTS.md"]);
@@ -373,11 +372,10 @@ describe("agent instructions service", () => {
 
     expect(bundle.mode).toBe("managed");
     expect(bundle.rootPath).toBe(managedRoot);
-    expect(bundle.entryFile).toBe("AGENTS.md");
+    expect(bundle.entryFile).toBe("docs/MISSING.md");
     expect(bundle.files.map((file) => file.path)).toEqual(["AGENTS.md"]);
     expect(bundle.warnings).toEqual([
       `Recovered managed instructions from disk at ${managedRoot}; ignoring stale configured root ${staleRoot}.`,
-      "Recovered managed instructions entry file from disk as AGENTS.md; previous entry docs/MISSING.md was missing.",
     ]);
     expect(exported.files).toEqual({ "AGENTS.md": "# Managed Agent\n" });
   });

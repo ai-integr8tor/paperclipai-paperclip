@@ -58,6 +58,7 @@ import {
   startAdapterExecutionTargetPaperclipBridge,
 } from "@paperclipai/adapter-utils/execution-target";
 import { agentService } from "./agents.js";
+import { agentInstructionWorkingCopyService, instructionWorkingCopyGuidance } from "./agent-instruction-working-copies.js";
 import { normalizeLegacyRunnerProvider } from "@paperclipai/adapter-utils";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -9401,6 +9402,7 @@ export function heartbeatService(
   options: HeartbeatServiceOptions = {},
 ) {
   let shutdownInProgress = false;
+  const instructionCopies = agentInstructionWorkingCopyService(db);
   const instanceSettings = instanceSettingsService(db);
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
@@ -18841,6 +18843,14 @@ export function heartbeatService(
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
+    // Recovery never launches a provider or infers stopped ownership from
+    // terminal status. Uncaptured local copies require durable stop evidence.
+    await instructionCopies.recoverStopped().catch(error => {
+      logger.warn({ err: error }, "failed to recover stopped instruction copies");
+    });
+    await instructionCopies.recoverCaptured().catch(error => {
+      logger.warn({ err: error }, "failed to retry captured instruction revisions");
+    });
 
     // Complete persisted native results before generic orphan recovery. The
     // reconciler reads the durable workspace barrier and persisted runtime
@@ -22254,6 +22264,27 @@ export function heartbeatService(
       await bindIssueToPersistedExecutionWorkspace(persistedExecutionWorkspace);
       const workspaceRealization = realizationResult.workspaceRealization;
       const executionTarget = realizationResult.executionTarget;
+      let instructionCopy: Awaited<ReturnType<typeof instructionCopies.prepare>> = null;
+      let instructionSave: Record<string, unknown> | null = null;
+      const collectStoppedInstructions = async () => {
+        if (!instructionCopy) return;
+        let saved = await instructionCopies.collectStopped({ companyId: agent.companyId, runId: run.id, target: executionTarget });
+        // Capture before disposal. Exhausted bounded collection leaves a durable
+        // explicit loss report, never a claim that missing bytes were saved.
+        while (saved?.state === "pending_collection" && saved.attempts < 3) {
+          saved = await instructionCopies.collectStopped({ companyId: agent.companyId, runId: run.id, target: executionTarget });
+        }
+        if (!saved) return;
+        const receipt = parseObject(saved.receipt);
+        instructionSave = { state: saved.state, entryFile: saved.entryFile,
+          revisionId: parseObject(receipt.revision).id ?? null, errorCode: saved.errorCode };
+        await appendRunEvent(run, { eventType: "instruction_save", stream: "system",
+          level: ["saved", "unchanged", "resolved"].includes(saved.state) ? "info" : "warn",
+          message: saved.state === "saved" ? "Instruction edits saved as a persistent revision."
+            : saved.state === "unchanged" ? "Instruction working copy is unchanged."
+              : "Instruction edits were not saved. Review the preserved candidate in the agent instruction editor.",
+          payload: instructionSave });
+      };
       if (managedAiRuntime && aiBinding) {
         try { await assertManagedAiProjectAuth({ ...resolvedConfig, cwd: executionWorkspace.cwd }, aiBinding.provider, executionTarget); }
         catch { throw new ConfigurationIncompleteFailure("Project authentication conflicts with this agent’s managed AI connection", { configurationIncomplete: { reason: "ai_connection_incompatible", actionUrl: `/agents/${agent.id}/runtime` } }); }
@@ -23063,6 +23094,34 @@ export function heartbeatService(
           target: executionTarget,
           workspaceId: persistedExecutionWorkspace?.id ?? null,
         });
+        const hasInstructionFilesystem = nativeRuntimeResolution.kind !== "native" || ![
+          "claude_managed_agents_api", "aws_agentcore_harness_api",
+        ].includes(nativeRuntimeResolution.profile.backend);
+        if (hasInstructionFilesystem) {
+          try {
+            instructionCopy = await instructionCopies.prepare({
+              companyId: agent.companyId, agentId: agent.id, runId: run.id,
+              target: executionTarget, cwd: executionWorkspace.cwd,
+            });
+          } catch {
+            // Missing write identity must not break a background run's read-only
+            // prompt. It must also never imply that ordinary file edits will save.
+            await appendRunEvent(run, { eventType: "instruction_save", stream: "system", level: "warn",
+              message: "Persistent instruction editing is unavailable. Use an authenticated user with instruction edit access and a managed instruction bundle.",
+              payload: { state: "unavailable", code: "INSTRUCTION_COPY_UNAVAILABLE" } });
+            const guidance = "No editable agent instruction working copy is registered for this turn. Use the instruction revision tools for persistent edits; do not edit a private copy named in an earlier turn or claim its changes will persist.";
+            for (const key of ["paperclipTaskMarkdown", "paperclipTaskMarkdownCompact"]) {
+              context[key] = [readNonEmptyString(context[key]), guidance].filter(Boolean).join("\n\n");
+            }
+          }
+          if (instructionCopy) {
+            runtimeConfig = { ...runtimeConfig, instructionsFilePath: path.join(instructionCopy.localRoot, instructionCopy.entryFile) };
+            const guidance = instructionWorkingCopyGuidance(instructionCopy);
+            for (const key of ["paperclipTaskMarkdown", "paperclipTaskMarkdownCompact"]) {
+              context[key] = [readNonEmptyString(context[key]), guidance].filter(Boolean).join("\n\n");
+            }
+          }
+        }
         let nativeExecution: NativeExecutionInput | null = null;
         let nativeRunnerInstanceId: string | null = null;
         if (nativeRuntimeResolution.kind === "native") {
@@ -23479,6 +23538,7 @@ export function heartbeatService(
               runId: run.id,
               runtimeConfig,
               runtimeSkillEntries,
+              instructionWorkingCopy: instructionCopy ? { rootPath: instructionCopy.executionRoot, entryPath: instructionCopy.entryFile } : undefined,
             });
             const nativeExecutionWithCheckpoint =
               buildNativeExecutionWithCheckpoint({
@@ -24184,6 +24244,10 @@ export function heartbeatService(
                     },
                     onLog,
                     onEvent: onAdapterEvent,
+                    instructionWorkingCopy: instructionCopy ? {
+                      hasChanges: () => instructionCopies.hasChanges({ companyId: agent.companyId, runId: run.id, target: executionTarget }),
+                      collectStopped: collectStoppedInstructions,
+                    } : undefined,
                     preparationSpans: nativeRunnerPreparationSpans,
                     // Bootstrap with executable/home discovery while keeping
                     // configured provider values and the server-selected
@@ -24377,6 +24441,7 @@ export function heartbeatService(
                         issueId,
                       );
                     },
+                    onProviderStopped: collectStoppedInstructions,
                     onDispatch: markDispatchStarted,
                     signal: executionControl.controller.signal,
                     ...(executionTarget?.kind === "remote" && executionTarget.transport === "sandbox" ? {
@@ -24425,6 +24490,7 @@ export function heartbeatService(
             if (!guardedDispatch.dispatched) return;
             adapterResult = await guardedDispatch.resultPromise;
           }
+          if (instructionSave) adapterResult.resultJson = { ...adapterResult.resultJson, instructionSave };
           adapterResult = applyWorkspaceRestoreFailure(adapterResult);
           // A returned result can include a failed restore. Keep the workspace
           // barrier closed until required files have been restored.
@@ -24626,6 +24692,7 @@ export function heartbeatService(
               "failed to revoke heartbeat-run MCP gateway tokens",
             );
           }
+          instructionCopies.release(agent.companyId, run.id);
         }
         // Reconcile the referenced-project set against the real remote staging outcome. A referenced
         // project can pass authorization and clone locally at run prep, then fail to stage into the
@@ -26007,6 +26074,15 @@ export function heartbeatService(
               },
             );
           }
+          // A retained or unverified process stays above this release boundary.
+          // If no stopped-copy capture occurred, preserve an explicit loss report.
+          const uncapturedInstructions = await instructionCopies.reportUnavailable(run.companyId, run.id);
+          if (uncapturedInstructions?.state === "unavailable") {
+            await appendRunEvent(run, { eventType: "instruction_save", stream: "system", level: "warn",
+              message: "Instruction edits could not be recovered before environment release. No instruction save is claimed.",
+              payload: { state: "unavailable", code: uncapturedInstructions.errorCode } });
+          }
+          instructionCopies.release(run.companyId, run.id);
           await releaseEnvironmentLeasesForRun({
             runId: run.id,
             companyId: run.companyId,

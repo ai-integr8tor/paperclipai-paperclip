@@ -432,3 +432,13 @@ cleanup authority; it does not prove that remote inference has stopped. Recovery
 revokes the previous boot identity with a conditional update. Its own claim also
 expires so another sweep can finish cleanup after a restart. Historical rows keep
 null ownership fields and follow the previous recovery path.
+
+## Agent instruction content revisions
+
+`agent_instruction_revisions` stores immutable exact UTF-8 content and server-bound
+attribution. `agent_instruction_heads` selects the current revision by company,
+agent, and configured entry filename. Revision/head/activity changes share one
+transaction; disk content is a recoverable projection. Existing managed files
+are seeded lazily without rewriting their content. See
+[Canonical agent instruction revisions](agent-instruction-revisions.md) for the
+commit, conflict, authorization, and runtime integration contract.

@@ -103,6 +103,9 @@ export function nativeTaskConstraints(input: NativeExecutionInput): string[] {
   }
   return [
     "Use only the assigned skills and provider-native tools.",
+    ...(input.runtimeContext.instructions.workingCopy ? [
+      `For this turn, the editable agent instruction file is ${input.runtimeContext.instructions.workingCopy.rootPath}/${input.runtimeContext.instructions.workingCopy.entryPath}. This replaces any private working-copy path from a previous turn. Ordinary edits save after the provider stops and only with a durable revision receipt. Use the agent instruction tools for immediate saves. Shared instruction assets and repository instructions are not collected.`,
+    ] : []),
     "Use Paperclip semantic tools for coordination and finalization.",
     "Save requested plans and Paperclip documents directly with write_document. A saved Paperclip document is already a durable deliverable. Do not create a local file, compute file hashes, or call register_deliverable for it unless the user also requests a downloadable file. Cite the saved document in your completion evidence and final response.",
     "When the requested result is a file, use register_deliverable before paperclip_finish. Compute its exact byte size and SHA-256, register the workspace-relative file, cite deliverable:<attachmentId> from the receipt as completion evidence, and include /api/attachments/<attachmentId>/content as the download link in your answer. A bare workspace filename is not a delivered result. For repository edits, cite an accessible PR or registered work product. Preserve existing work; do not upload unrelated files. If file publication fails, fix it or report the concrete blocker instead of claiming the file is delivered.",

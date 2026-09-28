@@ -1,3 +1,4 @@
+import { instructionPersistenceTask } from "./instruction-persistence.js";
 import { accountingTasks } from "./accounting-cases.js";
 import { continuationTasks } from "./continuation-cases.js";
 import { lifecycleLiveTasks, lifecycleLiveDefinitionDigest } from "./lifecycle-live-cases.js";
@@ -912,6 +913,15 @@ const everydayProfiles = [
 
 export const runnerSuites: readonly RunnerSuiteFixture[] = [
   {
+    id: "instruction-persistence", label: "Instruction Persistence",
+    description: "Ordinary private file edits persist as canonical revisions and survive a server restart and fresh browser task.",
+    groups: [], profiles: codexContinuityProfiles,
+    environments: [localEnvironment, runnerEnvironments.find(environment => environment.id === "daytona")!], tasks: [instructionPersistenceTask],
+    excludedExecutionIds: ["instruction-persistence.legacy-codex.daytona.private-copy-persists"],
+    expectedMatrixSize: 3, manualOnly: true,
+    definitionMetadata: { version: 3, oracle: "canonical-revision-independent-nonce-and-browser-conflict-resolution", providerTurns: 3, restart: "between-tasks", instructions: "production" },
+  },
+  {
     id: "continuation-accounting", label: "Continuation accounting baseline", manualOnly: true,
     description: "Structured productive steps, bounded repair, restart and late gates; comments cannot buy more attempts.",
     groups: ["local"], environments: [localEnvironment], profiles: codexContinuityProfiles.map(productionStoryProfile),
@@ -1169,6 +1179,7 @@ export function validateRunnerCatalog(): MatrixExecution[] {
     ...localIntegrityTasks,
     ...openRouterBreadthTasks,
     daytonaWarmContinuityTask,
+    instructionPersistenceTask,
   ];
   for (const [label, values] of [
     ["suite", runnerSuites],
