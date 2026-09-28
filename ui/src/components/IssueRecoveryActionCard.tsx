@@ -1,3 +1,4 @@
+import { useWorkspaceIsolationControls } from "@/hooks/useWorkspaceIsolationControls";
 import { requiresExecutionReconciliation } from "@paperclipai/shared";
 import { useMemo, useState } from "react";
 import type {
@@ -1001,6 +1002,7 @@ export function IssueRecoveryActionCard({
   variant = "full",
   className,
 }: IssueRecoveryActionCardProps) {
+  const { visible: workspaceIsolationControlsVisible } = useWorkspaceIsolationControls();
   const liveness = useMemo(() => ({ scheduledRetry }), [scheduledRetry]);
   const cardState: RecoveryCardCardState = forcedState ?? deriveRecoveryCardState(action, liveness);
   const tone = STATE_TONE[cardState];
@@ -1073,6 +1075,7 @@ export function IssueRecoveryActionCard({
   });
   const reissueBaseRef = divergence?.reissueBaseRef ?? null;
   const showReissueAction =
+    workspaceIsolationControlsVisible &&
     onReissueIsolated !== undefined &&
     cardState !== "resolved" &&
     divergence !== null &&
@@ -1104,7 +1107,7 @@ export function IssueRecoveryActionCard({
     divergence !== null &&
     divergence.cleanliness === "dirty";
   const repairDisabledReason = repairContention
-    ? `Held by ${contentionLabel(repairContention)} — re-issue on an isolated workspace instead.`
+    ? `Held by ${contentionLabel(repairContention)}${showReissueAction ? " — re-issue on an isolated workspace instead." : "."}`
     : null;
   // When contended, the re-issue is the recommended path, so it takes the primary emphasis and a
   // "Recommended" hint while the repair button is disabled.
