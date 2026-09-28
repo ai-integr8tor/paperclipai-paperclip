@@ -1,10 +1,16 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { gunzipSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
-import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
+import {
+  createBufferedTextFileWriter,
+  runDatabaseBackup,
+  runDatabaseRestore,
+  writeOwnerOnlyGzipFile,
+} from "./backup-lib.js";
 import { ensurePostgresDatabase } from "./client.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -75,49 +81,23 @@ describe("createBufferedTextFileWriter", () => {
     await writer.close();
 
     expect(fs.readFileSync(outputPath, "utf8")).toBe(lines.join("\n"));
+    expect(permissions(outputPath)).toBe(0o600);
+  });
+});
+
+describe("writeOwnerOnlyGzipFile", () => {
+  it("writes an owner-only, gzip-valid archive", async () => {
+    const tempDir = createTempDir("paperclip-owner-only-gzip-");
+    const outputPath = path.join(tempDir, "backup.sql.gz");
+
+    await writeOwnerOnlyGzipFile(Readable.from(["SELECT 1;\n"]), outputPath);
+
+    expect(permissions(outputPath)).toBe(0o600);
+    expect(gunzipSync(fs.readFileSync(outputPath)).toString("utf8")).toBe("SELECT 1;\n");
   });
 });
 
 describeEmbeddedPostgres("runDatabaseBackup", () => {
-  it("writes owner-only archives through the pg_dump writer", async () => {
-    const sourceConnectionString = await createTempDatabase();
-    const backupDir = createTempDir("paperclip-db-pg-dump-permissions-");
-    const pgDumpProgram = path.join(backupDir, "pg-dump-stub.cjs");
-    const pgDumpStub = path.join(
-      backupDir,
-      process.platform === "win32" ? "pg-dump-stub.cmd" : "pg-dump-stub",
-    );
-    const originalPgDumpPath = process.env.PAPERCLIP_PG_DUMP_PATH;
-    fs.writeFileSync(pgDumpProgram, "process.stdout.write('SELECT 1;\\n')\n");
-    fs.writeFileSync(
-      pgDumpStub,
-      process.platform === "win32"
-        ? `@echo off\r\n\"${process.execPath}\" \"${pgDumpProgram}\"\r\n`
-        : `#!/bin/sh\nexec \"${process.execPath}\" \"${pgDumpProgram}\"\n`,
-      { mode: 0o700 },
-    );
-    if (process.platform !== "win32") fs.chmodSync(pgDumpStub, 0o700);
-    process.env.PAPERCLIP_PG_DUMP_PATH = pgDumpStub;
-
-    try {
-      const result = await runDatabaseBackup({
-        connectionString: sourceConnectionString,
-        backupDir,
-        retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
-        filenamePrefix: "paperclip-pg-dump-permissions",
-        backupEngine: "pg_dump",
-      });
-
-      expect(permissions(result.backupFile)).toBe(0o600);
-    } finally {
-      if (originalPgDumpPath === undefined) {
-        delete process.env.PAPERCLIP_PG_DUMP_PATH;
-      } else {
-        process.env.PAPERCLIP_PG_DUMP_PATH = originalPgDumpPath;
-      }
-    }
-  });
-
   it(
     "keeps the newest backup for each retained calendar month",
     async () => {

@@ -317,6 +317,13 @@ async function waitForChildExit(child: ReturnType<typeof spawn>, label: string):
   }
 }
 
+export async function writeOwnerOnlyGzipFile(
+  source: NodeJS.ReadableStream,
+  backupFile: string,
+): Promise<void> {
+  await pipeline(source, createGzip(), createWriteStream(backupFile, { mode: 0o600 }));
+}
+
 async function runPgDumpBackup(opts: {
   connectionString: string;
   backupFile: string;
@@ -347,7 +354,7 @@ async function runPgDumpBackup(opts: {
   }
 
   await Promise.all([
-    pipeline(child.stdout, createGzip(), createWriteStream(opts.backupFile, { mode: 0o600 })),
+    writeOwnerOnlyGzipFile(child.stdout, opts.backupFile),
     waitForChildExit(child, pgDumpBin),
   ]);
 }
@@ -1022,8 +1029,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
 
     // Compress the SQL file with gzip
     const sqlReadStream = createReadStream(sqlFile);
-    const gzWriteStream = createWriteStream(backupFile, { mode: 0o600 });
-    await pipeline(sqlReadStream, createGzip(), gzWriteStream);
+    await writeOwnerOnlyGzipFile(sqlReadStream, backupFile);
     unlinkSync(sqlFile);
 
     const sizeBytes = statSync(backupFile).size;
