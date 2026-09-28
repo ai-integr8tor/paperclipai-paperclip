@@ -435,8 +435,13 @@ describeEmbeddedPostgres("heartbeat adapter-type concurrency limit", () => {
           provider: "test",
           model: "test-model",
         }));
+        // Drain here, not after the try/finally: if a mid-race assertion
+        // above throws, the gate is still released, but without this the
+        // background run it unblocks would still be writing to the database
+        // when afterEach's TRUNCATE runs right after this test -- turning one
+        // clear assertion failure into a confusing secondary error.
+        await heartbeat.drainActiveRunExecutions();
       }
-      await heartbeat.drainActiveRunExecutions();
 
       const allRuns = await db
         .select()
