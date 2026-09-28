@@ -2174,6 +2174,68 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     );
   });
 
+  it("schedules a bounded retry for a Hermes gateway 429 delivery refusal", async () => {
+    // Measured shape (production, 2026-09-27): errorCode hermes_gateway_rate_limited,
+    // errorFamily transient_upstream, and the gateway's Retry-After recorded as an
+    // absolute timestamp. Before this lane was reachable, the run settled as a
+    // terminal failure with scheduledRetryAt: null and the recovery re-dispatched
+    // once per second.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date("2026-09-27T06:20:55.000Z");
+    const retryNotBefore = "2026-09-27T06:20:56.000Z";
+
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "hermes_gateway_rate_limited",
+      errorFamily: "transient_upstream",
+      adapterType: "hermes_gateway",
+      agentName: "Leela",
+      resultJson: {
+        // The adapter refused the delivery before any provider work started, so
+        // the run carries no legacy execution that would need reconciliation.
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+        stopReason: "adapter_failed",
+        errorFamily: "transient_upstream",
+        retryNotBefore,
+        transientRetryNotBefore: retryNotBefore,
+      },
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+      now,
+      random: () => 0.5,
+    });
+
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+    // The 30s retry ladder wins over the shorter upstream hint, so a refused
+    // delivery is never retried inside its own window and never faster than the
+    // ladder allows.
+    expect(scheduled.dueAt.getTime()).toBe(now.getTime() + 30_000);
+
+    const retryRun = await db
+      .select({
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+        scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+        scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+
+    expect(retryRun?.scheduledRetryAt?.getTime()).toBe(now.getTime() + 30_000);
+    expect(retryRun?.scheduledRetryReason).toBe("transient_failure");
+    const contextSnapshot = (retryRun?.contextSnapshot as Record<string, unknown> | null) ?? {};
+    expect(contextSnapshot.transientRetryNotBefore).toBe(retryNotBefore);
+    // hermes_gateway is not codex_local, so it never enters the Codex fallback ladder.
+    expect(contextSnapshot.codexTransientFallbackMode ?? null).toBeNull();
+  });
+
   describe("run-dispatch module transactions", () => {
     it("promotes a due scheduled retry exactly once under concurrent promotion attempts", async () => {
       const companyId = randomUUID();
