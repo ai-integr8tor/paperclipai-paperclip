@@ -58,6 +58,10 @@ GitHub repos for repo-only project workspaces and refreshing worktree base
 refs. See
 [Execution workspaces](../guides/board-operator/execution-workspaces-and-runtime-services.md#private-repositories-and-repo-only-project-workspaces).
 
+GitHub skill and company imports read `GITHUB_TOKEN` or `GH_TOKEN` from the
+**server process environment**. Without one, they call GitHub anonymously and
+share its limit of 60 requests per hour per IP.
+
 ## User-Specific Secrets
 
 User-specific secrets let a shared agent or project declare a slot such as
