@@ -143,6 +143,7 @@ export async function issueExecutionGrant(input: {
       .limit(1).then((rows) => rows[0]?.id ?? null) : null;
   if (!target || !proposerAgentId ||
       proposed.executorAgentId !== input.executorAgentId ||
+      proposerAgentId === proposed.executorAgentId ||
       proposed.targetAgentId === policy.stewardAgentId ||
       (input.decisionKind === "agent" &&
         (approverAgentId === proposerAgentId || approverAgentId === input.executorAgentId)) ||

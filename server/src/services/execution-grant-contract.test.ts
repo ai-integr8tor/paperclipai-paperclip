@@ -42,6 +42,7 @@ describe("execution grant contract", () => {
   it.each([
     ["self approval", { decision: { kind: "agent", decisionId: "decision", approverAgentId: "proposer" } }, {}, "self_approval"],
     ["approver execution", { executorAgentId: "steward" }, { executorAgentId: "steward" }, "approver_is_executor"],
+    ["proposer execution", { executorAgentId: "proposer" }, { executorAgentId: "proposer" }, "proposer_is_executor"],
     ["changed payload", {}, { requestHash: "different" }, "request_changed"],
     ["stale target", {}, { targetRevisionId: "revision-2" }, "stale_target"],
     ["expired grant", {}, { now: grant.expiresAt }, "expired"],
@@ -54,6 +55,12 @@ describe("execution grant contract", () => {
       { ...grant, ...grantPatch } as ExecutionGrant,
       { ...attempt, ...attemptPatch } as ExecutionGrantAttempt,
     )).toBe(reason);
+  });
+
+  it("denies proposer execution of a board-approved grant", () => {
+    expect(executionGrantDenial({ ...grant, executorAgentId: "proposer",
+      decision: { kind: "board", decisionId: "board-decision", approverUserId: "board-user" },
+    }, { ...attempt, executorAgentId: "proposer" })).toBe("proposer_is_executor");
   });
 
   it("uses a canonical hash and binds the HTTP method and path", () => {

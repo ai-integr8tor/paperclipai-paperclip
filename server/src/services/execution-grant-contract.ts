@@ -38,6 +38,7 @@ export type ExecutionGrantDenial =
   | "company_mismatch"
   | "self_approval"
   | "approver_is_executor"
+  | "proposer_is_executor"
   | "steward_powers"
   | "already_consumed"
   | "expired"
@@ -77,6 +78,7 @@ export function executionGrantDenial(
   if (grant.decision.kind === "agent" && grant.decision.approverAgentId === grant.executorAgentId) {
     return "approver_is_executor";
   }
+  if (grant.proposerAgentId === grant.executorAgentId) return "proposer_is_executor";
   if (grant.targetAgentId === attempt.decisionStewardAgentId) return "steward_powers";
   if (grant.consumedAt !== null) return "already_consumed";
   if (grant.expiresAt.getTime() <= attempt.now.getTime()) return "expired";

@@ -180,6 +180,37 @@ describeDb("execution grants", () => {
     })).rejects.toMatchObject({ status: 403 });
   });
 
+  it("rejects proposer execution after either a Steward or board decision", async () => {
+    const fixture = await seed();
+    const executionGrant = { ...fixture.payload.executionGrant,
+      executorAgentId: fixture.proposerAgentId };
+    const payload = { ...fixture.payload, executionGrant,
+      detailsMarkdown: executionGrantApprovalDetails(executionGrant) };
+    await db.update(issueThreadInteractions).set({ payload })
+      .where(eq(issueThreadInteractions.id, fixture.decisionId));
+    await expect(issueExecutionGrant({
+      db, companyId: fixture.companyId, issueId: fixture.issueId,
+      decisionKind: "agent", decisionId: fixture.decisionId,
+      executorAgentId: fixture.proposerAgentId,
+    })).rejects.toMatchObject({ status: 403, details: { code: "execution_grant_invalid_decision" } });
+
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId, companyId: fixture.companyId, type: "request_board_approval",
+      requestedByAgentId: fixture.proposerAgentId, status: "approved",
+      decidedByUserId: "board-user", decidedAt: new Date(),
+      payload: { executionGrant, detailsMarkdown: payload.detailsMarkdown },
+    });
+    await db.insert(issueApprovals).values({
+      companyId: fixture.companyId, issueId: fixture.issueId, approvalId,
+    });
+    await expect(issueExecutionGrant({
+      db, companyId: fixture.companyId, issueId: fixture.issueId,
+      decisionKind: "board", decisionId: approvalId,
+      executorAgentId: fixture.proposerAgentId,
+    })).rejects.toMatchObject({ status: 403, details: { code: "execution_grant_invalid_decision" } });
+  });
+
   it("rejects an approval display that describes a different request", async () => {
     const fixture = await seed();
     await db.update(issueThreadInteractions).set({

@@ -67,6 +67,8 @@ Submit the request through either of these existing decision paths:
   issue with the same two payload fields. A board user must approve it. Board
   decisions produce the same grant type.
 
+For either decision path, the proposer and executor must be distinct agents.
+
 Approval records and interaction details are readable to actors with access to
 the issue. Grant requests therefore accept only display-safe profile fields,
 selected adapter settings, typed runtime AI connection bindings, and managed
