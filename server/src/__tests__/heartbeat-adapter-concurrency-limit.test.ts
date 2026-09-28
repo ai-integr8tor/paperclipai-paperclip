@@ -103,6 +103,17 @@ describe("resolveAdapterConcurrencyLimits", () => {
       resolveAdapterConcurrencyLimits({ PAPERCLIP_ADAPTER_CONCURRENCY_LIMITS: '{"opencode":2.9}' }),
     ).toEqual({ opencode: 2 });
   });
+
+  it("rejects a fractional limit that would floor to zero, instead of silently capping at zero", () => {
+    // A limit of 0 would leave every run for that adapter type queued
+    // forever, since reaching the limit never happens with nothing running.
+    // A value like 0.5 is a config mistake, not an intentional "block
+    // everything" -- so it is dropped (adapter type unthrottled) rather than
+    // floored into a permanent lockout.
+    expect(
+      resolveAdapterConcurrencyLimits({ PAPERCLIP_ADAPTER_CONCURRENCY_LIMITS: '{"opencode_local":0.5}' }),
+    ).toEqual({});
+  });
 });
 
 describeEmbeddedPostgres("heartbeat adapter-type concurrency limit", () => {
@@ -281,6 +292,62 @@ describeEmbeddedPostgres("heartbeat adapter-type concurrency limit", () => {
         expect(run.status).toBe("succeeded");
       }
       expect(mockAdapterExecute).toHaveBeenCalledTimes(agentBRuns.length);
+    },
+    15_000,
+  );
+
+  it(
+    "counts a running run against the adapter type it was dispatched under, not the agent's current one",
+    async () => {
+      // Agent A started its run while its adapterType was still
+      // CONCURRENCY_TEST_ADAPTER -- captured in runnerProfileJson at dispatch
+      // time, exactly as claimQueuedRun stamps it. An operator then reassigns
+      // the agent to a different adapter type while that run is still active.
+      const { companyId, agentAId, agentBId } = await createCompanyAndAgents();
+      const heartbeat = heartbeatService(db, {
+        runtimeEnv: {
+          PAPERCLIP_ADAPTER_CONCURRENCY_LIMITS: JSON.stringify({
+            [CONCURRENCY_TEST_ADAPTER]: 1,
+          }),
+        },
+      });
+
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId: agentAId,
+        status: "running",
+        invocationSource: "automation",
+        triggerDetail: "system",
+        contextSnapshot: {},
+        runnerProfileJson: {
+          adapterDispatch: { adapterType: CONCURRENCY_TEST_ADAPTER },
+        },
+      });
+      await db
+        .update(agents)
+        .set({ adapterType: "reassigned_other_adapter" })
+        .where(eq(agents.id, agentAId));
+
+      // Agent B is still on the throttled adapter type. If the bucket were
+      // (incorrectly) keyed off agent A's current adapterType, A's running
+      // run would no longer occupy it and B would be admitted immediately.
+      await heartbeat.wakeup(agentBId, {
+        source: "on_demand",
+        triggerDetail: "manual",
+        manualUserWake: true,
+        requestedByActorType: "user",
+        requestedByActorId: "test-responsible-user",
+      });
+      await heartbeat.drainActiveRunExecutions();
+
+      const agentBRuns = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentBId));
+      expect(agentBRuns).toHaveLength(1);
+      expect(agentBRuns[0]?.status).toBe("queued");
+      expect(mockAdapterExecute).not.toHaveBeenCalled();
     },
     15_000,
   );

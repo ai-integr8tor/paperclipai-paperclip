@@ -9424,7 +9424,10 @@ export function resolveAdapterConcurrencyLimits(
     parsed as Record<string, unknown>,
   )) {
     const parsedValue = typeof value === "number" ? value : Number(value);
-    if (Number.isFinite(parsedValue) && parsedValue > 0) {
+    // >= 1, not > 0: a value that floors to zero (e.g. 0.5) would otherwise
+    // pass this check and then cap the adapter type at zero, leaving every
+    // run for it queued forever with no running run to ever free a "slot".
+    if (Number.isFinite(parsedValue) && parsedValue >= 1) {
       limits[adapterType] = Math.floor(parsedValue);
     }
   }
@@ -16954,6 +16957,17 @@ export function heartbeatService(
     adapterType: string,
     executor: Db = db,
   ) {
+    // claimQueuedRun stamps the adapter type it actually dispatched under into
+    // runnerProfileJson.adapterDispatch.adapterType at the moment it flips a
+    // run to "running". Count against that captured identity, not the agent's
+    // current adapterType: an operator can reassign an agent to a different
+    // adapter type while one of its runs is still active, and joining on the
+    // live column would then move that running run into the new type's
+    // bucket -- freeing a slot in the old bucket while the process backing it
+    // is still running, and consuming one in the new bucket for a run that
+    // was never dispatched there. The coalesce falls back to the agent's
+    // current type only for the rare row with no captured value at all.
+    const dispatchedAdapterType = sql<string | null>`${heartbeatRuns.runnerProfileJson}->'adapterDispatch'->>'adapterType'`;
     const [{ count }] = await executor
       .select({ count: sql<number>`count(*)` })
       .from(heartbeatRuns)
@@ -16961,44 +16975,68 @@ export function heartbeatService(
       .where(
         and(
           eq(heartbeatRuns.status, "running"),
-          eq(agents.adapterType, adapterType),
+          eq(
+            sql`coalesce(${dispatchedAdapterType}, ${agents.adapterType})`,
+            adapterType,
+          ),
         ),
       );
     return Number(count ?? 0);
   }
 
-  // Caps `requested` slots to what the adapter-type bucket actually has free,
-  // for adapter types that have a configured limit; adapter types with no
-  // configured limit pass `requested` through untouched (default: no-op).
+  // Claims up to `maxClaims` of `prioritizedRuns` for `agent`.
   //
-  // A Postgres advisory lock keyed by a hash of the adapter type name is held
-  // for the duration of the count so that two different agents sharing the
-  // same adapter type, both ticking around the same moment, do not both read
-  // the same stale headroom and both admit up to the full limit at once --
-  // the exact failure mode a plain in-memory counter would have. The lock is
-  // released as soon as the count is read; the actual claim a caller makes
-  // afterwards still goes through claimQueuedRun's own atomic
-  // `UPDATE ... WHERE status = 'queued'`, which is what prevents the same run
-  // from ever being claimed twice. Between this function returning and that
-  // claim completing there is a small window in which a concurrent scheduler
-  // tick for another agent of the same adapter type could also have been
-  // admitted, so under contention the bucket can be transiently over by a run
-  // or two rather than never exceeded -- turning an unbounded burst (34
-  // processes in 9 seconds, observed on a self-hosted instance after a
-  // restart) into one bounded by roughly the configured limit, not a
-  // hard real-time guarantee.
-  async function reserveAdapterConcurrencySlots(
-    adapterType: string,
-    requested: number,
+  // When the agent's adapter type has no PAPERCLIP_ADAPTER_CONCURRENCY_LIMITS
+  // entry, this is exactly the old unguarded loop: claim in priority order
+  // until `maxClaims` is reached.
+  //
+  // When a limit is configured, the whole batch is claimed while holding a
+  // Postgres advisory lock keyed by the adapter type name, on a connection
+  // reserved for that purpose for the duration of this call. That lock is
+  // what closes the race a bare "count, release, then claim" check leaves
+  // open: without holding it across the claims themselves, two agents
+  // sharing the adapter type could each take the lock just long enough to
+  // read the same "capacity available" snapshot and release it again, and
+  // both would then admit a run -- because neither claim becomes visible to
+  // the other until after the lock was already given up. Holding the lock
+  // until every claim in this batch has been attempted (claimQueuedRun's own
+  // atomic `UPDATE ... WHERE status = 'queued'` still guards against the same
+  // row being claimed twice) means a second caller cannot even begin its own
+  // recount until this batch's runs are already committed as "running" and
+  // visible to it.
+  async function claimRunsWithAdapterConcurrencyGuard(
+    agent: typeof agents.$inferSelect,
+    prioritizedRuns: Array<typeof heartbeatRuns.$inferSelect>,
+    maxClaims: number,
+    companyAgents: AgentOrgRow[],
   ) {
-    if (requested <= 0) return 0;
-    const limit = adapterConcurrencyLimits[adapterType];
-    if (limit === undefined) return requested;
-    return db.transaction(async (tx) => {
-      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${adapterType}))`);
-      const running = await countRunningRunsForAdapterType(adapterType, tx as unknown as Db);
-      return Math.max(0, Math.min(requested, limit - running));
-    });
+    const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
+    const limit = adapterConcurrencyLimits[agent.adapterType];
+    if (limit === undefined) {
+      for (const queuedRun of prioritizedRuns) {
+        if (claimedRuns.length >= maxClaims) break;
+        const claimed = await claimQueuedRun(queuedRun, companyAgents);
+        if (claimed) claimedRuns.push(claimed);
+      }
+      return claimedRuns;
+    }
+    const reserved = await db.$client.reserve();
+    try {
+      await reserved`select pg_advisory_lock(hashtext(${agent.adapterType}))`;
+      const running = await countRunningRunsForAdapterType(agent.adapterType);
+      const allowed = Math.max(0, Math.min(maxClaims, limit - running));
+      for (const queuedRun of prioritizedRuns) {
+        if (claimedRuns.length >= allowed) break;
+        const claimed = await claimQueuedRun(queuedRun, companyAgents);
+        if (claimed) claimedRuns.push(claimed);
+      }
+      return claimedRuns;
+    } finally {
+      await reserved`select pg_advisory_unlock(hashtext(${agent.adapterType}))`.catch(
+        () => {},
+      );
+      reserved.release();
+    }
   }
 
   async function withChatControlRecoveryGate(
@@ -19908,18 +19946,11 @@ export function heartbeatService(
       }
       const policy = parseHeartbeatPolicy(agent);
       const runningCount = await countRunningRunsForAgent(agentId);
-      let availableSlots = Math.max(
+      const availableSlots = Math.max(
         0,
         policy.maxConcurrentRuns - runningCount,
       );
       if (availableSlots <= 0) return [];
-      if (Object.keys(adapterConcurrencyLimits).length > 0) {
-        availableSlots = await reserveAdapterConcurrencySlots(
-          agent.adapterType,
-          availableSlots,
-        );
-        if (availableSlots <= 0) return [];
-      }
 
       const queuedRuns = await db
         .select()
@@ -20007,12 +20038,12 @@ export function heartbeatService(
         return left.createdAt.getTime() - right.createdAt.getTime();
       });
 
-      const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
-      for (const queuedRun of prioritizedRuns) {
-        if (claimedRuns.length >= availableSlots) break;
-        const claimed = await claimQueuedRun(queuedRun, companyAgents);
-        if (claimed) claimedRuns.push(claimed);
-      }
+      const claimedRuns = await claimRunsWithAdapterConcurrencyGuard(
+        agent,
+        prioritizedRuns,
+        availableSlots,
+        companyAgents,
+      );
       if (claimedRuns.length === 0) return [];
 
       for (const claimedRun of claimedRuns) {
