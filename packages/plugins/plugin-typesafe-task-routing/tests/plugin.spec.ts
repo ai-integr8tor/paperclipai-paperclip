@@ -150,6 +150,37 @@ describe("TypeSafe task routing pilot", () => {
     expect(await records(harness)).toHaveLength(1);
   });
 
+  it("coalesces concurrent events for the same input revision", async () => {
+    const { harness } = setup(decision());
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const decide = vi.fn(async () => {
+      await gate;
+      return decision();
+    });
+    const client = { decide } satisfies RoutingDecisionClient;
+    const first = evaluateIssue(harness.ctx, "issue-1", COMPANY_ID, client);
+    const second = evaluateIssue(harness.ctx, "issue-1", COMPANY_ID, client);
+    await vi.waitFor(() => expect(decide).toHaveBeenCalledTimes(1));
+    release();
+    await expect(Promise.all([first, second])).resolves.toEqual(["engineering", "engineering"]);
+    expect(decide).toHaveBeenCalledTimes(1);
+    expect(await records(harness)).toHaveLength(1);
+  });
+
+  it("fails open when recommendation persistence is unavailable", async () => {
+    const { harness, client } = setup(decision());
+    vi.spyOn(harness.ctx.entities, "upsert").mockRejectedValue(new Error("database unavailable"));
+    await expect(evaluateIssue(harness.ctx, "issue-1", COMPANY_ID, client)).resolves.toBe("failed_open");
+  });
+
+  it("fails open when configuration persistence is unavailable", async () => {
+    const { harness, client, decide } = setup(decision());
+    vi.spyOn(harness.ctx.config, "get").mockRejectedValue(new Error("configuration unavailable"));
+    await expect(evaluateIssue(harness.ctx, "issue-1", COMPANY_ID, client)).resolves.toBe("failed_open");
+    expect(decide).not.toHaveBeenCalled();
+  });
+
   it("preserves explicit assignments without calling TypeSafe", async () => {
     const { harness, client, decide } = setup(decision());
     harness.seed({ issues: [issue({ assigneeAgentId: "already-assigned" })] });

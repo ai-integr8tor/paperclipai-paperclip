@@ -20,6 +20,7 @@ const TERMINAL_STATUSES = new Set(["done", "cancelled"]);
 const GATED_ACTION_PATTERN = /\b(refund|capture|void|authorize|re-?auth|store credit|gift card|payment|gateway|send|email|text|sms|publish|public reply|direct message)\b/i;
 const ACTION_REQUEST_PATTERN = /\b(execute|process|issue|apply|run|send|publish|post|reply|change|update|write|approve)\b/i;
 const ROUTING_ENTITY_TYPE = "typesafe-routing-recommendation";
+const inFlightEvaluations = new Map<string, Promise<string>>();
 
 export type RoutingDecision = {
   model: string;
@@ -207,35 +208,22 @@ async function record(ctx: PluginContext, issue: Issue, revision: string, recomm
   });
 }
 
-export async function evaluateIssue(
+function errorType(error: unknown): string {
+  return error instanceof Error ? error.name : "unknown_error";
+}
+
+async function evaluateAndRecord(
   ctx: PluginContext,
-  issueId: string,
-  companyId: string,
-  client?: RoutingDecisionClient,
-  clientFactory: () => RoutingDecisionClient = createTypeSafeDecisionClient,
+  issue: Issue,
+  inputRevision: string,
+  state: Record<string, JsonValue>,
+  config: RoutingConfig,
+  client: RoutingDecisionClient | undefined,
+  clientFactory: () => RoutingDecisionClient,
 ): Promise<string> {
-  const config = normalizeConfig(await ctx.config.get(companyId));
-  if (!config.enabled) return "disabled";
-
-  const issue = await ctx.issues.get(issueId, companyId);
-  if (!issue) return "missing";
-  const project = issue.projectId ? await ctx.projects.get(issue.projectId, companyId) : null;
-  const goal = issue.goalId ? await ctx.goals.get(issue.goalId, companyId) : null;
-  const ineligible = eligibilityReason(issue, project, goal);
-  if (ineligible) return ineligible;
-
-  const state = inputState(issue, project);
-  const inputRevision = computeInputRevision(state);
-  const externalId = `${issue.id}:${inputRevision}:${POLICY_VERSION}`;
-  const existing = await ctx.entities.list({ entityType: ROUTING_ENTITY_TYPE, scopeKind: "issue", scopeId: issue.id, externalId, limit: 1 });
-  if (existing.length > 0) return "duplicate";
-
   const startedAt = performance.now();
   try {
-    let decisionClient = client;
-    if (!decisionClient) {
-      decisionClient = clientFactory();
-    }
+    const decisionClient = client ?? clientFactory();
     const decision = await decisionClient.decide(state, config);
     const latencyMs = Math.round(performance.now() - startedAt);
     const resolved = resolveDecision(decision);
@@ -259,25 +247,81 @@ export async function evaluateIssue(
     });
     return resolved.destination;
   } catch (error) {
-    await record(ctx, issue, inputRevision, {
+    try {
+      await record(ctx, issue, inputRevision, {
+        issueId: issue.id,
+        inputRevision,
+        policyVersion: POLICY_VERSION,
+        questionVersion: QUESTION_VERSION,
+        requestedModelVersion: MODEL_VERSION,
+        returnedModelVersion: null,
+        rawDecision: null,
+        effectiveDecision: null,
+        recommendedAgentId: null,
+        confidence: null,
+        probabilities: null,
+        sufficiencyProbability: null,
+        latencyMs: Math.round(performance.now() - startedAt),
+        usage: null,
+        status: "failed",
+        reason: errorType(error),
+      });
+    } catch (recordError) {
+      ctx.logger.warn("TypeSafe routing failure record could not be persisted", {
+        issueId: issue.id,
+        errorType: errorType(recordError),
+      });
+    }
+    ctx.logger.warn("TypeSafe routing evaluation failed open", {
       issueId: issue.id,
-      inputRevision,
-      policyVersion: POLICY_VERSION,
-      questionVersion: QUESTION_VERSION,
-      requestedModelVersion: MODEL_VERSION,
-      returnedModelVersion: null,
-      rawDecision: null,
-      effectiveDecision: null,
-      recommendedAgentId: null,
-      confidence: null,
-      probabilities: null,
-      sufficiencyProbability: null,
-      latencyMs: Math.round(performance.now() - startedAt),
-      usage: null,
-      status: "failed",
-      reason: error instanceof Error ? error.name : "unknown_error",
+      errorType: errorType(error),
     });
-    ctx.logger.warn("TypeSafe routing evaluation failed open", { issueId, errorType: error instanceof Error ? error.name : "unknown" });
+    return "failed_open";
+  }
+}
+
+export async function evaluateIssue(
+  ctx: PluginContext,
+  issueId: string,
+  companyId: string,
+  client?: RoutingDecisionClient,
+  clientFactory: () => RoutingDecisionClient = createTypeSafeDecisionClient,
+): Promise<string> {
+  try {
+    const config = normalizeConfig(await ctx.config.get(companyId));
+    if (!config.enabled) return "disabled";
+
+    const issue = await ctx.issues.get(issueId, companyId);
+    if (!issue) return "missing";
+    const project = issue.projectId ? await ctx.projects.get(issue.projectId, companyId) : null;
+    const goal = issue.goalId ? await ctx.goals.get(issue.goalId, companyId) : null;
+    const ineligible = eligibilityReason(issue, project, goal);
+    if (ineligible) return ineligible;
+
+    const state = inputState(issue, project);
+    const inputRevision = computeInputRevision(state);
+    const externalId = `${issue.id}:${inputRevision}:${POLICY_VERSION}`;
+    const existing = await ctx.entities.list({ entityType: ROUTING_ENTITY_TYPE, scopeKind: "issue", scopeId: issue.id, externalId, limit: 1 });
+    if (existing.length > 0) return "duplicate";
+
+    const inFlightKey = `${companyId}:${externalId}`;
+    const existingEvaluation = inFlightEvaluations.get(inFlightKey);
+    if (existingEvaluation) return existingEvaluation;
+
+    const evaluation = evaluateAndRecord(ctx, issue, inputRevision, state, config, client, clientFactory);
+    inFlightEvaluations.set(inFlightKey, evaluation);
+    try {
+      return await evaluation;
+    } finally {
+      if (inFlightEvaluations.get(inFlightKey) === evaluation) {
+        inFlightEvaluations.delete(inFlightKey);
+      }
+    }
+  } catch (error) {
+    ctx.logger.warn("TypeSafe routing preflight failed open", {
+      issueId,
+      errorType: errorType(error),
+    });
     return "failed_open";
   }
 }
