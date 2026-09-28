@@ -21,7 +21,11 @@
 import { fork, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createInterface, type Interface as ReadlineInterface } from "node:readline";
+import { OneCLI, type ContainerConfig } from "@onecli-sh/sdk";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import {
   JSONRPC_VERSION,
@@ -3549,6 +3553,43 @@ export interface PluginWorkerManagerOptions {
    * stays upstream admission only.
    */
   maxConcurrentDuplexRoutes?: number | null;
+  /** Test seam for the trusted host-side OneCLI control client. */
+  getOneCliContainerConfig?: (options: { agent: string }) => Promise<ContainerConfig>;
+}
+
+const TYPESAFE_ROUTING_PLUGIN_ID = "oxford.typesafe-task-routing";
+const TYPESAFE_ROUTING_ONECLI_AGENT = "occ-typesafe-routing-plugin";
+const ONECLI_PROXY_ENV_NAMES = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] as const;
+
+export async function resolvePluginWorkerOneCliEnv(
+  pluginManifestId: string,
+  getContainerConfig: (options: { agent: string }) => Promise<ContainerConfig>,
+): Promise<Record<string, string>> {
+  if (pluginManifestId !== TYPESAFE_ROUTING_PLUGIN_ID) return {};
+
+  const config = await getContainerConfig({ agent: TYPESAFE_ROUTING_ONECLI_AGENT });
+  const env: Record<string, string> = {};
+  for (const name of ONECLI_PROXY_ENV_NAMES) {
+    const value = config.env?.[name];
+    if (typeof value === "string" && value.length > 0) env[name] = value;
+  }
+  if (!env.HTTPS_PROXY && !env.https_proxy) {
+    throw new Error("TypeSafe routing worker OneCLI binding has no HTTPS proxy");
+  }
+  if (typeof config.caCertificate !== "string" || config.caCertificate.trim().length === 0) {
+    throw new Error("TypeSafe routing worker OneCLI binding has no CA certificate");
+  }
+
+  const caDirectory = await mkdtemp(join(tmpdir(), "paperclip-onecli-ca-"));
+  const caPath = join(caDirectory, "proxy-ca.pem");
+  await writeFile(caPath, config.caCertificate, { mode: 0o600 });
+
+  return {
+    ...env,
+    NODE_USE_ENV_PROXY: "1",
+    ONECLI_GATEWAY: "true",
+    NODE_EXTRA_CA_CERTS: caPath,
+  };
 }
 
 /**
@@ -3655,11 +3696,17 @@ export function createPluginWorkerManager(
         );
       }
 
+      const oneCliEnv = await resolvePluginWorkerOneCliEnv(
+        options.manifest.id,
+        managerOptions?.getOneCliContainerConfig
+          ?? ((input) => new OneCLI().getContainerConfig(input)),
+      );
       const handle = createPluginWorkerHandle(pluginId, {
         // Inject the shared process-scoped route-slot controller, unless the
         // caller already supplied its own (a test may inject its own).
         duplexRouteSlots,
         ...options,
+        env: { ...options.env, ...oneCliEnv },
       });
       workers.set(pluginId, handle);
 

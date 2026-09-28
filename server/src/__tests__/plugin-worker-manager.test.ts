@@ -1,4 +1,5 @@
 import path from "node:path";
+import { access, readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
@@ -32,6 +33,7 @@ import {
   createDuplexRouteSlotController,
   createPluginWorkerHandle,
   formatWorkerFailureMessage,
+  resolvePluginWorkerOneCliEnv,
   resolveRpcCallTimeoutMs,
 } from "../services/plugin-worker-manager.js";
 
@@ -55,6 +57,67 @@ const TEST_MANIFEST: PaperclipPluginManifestV1 = {
   capabilities: [],
   entrypoints: { worker: "dist/worker.js" },
 };
+
+describe("TypeSafe worker OneCLI launcher boundary", () => {
+  it("scopes the binding to the exact TypeSafe plugin and agent", async () => {
+    const getContainerConfig = vi.fn(async () => ({
+      env: { HTTPS_PROXY: "http://gateway.invalid" },
+      caCertificate: "test-ca",
+      caCertificateContainerPath: "/untrusted/container/path",
+    }));
+
+    await expect(resolvePluginWorkerOneCliEnv("example.other", getContainerConfig)).resolves.toEqual({});
+    expect(getContainerConfig).not.toHaveBeenCalled();
+
+    await resolvePluginWorkerOneCliEnv("oxford.typesafe-task-routing", getContainerConfig);
+    expect(getContainerConfig).toHaveBeenCalledWith({ agent: "occ-typesafe-routing-plugin" });
+  });
+
+  it("returns only proxy aliases, gateway markers, and a readable host CA path", async () => {
+    const env = await resolvePluginWorkerOneCliEnv(
+      "oxford.typesafe-task-routing",
+      async () => ({
+        env: {
+          HTTPS_PROXY: "http://gateway.invalid",
+          HTTP_PROXY: "http://gateway.invalid",
+          ONECLI_API_KEY: "must-not-cross-boundary",
+          TYPESAFE_API_KEY: "must-not-cross-boundary",
+          UNRELATED: "must-not-cross-boundary",
+        },
+        caCertificate: "test-ca",
+        caCertificateContainerPath: "/untrusted/container/path",
+      }),
+    );
+
+    expect(Object.keys(env).sort()).toEqual([
+      "HTTPS_PROXY",
+      "HTTP_PROXY",
+      "NODE_EXTRA_CA_CERTS",
+      "NODE_USE_ENV_PROXY",
+      "ONECLI_GATEWAY",
+    ].sort());
+    expect(env).not.toHaveProperty("ONECLI_API_KEY");
+    expect(env).not.toHaveProperty("TYPESAFE_API_KEY");
+    await expect(access(env.NODE_EXTRA_CA_CERTS!)).resolves.toBeUndefined();
+    await expect(readFile(env.NODE_EXTRA_CA_CERTS!, "utf8")).resolves.toBe("test-ca");
+  });
+
+  it("fails closed when the binding lacks proxy or CA configuration", async () => {
+    await expect(resolvePluginWorkerOneCliEnv(
+      "oxford.typesafe-task-routing",
+      async () => ({ env: {}, caCertificate: "test-ca", caCertificateContainerPath: "/unused" }),
+    )).rejects.toThrow("has no HTTPS proxy");
+
+    await expect(resolvePluginWorkerOneCliEnv(
+      "oxford.typesafe-task-routing",
+      async () => ({
+        env: { HTTPS_PROXY: "http://gateway.invalid" },
+        caCertificate: "",
+        caCertificateContainerPath: "/unused",
+      }),
+    )).rejects.toThrow("has no CA certificate");
+  });
+});
 
 describe("resolveRpcCallTimeoutMs", () => {
   const MAX_RPC_TIMEOUT_MS = 15 * 60 * 1_000;
