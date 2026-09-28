@@ -1081,6 +1081,9 @@ describe("stageCodexHomeForSync", () => {
     // skills/ is a directory of symlinks.
     await fs.mkdir(path.join(home, "skills"), { recursive: true });
     await fs.symlink(skillSource, path.join(home, "skills", "demo.md"));
+    // agents/ holds agent-role links into skill sources.
+    await fs.mkdir(path.join(home, "agents"), { recursive: true });
+    await fs.symlink(skillSource, path.join(home, "agents", "demo.toml"));
 
     // Decoys: large runtime state the 4-name denylist missed.
     await fs.writeFile(path.join(home, "logs_2.sqlite"), "x", "utf8");
@@ -1119,6 +1122,9 @@ describe("stageCodexHomeForSync", () => {
       const stagedSkill = path.join(staged, "skills", "demo.md");
       expect((await fs.lstat(stagedSkill)).isSymbolicLink()).toBe(false);
       expect(await fs.readFile(stagedSkill, "utf8")).toBe(skillBytes);
+
+      // agents/ (agent roles linked from skills) copied the same way.
+      expect(await fs.readFile(path.join(staged, "agents", "demo.toml"), "utf8")).toBe(skillBytes);
 
       // config.toml (post-rewrite state) carried through.
       expect(await fs.readFile(path.join(staged, "config.toml"), "utf8")).toContain("model_provider");

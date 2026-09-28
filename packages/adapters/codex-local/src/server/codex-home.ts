@@ -16,7 +16,7 @@ const MANAGED_MCP_BLOCK_END = "# END PAPERCLIP MANAGED MCP";
  * stages into the sandbox `home` asset (see {@link stageCodexHomeForSync}).
  * Derived from the seeding constants so it can never drift from what the adapter
  * actually writes into the home: the copied static config files, the symlinked
- * credential file, and the injected `skills/` directory. Everything else the
+ * credential file, and the injected `skills/` and `agents/` directories. Everything else the
  * stock upstream `codex` binary writes at runtime (`*.sqlite`, `*-wal`,
  * `plugins/`, `cache/`, `sessions/`, `shell_snapshots/`, …) is intentionally
  * excluded — it is large host-local runtime state the sandbox run never needs.
@@ -25,6 +25,7 @@ export const CODEX_SYNC_ALLOWLIST = [
   ...COPIED_SHARED_FILES,
   ...SYMLINKED_SHARED_FILES,
   "skills",
+  "agents",
 ] as const;
 
 export type ManagedCodexMcpGateway = {
@@ -446,8 +447,8 @@ async function stageContainedSubtree(
 }
 
 /**
- * Recursively copies `sourceDir` (a directory allowlist entry — currently only
- * `skills/`) into `targetDir`, dereferencing symlinks to bytes and normalizing
+ * Recursively copies `sourceDir` (a directory allowlist entry — `skills/` or
+ * `agents/`) into `targetDir`, dereferencing symlinks to bytes and normalizing
  * every copied regular file to mode `0600`. Created directories get mode `0700`.
  *
  * This replaces `fs.cp({ dereference: true })` which preserves source file modes,

@@ -189,4 +189,29 @@ describe("codex local adapter skill injection", () => {
       await fs.realpath(path.join(currentRepo, "skills", "agent-browser")),
     );
   });
+
+  it("links agent roles shipped in a desired skill into CODEX_HOME/agents and drops them when the skill is removed", async () => {
+    const root = await makeTempDir("paperclip-codex-agent-roles-");
+    cleanupDirs.add(root);
+    const codexHome = path.join(root, "codex-home");
+    const skillsHome = path.join(codexHome, "skills");
+    await createCustomSkill(root, "design");
+    const skillSource = path.join(root, "custom", "design");
+    await fs.mkdir(path.join(skillSource, "agents"), { recursive: true });
+    await fs.writeFile(path.join(skillSource, "agents", "design_reviewer.toml"), 'name = "design_reviewer"\n', "utf8");
+    await fs.writeFile(path.join(skillSource, "agents", "openai.yaml"), "interface: {}\n", "utf8");
+    await fs.mkdir(path.join(codexHome, "agents"), { recursive: true });
+    await fs.writeFile(path.join(codexHome, "agents", "mine.toml"), 'name = "mine"\n', "utf8");
+    const entry = { key: "company/c/design", runtimeName: "design", source: skillSource };
+
+    await ensureCodexSkillsInjected(async () => {}, { skillsHome, skillsEntries: [entry], desiredSkillNames: [entry.key] });
+
+    const role = path.join(codexHome, "agents", "design_reviewer.toml");
+    expect(await fs.readlink(role)).toBe(path.join(skillSource, "agents", "design_reviewer.toml"));
+    expect((await fs.readdir(path.join(codexHome, "agents"))).sort()).toEqual(["design_reviewer.toml", "mine.toml"]);
+
+    await ensureCodexSkillsInjected(async () => {}, { skillsHome, skillsEntries: [entry], desiredSkillNames: [] });
+
+    expect(await fs.readdir(path.join(codexHome, "agents"))).toEqual(["mine.toml"]);
+  });
 });

@@ -265,6 +265,39 @@ async function pruneBrokenUnavailablePaperclipSkillSymlinks(
   }
 }
 
+// Codex loads agent roles only from CODEX_HOME/agents, not from a skill's own agents/ folder:
+// link the roles that desired skills ship, and drop links to skills that are no longer desired.
+async function syncCodexSkillAgentRoles(
+  codexHome: string,
+  skillsEntries: Array<{ source: string }>,
+  onLog: AdapterExecutionContext["onLog"],
+) {
+  const agentsHome = path.join(codexHome, "agents");
+  const wanted = new Map<string, string>();
+  for (const entry of skillsEntries) {
+    const rolesDir = path.join(entry.source, "agents");
+    for (const name of (await fs.readdir(rolesDir).catch(() => [])).sort()) {
+      if (name.endsWith(".toml") && !wanted.has(name)) wanted.set(name, path.join(rolesDir, name));
+    }
+  }
+  for (const name of await fs.readdir(agentsHome).catch(() => [])) {
+    const target = path.join(agentsHome, name);
+    const linkedPath = await fs.readlink(target).catch(() => null);
+    if (!linkedPath) continue;
+    const resolvedLinkedPath = path.resolve(agentsHome, linkedPath);
+    if (wanted.get(name) === resolvedLinkedPath) continue;
+    if (!(await pathExists(path.join(path.dirname(path.dirname(resolvedLinkedPath)), "SKILL.md")))) continue;
+    await fs.unlink(target).catch(() => {});
+  }
+  if (wanted.size === 0) return;
+  await fs.mkdir(agentsHome, { recursive: true });
+  for (const [name, source] of wanted) {
+    if ((await ensurePaperclipSkillSymlink(source, path.join(agentsHome, name))) === "created") {
+      await onLog("stdout", `[paperclip] Linked Codex agent role "${name}" into ${agentsHome}\n`);
+    }
+  }
+}
+
 function resolveCodexSkillsDir(codexHome: string): string {
   return path.join(codexHome, "skills");
 }
@@ -510,9 +543,10 @@ export async function ensureCodexSkillsInjected(
     options.desiredSkillNames ?? allSkillsEntries.map((entry) => entry.key);
   const desiredSet = new Set(desiredSkillNames);
   const skillsEntries = allSkillsEntries.filter((entry) => desiredSet.has(entry.key));
+  const skillsHome = options.skillsHome ?? resolveCodexSkillsDir(resolveSharedCodexHomeDir());
+  await syncCodexSkillAgentRoles(path.dirname(skillsHome), skillsEntries, onLog);
   if (skillsEntries.length === 0) return;
 
-  const skillsHome = options.skillsHome ?? resolveCodexSkillsDir(resolveSharedCodexHomeDir());
   await fs.mkdir(skillsHome, { recursive: true });
   const linkSkill = options.linkSkill;
   for (const entry of skillsEntries) {
