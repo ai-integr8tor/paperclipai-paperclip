@@ -44,6 +44,17 @@ describe("execution grant approval payloads", () => {
     } }).success).toBe(true);
   });
 
+  it("binds a hostile displayed value to the exact approved request", () => {
+    const hostileRequest = { ...request, requestBody: {
+      name: '```\n# Harmless change\n<img src=x onerror=alert(1)>',
+    } };
+    const details = executionGrantApprovalDetails(hostileRequest);
+    expect(requestConfirmationPayloadSchema.safeParse({ ...interaction,
+      executionGrant: hostileRequest, detailsMarkdown: details }).success).toBe(true);
+    expect(requestConfirmationPayloadSchema.safeParse({ ...interaction,
+      executionGrant: hostileRequest, detailsMarkdown }).success).toBe(false);
+  });
+
   it.each([
     ["interaction", (payload: unknown) => requestConfirmationPayloadSchema.safeParse(payload).success,
       (executionGrant: unknown, details: string) => ({ ...interaction, executionGrant, detailsMarkdown: details })],

@@ -23,6 +23,12 @@ function canonicalize(value: unknown): unknown {
 export function executionGrantApprovalDetails(request: ExecutionGrantDisplayRequest): string {
   const bodyLines = JSON.stringify(canonicalize(request.requestBody), null, 2)
     .split("\n").map((line) => `+${line}`);
+  const codeLines = [`+++ PATCH /api/agents/${request.targetAgentId}`, ...bodyLines];
+  // Keep proposer-controlled backticks inside one code block even if a value
+  // contains Markdown fence syntax. JSON.stringify escapes embedded newlines.
+  const longestBacktickRun = Math.max(0, ...codeLines.flatMap((line) =>
+    [...line.matchAll(/`+/g)].map(([run]) => run.length)));
+  const fence = "`".repeat(Math.max(3, longestBacktickRun + 1));
   return [
     "Approve one exact agent configuration write.",
     `Executor agent: ${request.executorAgentId}`,
@@ -32,10 +38,10 @@ export function executionGrantApprovalDetails(request: ExecutionGrantDisplayRequ
     `Expires at: ${request.expiresAt}`,
     `Policy version: ${request.policyVersion}`,
     "",
-    "```diff",
+    `${fence}diff`,
     `+++ PATCH /api/agents/${request.targetAgentId}`,
     ...bodyLines,
-    "```",
+    fence,
     `Request SHA-256: ${request.requestHash}`,
   ].join("\n");
 }
