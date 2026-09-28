@@ -357,6 +357,28 @@ function classifyHttpError(status: number): { code: string; family: AdapterExecu
   return { code: "hermes_gateway_protocol_error", family: null };
 }
 
+/**
+ * RFC 9110 section 10.2.3 lets `Retry-After` carry either an HTTP-date or a
+ * delay in seconds. Paperclip persists `retryNotBefore` and every consumer
+ * reads it as an absolute timestamp (`new Date(value)`), so the delta-seconds
+ * form must be made absolute here: `new Date("1")` is 2001-01-01, i.e. a hint
+ * that looks long expired and gets dropped. Measured in production on
+ * 2026-09-27: a Hermes API server's concurrent-run cap answers `POST /v1/runs`
+ * with `429` and `Retry-After: 1`.
+ */
+export function normalizeRetryAfter(
+  value: string | null | undefined,
+  now: Date = new Date(),
+): string | null {
+  const raw = value?.trim();
+  if (!raw) return null;
+  if (/^\d+$/.test(raw)) {
+    return new Date(now.getTime() + Number(raw) * 1000).toISOString();
+  }
+  const parsed = new Date(raw);
+  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+}
+
 function fetchFailureMessage(err: unknown): string {
   const message = err instanceof Error ? err.message : String(err);
   const cause = err instanceof Error ? (err as { cause?: unknown }).cause : null;
@@ -770,7 +792,7 @@ function errorResult(err: unknown, redactText: TextRedactor = sanitizeSensitiveT
     timedOut: false,
     errorCode: code,
     errorFamily: classified?.family ?? (code === "hermes_gateway_connect_failed" ? "transient_upstream" : null),
-    retryNotBefore: hermesError.retryNotBefore ?? null,
+    retryNotBefore: normalizeRetryAfter(hermesError.retryNotBefore),
     errorMessage,
     errorMeta: {
       ...(hermesError.status ? { status: hermesError.status } : {}),

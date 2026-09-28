@@ -1,6 +1,6 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
-import { execute, mapFinalResultForTest, parseSseFramesForTest, resolveSessionKey } from "./execute.js";
+import { execute, mapFinalResultForTest, normalizeRetryAfter, parseSseFramesForTest, resolveSessionKey } from "./execute.js";
 import { testEnvironment } from "./test.js";
 
 function makeCtx(config: Record<string, unknown>): AdapterExecutionContext {
@@ -498,6 +498,43 @@ describe("execute", () => {
     expect(result.errorMessage).toContain("Check adapterConfig.apiKey matches the Hermes API_SERVER_KEY");
   });
 
+  it("classifies a 429 delivery refusal as transient and makes Retry-After absolute", async () => {
+    // Measured shape (production, 2026-09-27): a Hermes API server's
+    // concurrent-run cap answers POST /v1/runs with 429, `Retry-After: 1` and a
+    // rate_limit body.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            error: {
+              message: "Too many concurrent runs (max 10)",
+              type: "rate_limit_error",
+              code: "rate_limit_exceeded",
+            },
+          }),
+          { status: 429, headers: { "retry-after": "1" } },
+        ),
+      ),
+    );
+
+    const before = Date.now();
+    const result = await execute(makeCtx({
+      apiBaseUrl: "http://127.0.0.1:8642",
+      apiKey: "test-api-key",
+    }));
+    const after = Date.now();
+
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("hermes_gateway_rate_limited");
+    expect(result.errorFamily).toBe("transient_upstream");
+    // Absolute, not the raw "1" that `new Date("1")` would read as 2001-01-01.
+    const retryAt = new Date(result.retryNotBefore ?? "").getTime();
+    expect(Number.isNaN(retryAt)).toBe(false);
+    expect(retryAt).toBeGreaterThanOrEqual(before + 1_000);
+    expect(retryAt).toBeLessThanOrEqual(after + 1_000);
+  });
+
   it("includes network causes in connection failure messages", async () => {
     const cause = Object.assign(new Error("getaddrinfo ENOTFOUND host.docker.internal"), { code: "ENOTFOUND" });
     vi.stubGlobal("fetch", vi.fn(async () => {
@@ -763,5 +800,26 @@ describe("mapFinalResultForTest", () => {
     expect(result.exitCode).toBe(1);
     expect(result.errorCode).toBe("hermes_gateway_run_failed");
     expect(result.errorMessage).toBe("boom");
+  });
+});
+
+describe("normalizeRetryAfter", () => {
+  const now = new Date("2026-09-27T06:20:55.000Z");
+
+  it("converts delta-seconds into an absolute timestamp", () => {
+    expect(normalizeRetryAfter("1", now)).toBe("2026-09-27T06:20:56.000Z");
+    expect(normalizeRetryAfter(" 120 ", now)).toBe("2026-09-27T06:22:55.000Z");
+  });
+
+  it("keeps an HTTP-date form", () => {
+    expect(normalizeRetryAfter("Wed, 27 Sep 2026 06:21:55 GMT", now)).toBe(
+      "2026-09-27T06:21:55.000Z",
+    );
+  });
+
+  it("returns null for an absent or unparseable header", () => {
+    expect(normalizeRetryAfter(null, now)).toBeNull();
+    expect(normalizeRetryAfter("  ", now)).toBeNull();
+    expect(normalizeRetryAfter("soon", now)).toBeNull();
   });
 });
