@@ -1062,6 +1062,21 @@ function resolveCodexTransientFallbackMode(
   return "fresh_session_safer_invocation";
 }
 
+// Delivery failures from an agent's own gateway are transient infrastructure,
+// not a failed attempt at the task: the API server refused the wake before any
+// provider work started. Measured in production on 2026-09-27: the agent
+// gateway's `max_concurrent_runs` cap answers `POST /v1/runs` with 429 +
+// `Retry-After: 1`, the adapter records `errorFamily: transient_upstream` and
+// `retryNotBefore`, and the run still settled as a terminal failure with
+// `scheduledRetryAt: null` - 50 runs over three minutes, one per second. These
+// codes belong in the same bounded-transient lane as the codex/claude upstream
+// codes below, so the retry ladder (and any later Retry-After hint) applies.
+const TRANSIENT_GATEWAY_DELIVERY_ERROR_CODES = new Set<string>([
+  "hermes_gateway_rate_limited",
+  "hermes_gateway_upstream_error",
+  "hermes_gateway_connect_failed",
+]);
+
 function readHeartbeatRunErrorFamily(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
 ) {
@@ -1075,7 +1090,9 @@ function readHeartbeatRunErrorFamily(
   if (
     run.errorCode === "codex_transient_upstream" ||
     run.errorCode === "claude_transient_upstream" ||
-    run.errorCode === "codex_harness_crash"
+    run.errorCode === "codex_harness_crash" ||
+    (run.errorCode != null &&
+      TRANSIENT_GATEWAY_DELIVERY_ERROR_CODES.has(run.errorCode))
   ) {
     return "transient_upstream";
   }
