@@ -88,17 +88,28 @@ describe("describeIssueWriteDenial", () => {
 
   // The two codes must not share copy. `required` means "you sent no run id",
   // where resending the header is the entire fix; `rejected` means a run id was
-  // supplied and could not be bound, where that same advice burns a run per
-  // attempt against a wall that will not move.
-  it("tells a rejected run id not to retry the header it already sent", () => {
+  // supplied and could not be bound, where retrying the *same* id burns a run
+  // per attempt against a wall that will not move.
+  //
+  // The remedy is still per-credential rather than a blanket "resend the
+  // header": `req.actor.runId` comes from the signed claim on the agent-JWT path
+  // but straight from the header on the API-key path, so an API-key caller can
+  // in fact fix this by sending a live run id. Asserting the header is never
+  // mentioned would be asserting a false claim about half of the callers.
+  it("tells a rejected run id not to retry the same run id, on either credential", () => {
     const copy = describeIssueWriteDenial("cross_issue_influence_run_context_rejected", {
       actorLabel: "Fable",
     });
     expect(copy.status).toBe(403);
     expect(copy.tone).toBe("boundary");
     expect(copy.whoCanAct).toContain("Fable");
-    expect(copy.sanctionedPath).not.toContain("X-Paperclip-Run-Id");
-    expect(copy.sanctionedPath).toContain("Do not retry");
+    expect(copy.sanctionedPath).toContain("Do not retry with the same run id");
+    // The JWT path cannot be fixed by a header; the API-key path can.
+    expect(copy.sanctionedPath).toContain("agent JWT");
+    expect(copy.sanctionedPath).toContain("X-Paperclip-Run-Id");
+    // The description must not assert the id always came from a signed
+    // credential — that is false for API-key callers.
+    expect(copy.description).not.toContain("read from the signed credential");
     expect(copy.description).toContain("Fable");
   });
 

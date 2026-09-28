@@ -4,7 +4,6 @@ import { activityLog, heartbeatRuns, issues } from "@paperclipai/db";
 import { isUuidLike, issueWriteDenialResponse } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 import { logger } from "../middleware/logger.js";
-import { TERMINAL_HEARTBEAT_RUN_STATUSES } from "./issues.js";
 
 export const CROSS_ISSUE_INFLUENCE_LIMIT = 20;
 export const CROSS_ISSUE_INFLUENCE_ENFORCE_AT = new Date("2026-08-11T00:00:00.000Z");
@@ -64,22 +63,35 @@ function readRunSourceIssueId(contextSnapshot: unknown) {
  * the checkout succeeded and the disposition could not be recorded.
  *
  * Read without `for update` on purpose: the issue-write routes lock the issue
- * row themselves, and taking that lock here would invert the lock order.
+ * row themselves, and taking that lock here would invert the lock order against
+ * `clearCheckoutRunIfTerminal`, which takes issue-then-run. The residual window
+ * is bounded and benign: this transaction holds the run row `for update` for its
+ * whole body, so a release that goes through `clearCheckoutRunIfTerminal` blocks
+ * until this transaction commits, and the write that follows the commit is a
+ * single request on an issue the run did hold at decision time.
  *
- * A terminal run holds nothing. The claim a finished run left behind is
- * released lazily (`clearCheckoutRunIfTerminal`, `resolveIssueOwner*`), so the
- * column can still name a run that already ended. Without this guard that stale
- * id would be a permanent, uncounted exemption — the per-run cap below is the
- * only remaining containment for a write that is not the run's own source issue,
- * and a run that can no longer act should not hold a reserve against it. A
- * terminal run's own disposition is recorded by finalization, not by a new API
- * write, so nothing in-boundary is lost by charging it.
+ * Only a run with a live process holds anything, so the exemption requires
+ * `running` rather than merely "not terminal". Both sides of that matter:
+ *
+ * - A terminal run's claim is released lazily (`clearCheckoutRunIfTerminal`,
+ *   `resolveIssueOwner*`), so the column can still name a run that already ended.
+ * - A `queued` or `scheduled_retry` run has no process at all, and
+ *   `issues.executionRunId` is written at *scheduling* time
+ *   (`heartbeat.ts`, the scheduled-retry path), before the run starts. That is a
+ *   reservation, not a claim.
+ *
+ * Without both guards a stale or merely-scheduled id would be a permanent,
+ * uncounted exemption — the per-run cap below is the only remaining containment
+ * for a write that is not the run's own source issue. A terminal run's own
+ * disposition is recorded by finalization, not by a new API write, and a run
+ * with no process is not the one making the write, so nothing in-boundary is
+ * lost by charging either.
  */
 async function runHoldsIssue(
   tx: Parameters<Parameters<Db["transaction"]>[0]>[0],
   input: { companyId: string; runId: string; runStatus: string; targetIssueId: string },
 ): Promise<boolean> {
-  if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(input.runStatus)) return false;
+  if (input.runStatus !== "running") return false;
   const rows = await tx
     .select({
       issueId: issues.id,

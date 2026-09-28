@@ -265,4 +265,28 @@ describe("cross-issue influence limit rollout", () => {
       expect.objectContaining({ action: "issue.cross_issue_influence_observed" }),
     ]);
   });
+
+  // `issues.executionRunId` is written at *scheduling* time, so it can already
+  // name a run that has no process. A queued or scheduled-retry run is a
+  // reservation, not a claim, and must not buy an uncounted exemption.
+  it.each(["queued", "scheduled_retry"])(
+    "does not let a %s run's unstarted reservation exempt a write",
+    async (status) => {
+      const fake = counterDb(0, { contextSnapshot: {}, status }, {
+        executionRunId: "11111111-1111-4111-8111-111111111111",
+      });
+
+      await expect(observeCrossIssueInfluence(fake.db as never, {
+        companyId: "22222222-2222-4222-8222-222222222222",
+        runId: "11111111-1111-4111-8111-111111111111",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        targetIssueId: "55555555-5555-4555-8555-555555555555",
+        kind: "update",
+        now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+      })).resolves.toMatchObject({ allowed: true, count: 1, mode: "enforce" });
+      expect(fake.inserted).toEqual([
+        expect.objectContaining({ action: "issue.cross_issue_influence_observed" }),
+      ]);
+    },
+  );
 });
