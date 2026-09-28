@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq, sql } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -348,6 +348,56 @@ describeEmbeddedPostgres("heartbeat adapter-type concurrency limit", () => {
       expect(agentBRuns).toHaveLength(1);
       expect(agentBRuns[0]?.status).toBe("queued");
       expect(mockAdapterExecute).not.toHaveBeenCalled();
+    },
+    15_000,
+  );
+
+  it(
+    "admits only one of two agents racing for the same adapter type's single slot",
+    async () => {
+      // Both agents wake up with no run yet occupying the adapter type's
+      // single slot, so both admission attempts start from the same "0
+      // running, capacity available" state and genuinely race -- this is the
+      // scenario the instance-wide guard exists for: two concurrent callers
+      // reading the same snapshot and both deciding they may claim.
+      const { agentAId, agentBId } = await createCompanyAndAgents();
+      const heartbeat = heartbeatService(db, {
+        runtimeEnv: {
+          PAPERCLIP_ADAPTER_CONCURRENCY_LIMITS: JSON.stringify({
+            [CONCURRENCY_TEST_ADAPTER]: 1,
+          }),
+        },
+      });
+
+      await Promise.all([
+        heartbeat.wakeup(agentAId, {
+          source: "on_demand",
+          triggerDetail: "manual",
+          manualUserWake: true,
+          requestedByActorType: "user",
+          requestedByActorId: "test-responsible-user",
+        }),
+        heartbeat.wakeup(agentBId, {
+          source: "on_demand",
+          triggerDetail: "manual",
+          manualUserWake: true,
+          requestedByActorType: "user",
+          requestedByActorId: "test-responsible-user",
+        }),
+      ]);
+      await heartbeat.drainActiveRunExecutions();
+
+      const allRuns = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(inArray(heartbeatRuns.agentId, [agentAId, agentBId]));
+      const admitted = allRuns.filter((run) => run.status === "succeeded");
+      const stillQueued = allRuns.filter((run) => run.status === "queued");
+      // Exactly one of the two ever ran: the guard admitted one and left the
+      // other queued instead of letting both through.
+      expect(admitted).toHaveLength(1);
+      expect(stillQueued).toHaveLength(1);
+      expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
     },
     15_000,
   );

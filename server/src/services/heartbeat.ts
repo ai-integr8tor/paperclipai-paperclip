@@ -9501,6 +9501,21 @@ export function heartbeatService(
   // resolveAdapterConcurrencyLimits above); an empty map disables every
   // check below at negligible cost, so this feature is a no-op by default.
   const adapterConcurrencyLimits = resolveAdapterConcurrencyLimits(runtimeEnv);
+  if (Object.keys(adapterConcurrencyLimits).length > 0) {
+    // claimRunsWithAdapterConcurrencyGuard holds one pooled connection for its
+    // lock/count transaction and needs at least one more free for
+    // claimQueuedRun's own work while that transaction is open. A
+    // single-connection pool would make every guarded wake wait on itself.
+    const poolMax = Number(runtimeEnv.DATABASE_POOL_MAX);
+    if (Number.isFinite(poolMax) && poolMax === 1) {
+      logger.warn(
+        { poolMax },
+        "PAPERCLIP_ADAPTER_CONCURRENCY_LIMITS is set but DATABASE_POOL_MAX=1; " +
+          "this combination can stall queued run admission indefinitely for " +
+          "the throttled adapter type(s). Set DATABASE_POOL_MAX to 2 or more.",
+      );
+    }
+  }
   const getWorktreeExecutionCutoff = async () => {
     const override = await resolveWorktreeRunExecutionOverride();
     return override.allowed ? override.cutoff : null;
@@ -16990,20 +17005,39 @@ export function heartbeatService(
   // entry, this is exactly the old unguarded loop: claim in priority order
   // until `maxClaims` is reached.
   //
-  // When a limit is configured, the whole batch is claimed while holding a
-  // Postgres advisory lock keyed by the adapter type name, on a connection
-  // reserved for that purpose for the duration of this call. That lock is
-  // what closes the race a bare "count, release, then claim" check leaves
-  // open: without holding it across the claims themselves, two agents
-  // sharing the adapter type could each take the lock just long enough to
-  // read the same "capacity available" snapshot and release it again, and
-  // both would then admit a run -- because neither claim becomes visible to
-  // the other until after the lock was already given up. Holding the lock
-  // until every claim in this batch has been attempted (claimQueuedRun's own
-  // atomic `UPDATE ... WHERE status = 'queued'` still guards against the same
-  // row being claimed twice) means a second caller cannot even begin its own
-  // recount until this batch's runs are already committed as "running" and
-  // visible to it.
+  // When a limit is configured, the whole batch is claimed inside one
+  // transaction that holds a `pg_advisory_xact_lock` keyed by the adapter
+  // type name for as long as the transaction is open. That lock is what
+  // closes the race a bare "count, then claim" check leaves open: without
+  // holding it across the claims themselves, two callers sharing the adapter
+  // type could each read the same "capacity available" count before either
+  // commits a claim, and both would then admit a run.
+  //
+  // The lock is transaction-scoped (`pg_advisory_xact_lock`, not
+  // `pg_advisory_lock`): Postgres releases it automatically at COMMIT or
+  // ROLLBACK, on whichever backend happens to run this transaction, so it
+  // needs no unlock call and does not depend on two statements landing on
+  // the same physical connection -- unlike a session-scoped lock taken on a
+  // client-reserved connection, which a transaction-mode external pooler can
+  // silently break.
+  //
+  // The count check runs as its own statement on this same transaction
+  // (`tx`, not the outer pooled `db`), *after* the lock statement: Postgres
+  // takes a fresh snapshot per statement under READ COMMITTED, so a count
+  // statement that only starts executing once the lock is acquired correctly
+  // sees every run any other holder of this same lock already committed --
+  // folding both into one statement (e.g. as extra WHERE-clause conditions
+  // on the claim's own UPDATE) does not: that UPDATE's snapshot is taken
+  // before it blocks on the lock, so its count sub-expression can still miss
+  // a just-committed row once it unblocks and proceeds.
+  //
+  // The individual claimQueuedRun calls below still run on the outer pooled
+  // `db`, in their own separate transactions -- not on `tx`. That is safe
+  // (this wrapper's lock stays held across all of them regardless of which
+  // connection performs the actual claim), but it does mean this feature
+  // needs at least 2 pooled connections: one held by this wrapper's `tx` for
+  // the lock, and at least one more for claimQueuedRun's own work. See the
+  // DATABASE_POOL_MAX check in resolveAdapterConcurrencyLimits' caller.
   async function claimRunsWithAdapterConcurrencyGuard(
     agent: typeof agents.$inferSelect,
     prioritizedRuns: Array<typeof heartbeatRuns.$inferSelect>,
@@ -17020,23 +17054,17 @@ export function heartbeatService(
       }
       return claimedRuns;
     }
-    const reserved = await db.$client.reserve();
-    try {
-      await reserved`select pg_advisory_lock(hashtext(${agent.adapterType}))`;
-      const running = await countRunningRunsForAdapterType(agent.adapterType);
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${agent.adapterType}))`);
+      const running = await countRunningRunsForAdapterType(agent.adapterType, tx as unknown as Db);
       const allowed = Math.max(0, Math.min(maxClaims, limit - running));
       for (const queuedRun of prioritizedRuns) {
         if (claimedRuns.length >= allowed) break;
         const claimed = await claimQueuedRun(queuedRun, companyAgents);
         if (claimed) claimedRuns.push(claimed);
       }
-      return claimedRuns;
-    } finally {
-      await reserved`select pg_advisory_unlock(hashtext(${agent.adapterType}))`.catch(
-        () => {},
-      );
-      reserved.release();
-    }
+    });
+    return claimedRuns;
   }
 
   async function withChatControlRecoveryGate(
