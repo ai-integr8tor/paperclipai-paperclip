@@ -31,6 +31,7 @@ export const ISSUE_WRITE_DENIAL_CODES = [
   "issue_write_assignee_run_lock",
   "cross_issue_influence_cap_exceeded",
   "cross_issue_influence_run_context_required",
+  "cross_issue_influence_run_context_rejected",
   "issue_write_attribution_spoof_rejected",
 ] as const;
 
@@ -259,6 +260,36 @@ export function describeIssueWriteDenial(
         sanctionedPath:
           `Send the \`X-Paperclip-Run-Id\` header with your current run (\`$PAPERCLIP_RUN_ID\`) ` +
           `and retry.`,
+
+      };
+
+    // Deliberately NOT a variant of the copy above. `required` means the caller
+    // sent no run id, and resending the header is the whole fix. `rejected` means
+    // a run id *was* supplied and the server could not bind it to a live run of
+    // this agent — on the agent-JWT path the run id comes from the signed claim,
+    // so the header cannot add anything and telling the caller to retry burns a
+    // run per attempt against a wall that will not move.
+    case "cross_issue_influence_run_context_rejected":
+      return {
+        code,
+        status: 403,
+        tone: "boundary",
+        boundary: "Heartbeat run context",
+        title: "The run id on this request did not resolve to a live run",
+        description:
+          `Every agent comment and task update is attributed to a heartbeat run so the ` +
+          `cross-issue cap can be counted and the audit trail can name who acted for whom. ` +
+          `This request carried a run id, but it does not resolve to a live run of ` +
+          `${actor} in this company, so the write could not be contained. The run id is ` +
+          `read from the signed credential, not from the header, so re-sending the ` +
+          `header cannot change the outcome.`,
+        whoCanAct:
+          `${actor}, from inside the run that owns this work.`,
+        sanctionedPath:
+          `Do not retry with the same run id. Check that the run is still ` +
+          `\`running\` (it may have already ended), then end this attempt and let the ` +
+          `next heartbeat pick the work up under its own run-scoped credential. If a ` +
+          `child task carries the work, ${CHILD_ISSUE_PATH}.`,
 
       };
 

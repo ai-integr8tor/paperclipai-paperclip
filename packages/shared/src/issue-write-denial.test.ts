@@ -86,6 +86,33 @@ describe("describeIssueWriteDenial", () => {
     expect(copy.sanctionedPath).toContain("PAPERCLIP_RUN_ID");
   });
 
+  // The two codes must not share copy. `required` means "you sent no run id",
+  // where resending the header is the entire fix; `rejected` means a run id was
+  // supplied and could not be bound, where that same advice burns a run per
+  // attempt against a wall that will not move.
+  it("tells a rejected run id not to retry the header it already sent", () => {
+    const copy = describeIssueWriteDenial("cross_issue_influence_run_context_rejected", {
+      actorLabel: "Fable",
+    });
+    expect(copy.status).toBe(403);
+    expect(copy.tone).toBe("boundary");
+    expect(copy.whoCanAct).toContain("Fable");
+    expect(copy.sanctionedPath).not.toContain("X-Paperclip-Run-Id");
+    expect(copy.sanctionedPath).toContain("Do not retry");
+    expect(copy.description).toContain("Fable");
+  });
+
+  it("keeps the two run-context codes distinct in the API message", () => {
+    const required = issueWriteDenialApiMessage(
+      describeIssueWriteDenial("cross_issue_influence_run_context_required"),
+    );
+    const rejected = issueWriteDenialApiMessage(
+      describeIssueWriteDenial("cross_issue_influence_run_context_rejected"),
+    );
+    expect(required).not.toBe(rejected);
+    expect(rejected).toContain("did not resolve to a live run");
+  });
+
   it("tells a spoof attempt that the write itself was fine", () => {
     const copy = describeIssueWriteDenial("issue_write_attribution_spoof_rejected", {
       actorLabel: "Fable",
