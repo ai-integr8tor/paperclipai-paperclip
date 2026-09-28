@@ -67,7 +67,9 @@ export function createOneCliGatewayFetch(
   fetchImpl: typeof globalThis.fetch = globalThis.fetch,
 ): (input: string, init?: RequestInit) => Promise<Response> {
   if (env.ONECLI_GATEWAY !== "true") throw new Error("OneCLI gateway is not enabled for this worker");
-  if (!env.HTTPS_PROXY) throw new Error("OneCLI HTTPS proxy is not configured for this worker");
+  if (!env.HTTPS_PROXY && !env.https_proxy) {
+    throw new Error("OneCLI HTTPS proxy is not configured for this worker");
+  }
   if (env.NODE_USE_ENV_PROXY !== "1") throw new Error("Node environment proxy support is not enabled for this worker");
   if (!env.NODE_EXTRA_CA_CERTS) throw new Error("OneCLI CA trust is not configured for this worker");
 

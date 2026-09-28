@@ -121,6 +121,22 @@ describe("TypeSafe task routing pilot", () => {
     expect(() => createOneCliGatewayFetch({ ONECLI_GATEWAY: "true" })).toThrow("HTTPS proxy is not configured");
   });
 
+  it("accepts the lowercase HTTPS proxy alias emitted by the host", async () => {
+    const fetchImpl = vi.fn(async () => new Response(null, { status: 204 }));
+    const gatewayFetch = createOneCliGatewayFetch(
+      {
+        ONECLI_GATEWAY: "true",
+        https_proxy: "http://gateway.invalid",
+        NODE_USE_ENV_PROXY: "1",
+        NODE_EXTRA_CA_CERTS: import.meta.filename,
+      },
+      fetchImpl,
+    );
+
+    await expect(gatewayFetch("https://api.typesafe.ai/v1/systemone")).resolves.toHaveProperty("status", 204);
+    expect(fetchImpl).toHaveBeenCalledOnce();
+  });
+
   it("refuses custom-fetch requests outside the TypeSafe API origin", async () => {
     const gatewayFetch = createOneCliGatewayFetch(
       {

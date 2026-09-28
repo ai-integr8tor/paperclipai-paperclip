@@ -1,5 +1,6 @@
 import path from "node:path";
-import { access, readFile } from "node:fs/promises";
+import { access, readFile, readdir } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
@@ -31,6 +32,7 @@ import { logger } from "../middleware/logger.js";
 import {
   appendStderrExcerpt,
   createDuplexRouteSlotController,
+  createPluginWorkerManager,
   createPluginWorkerHandle,
   formatWorkerFailureMessage,
   resolvePluginWorkerOneCliEnv,
@@ -59,6 +61,27 @@ const TEST_MANIFEST: PaperclipPluginManifestV1 = {
 };
 
 describe("TypeSafe worker OneCLI launcher boundary", () => {
+  const oneCliCaDirectories = async () => new Set(
+    (await readdir(tmpdir())).filter((name) => name.startsWith("paperclip-onecli-ca-")),
+  );
+  const typesafeManifest = {
+    ...TEST_MANIFEST,
+    id: "oxford.typesafe-task-routing",
+  };
+  const containerConfig = {
+    env: { https_proxy: "http://gateway.invalid" },
+    caCertificate: "test-ca",
+    caCertificateContainerPath: "/untrusted/container/path",
+  };
+  const workerOptions = (entrypointPath = DELAYED_WORKER_ENTRYPOINT) => ({
+    entrypointPath,
+    manifest: typesafeManifest,
+    config: {},
+    instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+    apiVersion: 1,
+    hostHandlers: {},
+  });
+
   it("scopes the binding to the exact TypeSafe plugin and agent", async () => {
     const getContainerConfig = vi.fn(async () => ({
       env: { HTTPS_PROXY: "http://gateway.invalid" },
@@ -66,15 +89,16 @@ describe("TypeSafe worker OneCLI launcher boundary", () => {
       caCertificateContainerPath: "/untrusted/container/path",
     }));
 
-    await expect(resolvePluginWorkerOneCliEnv("example.other", getContainerConfig)).resolves.toEqual({});
+    await expect(resolvePluginWorkerOneCliEnv("example.other", getContainerConfig)).resolves.toMatchObject({ env: {} });
     expect(getContainerConfig).not.toHaveBeenCalled();
 
-    await resolvePluginWorkerOneCliEnv("oxford.typesafe-task-routing", getContainerConfig);
+    const resolved = await resolvePluginWorkerOneCliEnv("oxford.typesafe-task-routing", getContainerConfig);
     expect(getContainerConfig).toHaveBeenCalledWith({ agent: "occ-typesafe-routing-plugin" });
+    await resolved.cleanup();
   });
 
   it("returns only proxy aliases, gateway markers, and a readable host CA path", async () => {
-    const env = await resolvePluginWorkerOneCliEnv(
+    const resolved = await resolvePluginWorkerOneCliEnv(
       "oxford.typesafe-task-routing",
       async () => ({
         env: {
@@ -89,17 +113,19 @@ describe("TypeSafe worker OneCLI launcher boundary", () => {
       }),
     );
 
-    expect(Object.keys(env).sort()).toEqual([
+    expect(Object.keys(resolved.env).sort()).toEqual([
       "HTTPS_PROXY",
       "HTTP_PROXY",
       "NODE_EXTRA_CA_CERTS",
       "NODE_USE_ENV_PROXY",
       "ONECLI_GATEWAY",
     ].sort());
-    expect(env).not.toHaveProperty("ONECLI_API_KEY");
-    expect(env).not.toHaveProperty("TYPESAFE_API_KEY");
-    await expect(access(env.NODE_EXTRA_CA_CERTS!)).resolves.toBeUndefined();
-    await expect(readFile(env.NODE_EXTRA_CA_CERTS!, "utf8")).resolves.toBe("test-ca");
+    expect(resolved.env).not.toHaveProperty("ONECLI_API_KEY");
+    expect(resolved.env).not.toHaveProperty("TYPESAFE_API_KEY");
+    await expect(access(resolved.env.NODE_EXTRA_CA_CERTS!)).resolves.toBeUndefined();
+    await expect(readFile(resolved.env.NODE_EXTRA_CA_CERTS!, "utf8")).resolves.toBe("test-ca");
+    await resolved.cleanup();
+    await expect(access(resolved.env.NODE_EXTRA_CA_CERTS!)).rejects.toThrow();
   });
 
   it("fails closed when the binding lacks proxy or CA configuration", async () => {
@@ -116,6 +142,65 @@ describe("TypeSafe worker OneCLI launcher boundary", () => {
         caCertificateContainerPath: "/unused",
       }),
     )).rejects.toThrow("has no CA certificate");
+  });
+
+  it("locks before OneCLI configuration so overlapping starts share one attempt", async () => {
+    let releaseConfig!: () => void;
+    const configGate = new Promise<void>((resolve) => { releaseConfig = resolve; });
+    const getOneCliContainerConfig = vi.fn(async () => {
+      await configGate;
+      return containerConfig;
+    });
+    const manager = createPluginWorkerManager({ getOneCliContainerConfig });
+    const first = manager.startWorker("typesafe", workerOptions());
+    const second = manager.startWorker("typesafe", workerOptions());
+
+    expect(getOneCliContainerConfig).toHaveBeenCalledOnce();
+    releaseConfig();
+    const [firstHandle, secondHandle] = await Promise.all([first, second]);
+    expect(secondHandle).toBe(firstHandle);
+    await manager.stopAll();
+  });
+
+  it("removes the temporary CA directory when worker startup fails", async () => {
+    const before = await oneCliCaDirectories();
+    const manager = createPluginWorkerManager({
+      getOneCliContainerConfig: vi.fn(async () => containerConfig),
+    });
+    const start = manager.startWorker("typesafe", workerOptions("/missing/plugin-worker.cjs"));
+    await vi.waitFor(() => expect(manager.getWorker("typesafe")).toBeDefined());
+    const during = await oneCliCaDirectories();
+    const created = [...during].filter((name) => !before.has(name));
+    expect(created).toHaveLength(1);
+    await expect(start).rejects.toThrow();
+    expect(manager.getWorker("typesafe")).toBeUndefined();
+    await expect(access(path.join(tmpdir(), created[0]!))).rejects.toThrow();
+  });
+
+  it("removes the temporary CA file on worker stop", async () => {
+    const before = await oneCliCaDirectories();
+    const manager = createPluginWorkerManager({
+      getOneCliContainerConfig: vi.fn(async () => containerConfig),
+    });
+    await manager.startWorker("typesafe", workerOptions());
+    const during = await oneCliCaDirectories();
+    const created = [...during].filter((name) => !before.has(name));
+    expect(created).toHaveLength(1);
+    await manager.stopWorker("typesafe");
+    await expect(access(path.join(tmpdir(), created[0]!))).rejects.toThrow();
+  });
+
+  it("removes the temporary CA file on manager shutdown", async () => {
+    const before = await oneCliCaDirectories();
+    const manager = createPluginWorkerManager({
+      getOneCliContainerConfig: vi.fn(async () => containerConfig),
+    });
+    await manager.startWorker("typesafe", workerOptions());
+    const during = await oneCliCaDirectories();
+    const created = [...during].filter((name) => !before.has(name));
+    expect(created).toHaveLength(1);
+    await manager.stopAll();
+    await expect(access(path.join(tmpdir(), created[0]!))).rejects.toThrow();
   });
 });
 
